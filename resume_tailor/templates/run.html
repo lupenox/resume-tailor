@@ -1,0 +1,407 @@
+{% extends "base.html" %}
+{% block title %}{{ run.company or "Active run" }} · resume-tailor{% endblock %}
+{% block content %}
+  <div id="run-page" data-run-id="{{ run.run_id }}" data-revision="{{ run.revision }}"
+    data-status="{{ run.status }}">
+    <section class="run-hero">
+      <div>
+        <a class="back-link" href="/">← Dashboard</a>
+        <p class="eyebrow">Tailoring workflow</p>
+        <h1>{{ run.role or "Preparing job details" }}</h1>
+        <p>{{ run.company or "Company will be derived from the posting" }}</p>
+      </div>
+      <div class="run-status-block" role="status" aria-live="polite" aria-atomic="true">
+        <span id="run-status" class="status-pill status-{{ run.status|lower }}">{{ run.status }}</span>
+        <span id="run-message">{{ run.message }}</span>
+      </div>
+    </section>
+
+    <div class="workflow-grid">
+      <aside class="card stepper-card">
+        <div class="card-heading compact">
+          <div>
+            <p class="eyebrow">Progress</p>
+            <h2>Workflow</h2>
+          </div>
+        </div>
+        <ol class="stepper" id="workflow-stepper" aria-label="Tailoring workflow progress">
+          {% for key, label in workflow_stages %}
+            {% set index = loop.index0 %}
+            <li data-stage="{{ key }}" data-stage-index="{{ index }}"
+              {% if index == run.stage_index and run.status != 'COMPLETE' %}aria-current="step"{% endif %}
+              class="{% if index < run.stage_index or run.status == 'COMPLETE' %}done{% elif index == run.stage_index %}active{% endif %}">
+              <span class="step-marker">
+                <span class="step-number">{{ loop.index }}</span>
+                <span class="step-check">✓</span>
+              </span>
+              <span>{{ label }}</span>
+            </li>
+          {% endfor %}
+        </ol>
+      </aside>
+
+      <div class="workflow-main">
+        {% if run.status == "AWAITING_APPROVAL" and run.approval %}
+          {% if run.approval.kind == "linkedin_posting" %}
+            {% set posting = run.approval.payload %}
+            <section class="card gate-card">
+              <div class="gate-heading">
+                <span class="gate-icon" aria-hidden="true">01</span>
+                <div>
+                  <p class="eyebrow">Approval required</p>
+                  <h2>Is this the intended posting?</h2>
+                  <p>No résumé extraction or Codex analysis has started.</p>
+                </div>
+              </div>
+              <div class="posting-summary">
+                <div class="posting-identity">
+                  <span class="company-monogram" aria-hidden="true">{{ (posting.company or "?")[:1] }}</span>
+                  <div>
+                    <h3>{{ posting.job_title }}</h3>
+                    <p>{{ posting.company }}</p>
+                  </div>
+                </div>
+                <dl class="detail-grid">
+                  <div><dt>Location</dt><dd>{{ posting.location or "Not provided" }}</dd></div>
+                  <div><dt>Employment</dt><dd>{{ posting.employment_type or "Not provided" }}</dd></div>
+                  <div><dt>Workplace</dt><dd>{{ posting.workplace_type|title }}</dd></div>
+                  <div><dt>Salary</dt><dd>{{ posting.salary or "Not provided" }}</dd></div>
+                </dl>
+                <div class="url-stack">
+                  <div><strong>Requested URL</strong><code>{{ posting.requested_url }}</code></div>
+                  <div><strong>Resolved URL</strong><code>{{ posting.final_resolved_url }}</code></div>
+                </div>
+                <div class="preview-block">
+                  <h3>Description preview</h3>
+                  <p>{{ posting.normalized_job_description[:900] }}{% if posting.normalized_job_description|length > 900 %}…{% endif %}</p>
+                </div>
+                <div class="extraction-columns">
+                  <div>
+                    <h3>Responsibilities</h3>
+                    <ul>
+                      {% for item in posting.responsibilities[:8] %}<li>{{ item }}</li>{% else %}<li>None extracted</li>{% endfor %}
+                    </ul>
+                  </div>
+                  <div>
+                    <h3>Skills & technologies</h3>
+                    <div class="tag-list">
+                      {% for item in posting.technologies_and_skills[:16] %}<span>{{ item }}</span>{% else %}<span>None extracted</span>{% endfor %}
+                    </div>
+                  </div>
+                </div>
+                {% if posting.warnings %}
+                  <div class="alert alert-warning">
+                    <strong>Extraction warnings</strong>
+                    <ul>{% for warning in posting.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+                  </div>
+                {% endif %}
+              </div>
+              <div class="gate-actions">
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="approve">
+                  <button class="primary-button" type="submit">Yes, continue <span>→</span></button>
+                </form>
+                <button class="secondary-button" type="button" data-show-fallback>Use pasted description instead</button>
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="cancel">
+                  <button class="danger-button" type="submit">Cancel</button>
+                </form>
+              </div>
+              <form class="fallback-form" action="/runs/{{ run.run_id }}/approval" method="post" data-fallback-form hidden>
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="action" value="use_pasted">
+                <label for="fallback-description">Complete pasted job description</label>
+                <textarea id="fallback-description" name="fallback_description" rows="10"
+                  placeholder="Paste the complete trusted copy of this posting…"></textarea>
+                <div class="gate-actions">
+                  <button class="primary-button" type="submit">Use pasted text and continue</button>
+                  <button class="text-button" type="button" data-hide-fallback>Keep reviewing extraction</button>
+                </div>
+              </form>
+            </section>
+
+          {% elif run.approval.kind == "codex_analysis" %}
+            {% set analysis = run.approval.analysis %}
+            <section class="card gate-card">
+              <div class="gate-heading">
+                <span class="gate-icon" aria-hidden="true">02</span>
+                <div>
+                  <p class="eyebrow">Approval required</p>
+                  <h2>Review evidence-backed recommendations</h2>
+                  <p>Antigravity will not tailor content until you approve this analysis.</p>
+                </div>
+              </div>
+              <div class="analysis-overview">
+                <div class="match-card">
+                  <span>Match assessment</span>
+                  <strong>{{ analysis.fit_assessment.overall }}</strong>
+                  <p>{{ analysis.role_summary }}</p>
+                </div>
+                <div class="analysis-columns">
+                  <div class="signal-panel signal-good">
+                    <h3>Strengths</h3>
+                    <ul>{% for item in analysis.fit_assessment.strengths %}<li>{{ item }}</li>{% else %}<li>No strengths returned</li>{% endfor %}</ul>
+                  </div>
+                  <div class="signal-panel signal-neutral">
+                    <h3>Gaps</h3>
+                    <ul>{% for item in analysis.fit_assessment.gaps %}<li>{{ item }}</li>{% else %}<li>No material gaps returned</li>{% endfor %}</ul>
+                  </div>
+                </div>
+                <div class="report-section">
+                  <h3>Proposed summary changes</h3>
+                  {% for edit in run.approval.grouped_edits.summary %}
+                    <article class="edit-card">
+                      <del>{{ edit.existing_claim }}</del>
+                      <ins>{{ edit.proposed_replacement }}</ins>
+                      <p>{{ edit.alignment_rationale }}</p>
+                      <small>Evidence: {{ edit.exact_supporting_evidence }}</small>
+                    </article>
+                  {% else %}<p class="muted">No summary changes proposed.</p>{% endfor %}
+                </div>
+                <div class="report-split">
+                  <div class="report-section">
+                    <h3>Experience changes</h3>
+                    {% for edit in run.approval.grouped_edits.experience %}
+                      <article class="edit-card"><del>{{ edit.existing_claim }}</del><ins>{{ edit.proposed_replacement }}</ins><small>Evidence: {{ edit.exact_supporting_evidence }}</small></article>
+                    {% else %}<p class="muted">No experience changes proposed.</p>{% endfor %}
+                  </div>
+                  <div class="report-section">
+                    <h3>Project changes</h3>
+                    {% for edit in run.approval.grouped_edits.projects %}
+                      <article class="edit-card"><del>{{ edit.existing_claim }}</del><ins>{{ edit.proposed_replacement }}</ins><small>Evidence: {{ edit.exact_supporting_evidence }}</small></article>
+                    {% else %}<p class="muted">No project changes proposed.</p>{% endfor %}
+                  </div>
+                </div>
+                <div class="report-split">
+                  <div class="report-section">
+                    <h3>Keyword alignment</h3>
+                    <div class="tag-list">
+                      {% for item in analysis.supported_ats_keywords %}<span>{{ item }}</span>{% else %}<span>No supported keywords returned</span>{% endfor %}
+                    </div>
+                  </div>
+                  <div class="report-section">
+                    <h3>Unchanged sections</h3>
+                    <ul class="check-list">{% for item in run.approval.unchanged_sections %}<li>{{ item }}</li>{% endfor %}</ul>
+                  </div>
+                </div>
+                <div class="alert {% if analysis.missing_or_unsupported_requirements %}alert-warning{% else %}alert-success{% endif %}">
+                  <strong>Factual-integrity review</strong>
+                  {% if analysis.missing_or_unsupported_requirements %}
+                    <ul>{% for item in analysis.missing_or_unsupported_requirements %}<li>{{ item }}</li>{% endfor %}</ul>
+                  {% else %}
+                    <span>No unsupported requirements were misrepresented as résumé facts.</span>
+                  {% endif %}
+                </div>
+                <div class="report-section">
+                  <h3>Forbidden claims</h3>
+                  <div class="tag-list tag-danger">
+                    {% for item in analysis.forbidden_claims %}<span>{{ item }}</span>{% else %}<span>None returned</span>{% endfor %}
+                  </div>
+                </div>
+              </div>
+              <div class="gate-actions">
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="approve">
+                  <button class="primary-button" type="submit">Approve tailoring <span>→</span></button>
+                </form>
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="cancel">
+                  <button class="danger-button" type="submit">Cancel run</button>
+                </form>
+              </div>
+            </section>
+
+          {% elif run.approval.kind == "tailored_content" %}
+            {% set evidence = run.approval.payload.evidence %}
+            <section class="card gate-card">
+              <div class="gate-heading">
+                <span class="gate-icon" aria-hidden="true">03</span>
+                <div>
+                  <p class="eyebrow">Final content gate</p>
+                  <h2>Approve the validated before/after diff</h2>
+                  <p>The document renderer remains disabled until this final content approval.</p>
+                </div>
+              </div>
+              <div class="integrity-banner">
+                <span class="status-dot" aria-hidden="true"></span>
+                <div>
+                  <strong>Local evidence validation passed</strong>
+                  <p>No blocking unsupported claims were detected.</p>
+                </div>
+              </div>
+              <div class="risk-grid">
+                <div><span>New technologies</span><strong>{{ evidence.introduced_technologies|length }}</strong></div>
+                <div><span>New metrics</span><strong>{{ evidence.introduced_metrics|length }}</strong></div>
+                <div><span>Role labels</span><strong>{{ evidence.introduced_role_labels|length }}</strong></div>
+                <div><span>Availability claims</span><strong>{{ evidence.introduced_availability|length }}</strong></div>
+              </div>
+              <details class="diff-details" open>
+                <summary>Section-by-section content diff</summary>
+                <pre>{{ run.approval.payload.content_diff }}</pre>
+              </details>
+              <div class="gate-actions">
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="approve">
+                  <button class="primary-button" type="submit">Approve rendering <span>→</span></button>
+                </form>
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="cancel">
+                  <button class="danger-button" type="submit">Cancel run</button>
+                </form>
+              </div>
+            </section>
+          {% endif %}
+
+        {% elif run.status == "COMPLETE" %}
+          <section class="card result-card">
+            <div class="success-hero">
+              <span class="success-mark" aria-hidden="true">✓</span>
+              <div>
+                <p class="eyebrow">Run complete</p>
+                <h2>Your tailored résumé is ready.</h2>
+                <p>{{ run.company }} · {{ run.role }}</p>
+              </div>
+            </div>
+            <div class="result-metrics">
+              <div>
+                <span>Final Codex QA</span>
+                <strong class="text-success">{{ run.metadata.get("final_qa", {}).get("status", "PASS") }}</strong>
+              </div>
+              <div>
+                <span>Factual integrity</span>
+                <strong class="text-success">{{ run.metadata.get("factual_integrity", {}).get("status", "PASS") }}</strong>
+              </div>
+              <div>
+                <span>Layout validation</span>
+                <strong class="text-success">{{ run.metadata.get("layout_validation", {}).get("pages", 1) }} page</strong>
+              </div>
+            </div>
+            {% if run.metadata.get("final_qa") %}
+              <div class="qa-summary">
+                <h3>Final QA result</h3>
+                <p>{{ run.metadata.final_qa.summary }}</p>
+                <small>{{ run.metadata.final_qa.improvement_assessment }}</small>
+              </div>
+            {% endif %}
+            <div class="result-layout">
+              <div class="artifact-panel">
+                <h3>Generated artifacts</h3>
+                <div class="artifact-list">
+                  {% for artifact in run.artifacts %}
+                    <a href="/runs/{{ run.run_id }}/artifacts/{{ artifact.name }}">
+                      <span class="file-icon">{{ artifact.kind[:1] }}</span>
+                      <span><strong>{{ artifact.name }}</strong><small>{{ artifact.kind }}</small></span>
+                      <span aria-hidden="true">↓</span>
+                    </a>
+                  {% else %}
+                    <p class="muted">No downloadable artifacts were found.</p>
+                  {% endfor %}
+                </div>
+                {% if run.artifact_directory %}
+                  <div class="artifact-path">
+                    <span>Artifact directory</span>
+                    <code>{{ run.artifact_directory }}</code>
+                  </div>
+                {% endif %}
+              </div>
+              {% if run.pdf_name %}
+                <div class="pdf-panel">
+                  <div class="panel-heading">
+                    <h3>PDF preview</h3>
+                    <a href="/runs/{{ run.run_id }}/artifacts/{{ run.pdf_name }}">Download PDF</a>
+                  </div>
+                  <iframe title="Tailored résumé PDF preview"
+                    src="/runs/{{ run.run_id }}/artifacts/{{ run.pdf_name }}?inline=true"></iframe>
+                </div>
+              {% endif %}
+            </div>
+            <div class="result-actions">
+              <a class="primary-button" href="/">Start another run <span>→</span></a>
+            </div>
+          </section>
+
+        {% elif run.status in ["FAILED", "CANCELLED"] %}
+          <section class="card terminal-card">
+            <span class="terminal-icon" aria-hidden="true">{% if run.status == "FAILED" %}!{% else %}×{% endif %}</span>
+            <p class="eyebrow">{{ run.status }}</p>
+            <h2>{% if run.status == "FAILED" %}The pipeline stopped safely.{% else %}Run cancelled.{% endif %}</h2>
+            <p>{{ run.message }}</p>
+            {% if run.error %}
+              <details class="diff-details technical-details">
+                <summary>Sanitized technical details</summary>
+                <pre>{{ run.error }}</pre>
+              </details>
+            {% endif %}
+            {% if run.artifact_directory %}
+              <div class="artifact-path">
+                <span>Preserved diagnostics</span>
+                <code>{{ run.artifact_directory }}</code>
+              </div>
+            {% endif %}
+            {% if run.artifacts %}
+              <div class="artifact-list terminal-artifacts">
+                {% for artifact in run.artifacts %}
+                  <a href="/runs/{{ run.run_id }}/artifacts/{{ artifact.name }}">
+                    <span class="file-icon">{{ artifact.kind[:1] }}</span>
+                    <span><strong>{{ artifact.name }}</strong><small>{{ artifact.kind }}</small></span>
+                    <span aria-hidden="true">↓</span>
+                  </a>
+                {% endfor %}
+              </div>
+            {% endif %}
+            <div class="alert alert-info">
+              <strong>LinkedIn fallback</strong>
+              <span>If retrieval was blocked, retry with a UTF-8 text file or pasted description.</span>
+            </div>
+            <a class="primary-button" href="/">Start a new run <span>→</span></a>
+          </section>
+
+        {% else %}
+          <section class="card activity-card">
+            <div class="loading-header">
+              <span class="spinner" aria-hidden="true"></span>
+              <div>
+                <p class="eyebrow">Pipeline active</p>
+                <h2>Working through the evidence safely</h2>
+                <p id="activity-current">{{ run.message }}</p>
+              </div>
+            </div>
+            <div class="safe-activity-note">
+              Activity messages are intentionally concise. Hidden reasoning, raw prompts,
+              credentials, and environment values are never displayed.
+            </div>
+            <form action="/runs/{{ run.run_id }}/cancel" method="post">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="danger-button" type="submit">Cancel run</button>
+            </form>
+          </section>
+        {% endif %}
+
+        <section class="card activity-log-card">
+          <div class="card-heading compact">
+            <div>
+              <p class="eyebrow">Safe activity</p>
+              <h2>Run log</h2>
+            </div>
+            <span class="live-indicator"><span aria-hidden="true"></span> Live</span>
+          </div>
+          <ol id="activity-list" class="activity-list">
+            {% for event in run.events %}
+              <li>
+                <time>{{ event.time }}</time>
+                <span class="activity-node"></span>
+                <div><strong>{{ event.message }}</strong><small>{{ event.stage|replace("_", " ")|title }}</small></div>
+              </li>
+            {% endfor %}
+          </ol>
+        </section>
+      </div>
+    </div>
+  </div>
+{% endblock %}

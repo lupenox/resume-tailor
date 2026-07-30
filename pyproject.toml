@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resume-tailor"
+version = "0.1.0"
+description = "Truthful, human-gated resume tailoring with Codex and Antigravity"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+  "fastapi>=0.115,<0.120",
+  "jinja2>=3.1,<4",
+  "python-docx>=1.1.2,<2",
+  "jsonschema>=4.21,<5",
+  "python-multipart>=0.0.12,<1",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27,<1",
+  "pytest>=8.2,<10",
+]
+
+[project.scripts]
+tailor-resume = "resume_tailor.cli:main"
+tailor-resume-ui = "resume_tailor.ui_cli:main"
+
+[tool.setuptools]
+packages = ["resume_tailor"]
+
+[tool.setuptools.package-data]
+resume_tailor = [
+  "static/*.css",
+  "static/*.js",
+  "static/*.svg",
+  "templates/*.html",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

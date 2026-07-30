@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex resume-to-job analysis",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role_summary",
+    "fit_assessment",
+    "matched_requirements",
+    "evidence_map",
+    "supported_ats_keywords",
+    "missing_or_unsupported_requirements",
+    "recommended_edits",
+    "immutable_facts",
+    "forbidden_claims",
+    "content_budget_guidance",
+    "questions_for_user"
+  ],
+  "properties": {
+    "role_summary": {"type": "string", "minLength": 1},
+    "fit_assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall", "strengths", "gaps"],
+      "properties": {
+        "overall": {"type": "string", "minLength": 1},
+        "strengths": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "gaps": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    },
+    "matched_requirements": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "evidence_map": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requirement", "resume_evidence", "strength"],
+        "properties": {
+          "requirement": {"type": "string", "minLength": 1},
+          "resume_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "strength": {"type": "string", "enum": ["strong", "partial", "weak"]}
+        }
+      }
+    },
+    "supported_ats_keywords": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "missing_or_unsupported_requirements": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "recommended_edits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "resume_section",
+          "existing_claim",
+          "proposed_replacement",
+          "alignment_rationale",
+          "exact_supporting_evidence"
+        ],
+        "properties": {
+          "resume_section": {"type": "string", "minLength": 1},
+          "existing_claim": {"type": "string", "minLength": 1},
+          "proposed_replacement": {"type": "string", "minLength": 1},
+          "alignment_rationale": {"type": "string", "minLength": 1},
+          "exact_supporting_evidence": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "immutable_facts": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "forbidden_claims": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "content_budget_guidance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content_id", "maximum_characters", "guidance"],
+        "properties": {
+          "content_id": {"type": "string", "minLength": 1},
+          "maximum_characters": {"type": "integer", "minimum": 1},
+          "guidance": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "questions_for_user": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    }
+  }
+}

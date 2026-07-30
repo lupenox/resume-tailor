@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% block title %}New run · resume-tailor{% endblock %}
+{% block content %}
+  {% set selected_job_mode = form_values.get("job_mode", "url") %}
+  {% set selected_resume_mode = form_values.get("resume_mode", "master") %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">AI engineering résumé workspace</p>
+      <h1>Tailor with evidence, not invention.</h1>
+      <p class="hero-copy">
+        Bring a posting, approve every important decision, and receive a
+        formatting-safe DOCX and one-page PDF.
+      </p>
+    </div>
+    <div class="hero-trust" aria-label="Pipeline safeguards">
+      <span>Human gated</span>
+      <span>Source protected</span>
+      <span>Schema validated</span>
+    </div>
+  </section>
+
+  <div class="dashboard-grid">
+    <section class="card run-card">
+      <div class="card-heading">
+        <div>
+          <p class="eyebrow">Start here</p>
+          <h2>New Tailoring Run</h2>
+        </div>
+        <span class="step-chip" aria-hidden="true">01</span>
+      </div>
+
+      {% if form_error %}
+        <div class="alert alert-error" role="alert">
+          <strong>Check the run details</strong>
+          <span>{{ form_error }}</span>
+        </div>
+      {% endif %}
+      <div id="form-error" class="alert alert-error" role="alert" hidden></div>
+
+      <form id="new-run-form" action="/runs" method="post" enctype="multipart/form-data" novalidate>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <fieldset class="form-section">
+          <legend>Résumé source</legend>
+          <div class="choice-grid choice-grid-two">
+            <label class="choice-card">
+              <input type="radio" name="resume_mode" value="master"
+                {% if selected_resume_mode != "upload" %}checked{% endif %}>
+              <span class="choice-title">Master résumé</span>
+              <span class="choice-copy">{{ master_resume_name }}</span>
+              <span class="choice-meta">Recommended · protected source</span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="resume_mode" value="upload"
+                {% if selected_resume_mode == "upload" %}checked{% endif %}>
+              <span class="choice-title">Upload DOCX</span>
+              <span class="choice-copy">Use another compatible template</span>
+              <span class="choice-meta">5 MiB maximum</span>
+            </label>
+          </div>
+          <div class="conditional-field" data-resume-panel="upload" hidden>
+            <label for="resume-upload">Résumé DOCX</label>
+            <input id="resume-upload" name="resume_upload" type="file"
+              accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+            <p class="field-help">
+              The document is structurally validated before any pipeline work.
+            </p>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend>Job description</legend>
+          <div class="segmented-control" role="radiogroup" aria-label="Job input mode">
+            <label>
+              <input type="radio" name="job_mode" value="url"
+                {% if selected_job_mode == "url" %}checked{% endif %}>
+              <span>LinkedIn URL</span>
+            </label>
+            <label>
+              <input type="radio" name="job_mode" value="pasted"
+                {% if selected_job_mode == "pasted" %}checked{% endif %}>
+              <span>Clipboard text</span>
+            </label>
+            <label>
+              <input type="radio" name="job_mode" value="file"
+                {% if selected_job_mode == "file" %}checked{% endif %}>
+              <span>Text file</span>
+            </label>
+          </div>
+
+          <div class="input-panel" data-job-panel="url">
+            <label for="job-url">Public LinkedIn job URL</label>
+            <div class="input-with-icon">
+              <span aria-hidden="true">↗</span>
+              <input id="job-url" name="job_url" type="url"
+                placeholder="https://www.linkedin.com/jobs/view/example-role-1234567890/"
+                value="{{ form_values.get('job_url', '') }}" autocomplete="off">
+            </div>
+            <p class="field-help">
+              HTTPS LinkedIn job pages only. No login, Apply interaction, or account access.
+            </p>
+          </div>
+
+          <div class="input-panel" data-job-panel="pasted" hidden>
+            <div class="label-row">
+              <label for="pasted-description">Pasted job description</label>
+              <button id="paste-button" class="text-button" type="button">Paste from clipboard</button>
+            </div>
+            <textarea id="pasted-description" name="pasted_description" rows="10"
+              placeholder="Paste the complete posting as plain text…">{{ form_values.get("pasted_description", "") }}</textarea>
+            <p id="clipboard-status" class="field-help" aria-live="polite">
+              Browser clipboard access is optional; manual paste always works.
+            </p>
+          </div>
+
+          <div class="input-panel" data-job-panel="file" hidden>
+            <label for="job-file">UTF-8 job-description file</label>
+            <input id="job-file" name="job_file" type="file" accept=".txt,text/plain">
+            <p class="field-help">Plain-text `.txt` files up to 500,000 bytes.</p>
+          </div>
+
+          <div class="identity-grid" data-manual-identity hidden>
+            <div>
+              <label for="company">Company</label>
+              <input id="company" name="company" type="text" maxlength="200"
+                value="{{ form_values.get('company', '') }}" placeholder="Company name">
+            </div>
+            <div>
+              <label for="role">Role</label>
+              <input id="role" name="role" type="text" maxlength="200"
+                value="{{ form_values.get('role', '') }}" placeholder="Job title">
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="privacy-note">
+          <span class="shield-icon" aria-hidden="true">✓</span>
+          <p>
+            The master file is never overwritten. In a real run, résumé and posting
+            content are sent through your authenticated Codex and Antigravity CLIs.
+          </p>
+        </div>
+
+        <button id="start-button" class="primary-button" type="submit">
+          <span>Start tailoring run</span>
+          <span aria-hidden="true">→</span>
+        </button>
+      </form>
+    </section>
+
+    <aside class="dashboard-side">
+      <section class="card safety-card">
+        <div class="card-heading compact">
+          <div>
+            <p class="eyebrow">Guardrails</p>
+            <h2>Built to stop safely</h2>
+          </div>
+        </div>
+        <ul class="feature-list">
+          <li>
+            <span class="feature-icon" aria-hidden="true">1</span>
+            <div><strong>Confirm the posting</strong><small>Nothing reaches Codex until the fetched identity is approved.</small></div>
+          </li>
+          <li>
+            <span class="feature-icon" aria-hidden="true">2</span>
+            <div><strong>Approve evidence-backed edits</strong><small>Unsupported facts and unanswered questions block the run.</small></div>
+          </li>
+          <li>
+            <span class="feature-icon" aria-hidden="true">3</span>
+            <div><strong>Validate the final page</strong><small>DOCX formatting, PDF layout, and visual QA are checked locally.</small></div>
+          </li>
+        </ul>
+      </section>
+
+      <section class="card history-card">
+        <div class="card-heading compact">
+          <div>
+            <p class="eyebrow">Local artifacts</p>
+            <h2>Run history</h2>
+          </div>
+          <span class="count-badge">{{ history|length }}</span>
+        </div>
+        {% if history %}
+          <div class="history-list">
+            {% for item in history %}
+              <article class="history-item">
+                <div class="history-topline">
+                  <span class="status-pill status-{{ item.status|lower }}">{{ item.status }}</span>
+                  <time>{{ item.created_at[:10] if item.created_at else "Unknown date" }}</time>
+                </div>
+                <strong>{{ item.company or "Pending company" }}</strong>
+                <span>{{ item.role or "Pending role" }}</span>
+                {% if item.artifact_directory %}
+                  <code title="{{ item.artifact_directory }}">{{ item.artifact_directory }}</code>
+                {% endif %}
+                <div class="history-actions">
+                  {% if not item.is_history %}
+                    <a href="/runs/{{ item.run_id }}">View run</a>
+                  {% endif %}
+                  {% for artifact in item.artifacts %}
+                    {% if artifact.kind in ["DOCX", "PDF"] %}
+                      <a href="/runs/{{ item.run_id }}/artifacts/{{ artifact.name }}">{{ artifact.kind }}</a>
+                    {% endif %}
+                  {% endfor %}
+                </div>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state">
+            <span aria-hidden="true">◇</span>
+            <strong>No runs yet</strong>
+            <p>Your local artifact history will appear here.</p>
+          </div>
+        {% endif %}
+      </section>
+    </aside>
+  </div>
+{% endblock %}

@@ -1,0 +1,1232 @@
+from __future__ import annotations
+
+import argparse
+import hmac
+import json
+import re
+import secrets
+import shutil
+import threading
+import time
+import uuid
+import zipfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Mapping
+from urllib.parse import quote
+
+from docx import Document
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from starlette.datastructures import FormData, UploadFile
+
+from . import __version__
+from .cli import _validate_label, run_pipeline
+from .docx_extract import validate_template
+from .linkedin_job import validate_linkedin_url
+from .orchestration import (
+    ApprovalRequest,
+    ApprovalResponse,
+    PipelineHooks,
+)
+from .utilities import (
+    ApprovalError,
+    CancellationError,
+    CodexSchemaCompatibilityError,
+    InputError,
+    ModelError,
+    ResumeTailorError,
+    atomic_write_text,
+    parse_duration,
+    utc_now_iso,
+)
+
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+MAX_RESUME_BYTES = 5 * 1024 * 1024
+MAX_JOB_BYTES = 500_000
+MAX_REQUEST_BYTES = MAX_RESUME_BYTES + MAX_JOB_BYTES + 256_000
+COOKIE_NAME = "resume_tailor_session"
+
+WORKFLOW_STAGES: tuple[tuple[str, str], ...] = (
+    ("validating_input", "Validating input"),
+    ("fetching_job", "Fetching job posting"),
+    ("confirming_posting", "Confirming posting"),
+    ("codex_analysis", "Codex analysis"),
+    ("reviewing_changes", "Reviewing proposed changes"),
+    ("antigravity_tailoring", "Antigravity tailoring"),
+    ("evidence_validation", "Evidence validation"),
+    ("rendering", "Rendering DOCX/PDF"),
+    ("final_qa", "Final Codex QA"),
+    ("complete", "Complete"),
+)
+_STAGE_INDEX = {name: index for index, (name, _) in enumerate(WORKFLOW_STAGES)}
+_TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
+_DOWNLOAD_EXACT = {
+    "job-source.json",
+    "job-description.txt",
+    "extracted-master-resume.json",
+    "codex-analysis.json",
+    "codex-analysis-normalization-warnings.json",
+    "antigravity-response.json",
+    "tailored-content.json",
+    "content-diff.md",
+    "preview.png",
+    "final-qa.md",
+    "final-qa-normalization-warnings.json",
+    "run-metadata.json",
+}
+
+
+PipelineRunner = Callable[..., Path]
+
+
+class ActiveRunError(InputError):
+    pass
+
+
+@dataclass(frozen=True)
+class UISettings:
+    host: str
+    port: int
+    output_directory: Path
+    master_resume: Path
+    launch_token: str
+    timeout: tuple[int, str]
+
+
+@dataclass
+class RunRecord:
+    run_id: str
+    created_at: str
+    source_mode: str
+    company: str | None
+    role: str | None
+    namespace: argparse.Namespace
+    staging_directory: Path
+    status: str = "QUEUED"
+    stage: str = "validating_input"
+    message: str = "Run queued."
+    artifact_directory: Path | None = None
+    error: str | None = None
+    events: list[dict[str, str]] = field(default_factory=list)
+    approval: ApprovalRequest | None = None
+    approval_response: ApprovalResponse | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    revision: int = 0
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def default_master_resume() -> Path:
+    return _project_root() / "template" / "sample_resume.docx"
+
+
+def default_output_directory() -> Path:
+    return Path("~/Documents/Resumes/Tailored").expanduser()
+
+
+def _is_direct_child(path: Path, parent: Path) -> bool:
+    try:
+        return path.resolve().parent == parent.resolve()
+    except OSError:
+        return False
+
+
+def _safe_remove_staging(path: Path, staging_root: Path) -> None:
+    try:
+        resolved = path.resolve()
+        root = staging_root.resolve()
+    except OSError:
+        return
+    if resolved.parent == root and resolved.name.startswith("run-") and resolved.is_dir():
+        shutil.rmtree(resolved)
+
+
+def _safe_json(path: Path) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > 2_000_000:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _artifact_kind(name: str) -> str:
+    suffix = Path(name).suffix.casefold()
+    if suffix == ".docx":
+        return "DOCX"
+    if suffix == ".pdf":
+        return "PDF"
+    if suffix == ".png":
+        return "Preview"
+    if suffix == ".json":
+        return "JSON"
+    if suffix == ".md":
+        return "Report"
+    return "Text"
+
+
+def _is_downloadable_name(name: str) -> bool:
+    if (
+        not name
+        or Path(name).name != name
+        or name in {".", ".."}
+        or any(ord(character) < 32 for character in name)
+    ):
+        return False
+    return name in _DOWNLOAD_EXACT or Path(name).suffix.casefold() in {
+        ".docx",
+        ".pdf",
+    }
+
+
+def _artifact_entries(run_directory: Path | None) -> list[dict[str, str]]:
+    if run_directory is None or not run_directory.is_dir():
+        return []
+    entries: list[dict[str, str]] = []
+    for path in sorted(run_directory.iterdir(), key=lambda item: item.name.casefold()):
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and _is_downloadable_name(path.name)
+        ):
+            entries.append({"name": path.name, "kind": _artifact_kind(path.name)})
+    return entries
+
+
+def _analysis_view(analysis: Mapping[str, Any]) -> dict[str, Any]:
+    major_sections = (
+        "Professional Summary",
+        "Education & Certifications",
+        "Technical Skills",
+        "AI Engineering Projects",
+        "Open Source Contribution",
+        "Experience",
+    )
+    grouped: dict[str, list[Mapping[str, Any]]] = {
+        "summary": [],
+        "experience": [],
+        "projects": [],
+        "other": [],
+    }
+    touched: set[str] = set()
+    for edit in analysis.get("recommended_edits", []):
+        section = str(edit.get("resume_section", ""))
+        normalized = section.casefold()
+        if "summary" in normalized or "objective" in normalized:
+            grouped["summary"].append(edit)
+            touched.add("Professional Summary")
+        elif "experience" in normalized or "employment" in normalized:
+            grouped["experience"].append(edit)
+            touched.add("Experience")
+        elif "project" in normalized:
+            grouped["projects"].append(edit)
+            touched.add("AI Engineering Projects")
+        else:
+            grouped["other"].append(edit)
+            for candidate in major_sections:
+                if candidate.casefold().split()[0] in normalized:
+                    touched.add(candidate)
+                    break
+    return {
+        "analysis": analysis,
+        "grouped_edits": grouped,
+        "unchanged_sections": [item for item in major_sections if item not in touched],
+    }
+
+
+class RunManager:
+    def __init__(
+        self,
+        *,
+        settings: UISettings,
+        pipeline_runner: PipelineRunner,
+    ) -> None:
+        self.settings = settings
+        self.pipeline_runner = pipeline_runner
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._records: dict[str, RunRecord] = {}
+        self._active_run_id: str | None = None
+        self._staging_root = settings.output_directory / ".ui-staging"
+        self._staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def create_staging_directory(self) -> Path:
+        path = self._staging_root / f"run-{uuid.uuid4().hex}"
+        path.mkdir(mode=0o700)
+        return path
+
+    def start(
+        self,
+        *,
+        namespace: argparse.Namespace,
+        staging_directory: Path,
+        source_mode: str,
+        company: str | None,
+        role: str | None,
+    ) -> RunRecord:
+        with self._condition:
+            if self._active_run_id is not None:
+                active = self._records.get(self._active_run_id)
+                if active is not None and active.status not in _TERMINAL_STATUSES:
+                    raise ActiveRunError(
+                        "A tailoring run is already active. Finish or cancel it "
+                        "before starting another."
+                    )
+            record = RunRecord(
+                run_id=secrets.token_urlsafe(12),
+                created_at=utc_now_iso(),
+                source_mode=source_mode,
+                company=company,
+                role=role,
+                namespace=namespace,
+                staging_directory=staging_directory,
+            )
+            record.events.append(
+                {
+                    "time": _clock_text(),
+                    "stage": record.stage,
+                    "message": "Run accepted and queued on this localhost server.",
+                }
+            )
+            self._records[record.run_id] = record
+            self._active_run_id = record.run_id
+            thread = threading.Thread(
+                target=self._execute,
+                args=(record.run_id,),
+                name=f"resume-tailor-{record.run_id}",
+                daemon=False,
+            )
+            record.thread = thread
+            thread.start()
+            return record
+
+    def _execute(self, run_id: str) -> None:
+        with self._condition:
+            record = self._records[run_id]
+            record.status = "RUNNING"
+            record.revision += 1
+        hooks = PipelineHooks(
+            progress_handler=lambda stage, message, payload: self._progress(
+                run_id,
+                stage,
+                message,
+                payload,
+            ),
+            approval_handler=lambda request: self._await_approval(run_id, request),
+            cancel_event=record.cancel_event,
+        )
+        try:
+            run_directory = self.pipeline_runner(record.namespace, hooks=hooks)
+        except (CancellationError, ApprovalError) as exc:
+            with self._condition:
+                record.status = "CANCELLED"
+                record.error = _sanitized_technical_details(exc)
+                record.message = "Run cancelled. Useful diagnostics were preserved."
+                record.approval = None
+                record.events.append(
+                    {
+                        "time": _clock_text(),
+                        "stage": record.stage,
+                        "message": record.message,
+                    }
+                )
+                record.revision += 1
+                self._condition.notify_all()
+        except ResumeTailorError as exc:
+            with self._condition:
+                record.status = "FAILED"
+                record.error = _sanitized_technical_details(exc)
+                record.message = _safe_error_message(exc)
+                record.approval = None
+                record.events.append(
+                    {
+                        "time": _clock_text(),
+                        "stage": record.stage,
+                        "message": record.message,
+                    }
+                )
+                record.revision += 1
+                self._condition.notify_all()
+        except Exception as exc:  # defensive boundary for a localhost UI thread
+            with self._condition:
+                record.status = "FAILED"
+                record.error = (
+                    _sanitized_technical_details(
+                        RuntimeError(
+                            f"Unexpected internal error: {type(exc).__name__}: {exc}"
+                        )
+                    )
+                )
+                record.message = (
+                    "The local pipeline stopped unexpectedly. Existing artifacts "
+                    "were preserved for review."
+                )
+                record.approval = None
+                record.events.append(
+                    {
+                        "time": _clock_text(),
+                        "stage": record.stage,
+                        "message": record.message,
+                    }
+                )
+                record.revision += 1
+                self._condition.notify_all()
+        else:
+            with self._condition:
+                record.artifact_directory = run_directory.resolve()
+                record.status = "COMPLETE"
+                record.stage = "complete"
+                record.message = "Run complete. DOCX, PDF, and reports are ready."
+                record.revision += 1
+                self._condition.notify_all()
+        finally:
+            with self._condition:
+                if self._active_run_id == run_id:
+                    self._active_run_id = None
+                self._condition.notify_all()
+            _safe_remove_staging(record.staging_directory, self._staging_root)
+
+    def _progress(
+        self,
+        run_id: str,
+        stage: str,
+        message: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if stage not in _STAGE_INDEX:
+            return
+        with self._condition:
+            record = self._records[run_id]
+            record.stage = stage
+            record.message = message[:500]
+            if stage != "complete" and record.status != "AWAITING_APPROVAL":
+                record.status = "RUNNING"
+            run_directory = payload.get("run_directory")
+            if isinstance(run_directory, str):
+                candidate = Path(run_directory)
+                if _is_direct_child(candidate, self.settings.output_directory):
+                    record.artifact_directory = candidate.resolve()
+            company = payload.get("company")
+            role = payload.get("role")
+            if isinstance(company, str):
+                record.company = company[:300]
+            if isinstance(role, str):
+                record.role = role[:300]
+            event = {
+                "time": _clock_text(),
+                "stage": stage,
+                "message": message[:500],
+            }
+            if not record.events or record.events[-1]["message"] != event["message"]:
+                record.events.append(event)
+                record.events[:] = record.events[-100:]
+            record.revision += 1
+            self._condition.notify_all()
+
+    def _await_approval(
+        self,
+        run_id: str,
+        request: ApprovalRequest,
+    ) -> ApprovalResponse:
+        with self._condition:
+            record = self._records[run_id]
+            if request.kind == "linkedin_posting":
+                company = request.payload.get("company")
+                role = request.payload.get("job_title")
+                if isinstance(company, str):
+                    record.company = company[:300]
+                if isinstance(role, str):
+                    record.role = role[:300]
+            record.approval = request
+            record.approval_response = None
+            record.status = "AWAITING_APPROVAL"
+            record.message = f"{request.title} needs your explicit approval."
+            record.events.append(
+                {
+                    "time": _clock_text(),
+                    "stage": record.stage,
+                    "message": record.message,
+                }
+            )
+            record.revision += 1
+            self._condition.notify_all()
+            while record.approval_response is None:
+                if record.cancel_event.is_set():
+                    record.approval = None
+                    raise CancellationError(
+                        "The run was cancelled while waiting for approval."
+                    )
+                self._condition.wait(timeout=0.25)
+            response = record.approval_response
+            record.approval = None
+            record.approval_response = None
+            if response.action in {"approve", "use_pasted"}:
+                record.status = "RUNNING"
+                record.message = f"{request.title} approved."
+                record.events.append(
+                    {
+                        "time": _clock_text(),
+                        "stage": record.stage,
+                        "message": record.message,
+                    }
+                )
+                record.revision += 1
+                self._condition.notify_all()
+            return response
+
+    def respond_to_approval(
+        self,
+        run_id: str,
+        *,
+        action: str,
+        job_description: str = "",
+    ) -> None:
+        with self._condition:
+            record = self._require_record(run_id)
+            if record.status != "AWAITING_APPROVAL" or record.approval is None:
+                raise InputError("This run is not currently waiting for approval.")
+            kind = record.approval.kind
+            allowed = (
+                {"approve", "cancel", "use_pasted"}
+                if kind == "linkedin_posting"
+                else {"approve", "cancel"}
+            )
+            if action not in allowed:
+                raise InputError("That approval action is not valid for this gate.")
+            data: dict[str, Any] = {}
+            if action == "use_pasted":
+                description = job_description.strip()
+                if not description:
+                    raise InputError("Paste a complete job description first.")
+                if len(description.encode("utf-8")) > MAX_JOB_BYTES:
+                    raise InputError(
+                        "The pasted job description exceeds the 500,000-byte limit."
+                    )
+                data["job_description"] = description
+            if action == "cancel":
+                record.cancel_event.set()
+            record.approval_response = ApprovalResponse(action, data)
+            record.revision += 1
+            self._condition.notify_all()
+
+    def cancel(self, run_id: str) -> None:
+        with self._condition:
+            record = self._require_record(run_id)
+            if record.status in _TERMINAL_STATUSES:
+                return
+            record.cancel_event.set()
+            if record.approval is not None and record.approval_response is None:
+                record.approval_response = ApprovalResponse("cancel")
+            record.message = "Cancellation requested; stopping active work safely."
+            record.events.append(
+                {
+                    "time": _clock_text(),
+                    "stage": record.stage,
+                    "message": record.message,
+                }
+            )
+            record.revision += 1
+            self._condition.notify_all()
+
+    def snapshot(self, run_id: str) -> dict[str, Any]:
+        with self._condition:
+            record = self._require_record(run_id)
+            return self._snapshot_locked(record)
+
+    def _snapshot_locked(self, record: RunRecord) -> dict[str, Any]:
+        approval: dict[str, Any] | None = None
+        if record.approval is not None:
+            payload = dict(record.approval.payload)
+            approval = {
+                "kind": record.approval.kind,
+                "title": record.approval.title,
+                "payload": payload,
+            }
+            if record.approval.kind == "codex_analysis":
+                approval.update(_analysis_view(payload))
+        metadata = (
+            _safe_json(record.artifact_directory / "run-metadata.json")
+            if record.artifact_directory is not None
+            else {}
+        )
+        company = record.company or metadata.get("company")
+        role = record.role or metadata.get("role")
+        artifacts = _artifact_entries(record.artifact_directory)
+        pdf = next((item["name"] for item in artifacts if item["kind"] == "PDF"), None)
+        return {
+            "run_id": record.run_id,
+            "created_at": record.created_at,
+            "source_mode": record.source_mode,
+            "company": company,
+            "role": role,
+            "status": record.status,
+            "stage": record.stage,
+            "stage_index": _STAGE_INDEX.get(record.stage, 0),
+            "message": record.message,
+            "artifact_directory": (
+                str(record.artifact_directory)
+                if record.artifact_directory is not None
+                else None
+            ),
+            "error": record.error,
+            "events": [dict(item) for item in record.events],
+            "approval": approval,
+            "revision": record.revision,
+            "artifacts": artifacts,
+            "pdf_name": pdf,
+            "metadata": metadata,
+        }
+
+    def history(self) -> list[dict[str, Any]]:
+        with self._condition:
+            in_memory = {
+                str(record.artifact_directory.resolve()): self._snapshot_locked(record)
+                for record in self._records.values()
+                if record.artifact_directory is not None
+            }
+            pending = [
+                self._snapshot_locked(record)
+                for record in self._records.values()
+                if record.artifact_directory is None
+            ]
+        disk: list[dict[str, Any]] = []
+        try:
+            children = list(self.settings.output_directory.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            if (
+                child.name.startswith(".")
+                or child.is_symlink()
+                or not child.is_dir()
+                or not _is_direct_child(child, self.settings.output_directory)
+            ):
+                continue
+            key = str(child.resolve())
+            if key in in_memory:
+                continue
+            metadata = _safe_json(child / "run-metadata.json")
+            if metadata.get("application") != "resume-tailor":
+                continue
+            artifacts = _artifact_entries(child)
+            disk.append(
+                {
+                    "run_id": f"history-{child.name}",
+                    "created_at": metadata.get("created_at", ""),
+                    "company": metadata.get("company"),
+                    "role": metadata.get("role"),
+                    "status": metadata.get("status", "UNKNOWN"),
+                    "stage": metadata.get("stage", ""),
+                    "artifact_directory": str(child.resolve()),
+                    "artifacts": artifacts,
+                    "is_history": True,
+                }
+            )
+        values = [*pending, *in_memory.values(), *disk]
+        return sorted(values, key=lambda item: str(item.get("created_at", "")), reverse=True)
+
+    def resolve_artifact(self, run_id: str, artifact_name: str) -> Path:
+        if not _is_downloadable_name(artifact_name):
+            raise InputError("That artifact name is not allowed.")
+        with self._condition:
+            if run_id.startswith("history-"):
+                directory_name = run_id.removeprefix("history-")
+                if (
+                    Path(directory_name).name != directory_name
+                    or directory_name.startswith(".")
+                ):
+                    raise InputError("Invalid historical run identifier.")
+                run_directory = self.settings.output_directory / directory_name
+                metadata = _safe_json(run_directory / "run-metadata.json")
+                if metadata.get("application") != "resume-tailor":
+                    raise InputError(
+                        "The requested directory is not a validated resume-tailor run."
+                    )
+            else:
+                record = self._require_record(run_id)
+                run_directory = record.artifact_directory
+        if run_directory is None or not _is_direct_child(
+            run_directory, self.settings.output_directory
+        ):
+            raise InputError("The requested run directory is not available.")
+        candidate = run_directory / artifact_name
+        if (
+            candidate.is_symlink()
+            or not candidate.is_file()
+            or candidate.resolve().parent != run_directory.resolve()
+        ):
+            raise InputError("The requested artifact is not available.")
+        return candidate.resolve()
+
+    def _require_record(self, run_id: str) -> RunRecord:
+        record = self._records.get(run_id)
+        if record is None:
+            raise InputError("Unknown run identifier.")
+        return record
+
+    def wait_for(
+        self,
+        run_id: str,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        timeout: float = 10,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                snapshot = self._snapshot_locked(self._require_record(run_id))
+                if predicate(snapshot):
+                    return snapshot
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for run {run_id}.")
+                self._condition.wait(timeout=min(0.25, remaining))
+
+    def shutdown(self) -> None:
+        with self._condition:
+            records = list(self._records.values())
+            for record in records:
+                if record.status not in _TERMINAL_STATUSES:
+                    record.cancel_event.set()
+                    if record.approval is not None:
+                        record.approval_response = ApprovalResponse("cancel")
+            self._condition.notify_all()
+        for record in records:
+            if record.thread is not None and record.thread.is_alive():
+                record.thread.join(timeout=5)
+
+
+def _clock_text() -> str:
+    return datetime.now().astimezone().strftime("%H:%M:%S")
+
+
+def _safe_error_message(error: ResumeTailorError) -> str:
+    if isinstance(error, CodexSchemaCompatibilityError):
+        return "Codex could not start because its output schema was incompatible."
+    if isinstance(error, ModelError):
+        provider = (
+            "Codex"
+            if "codex" in str(error).casefold()
+            else "Antigravity"
+            if "antigravity" in str(error).casefold()
+            else "The model stage"
+        )
+        return (
+            f"{provider} stopped with an error. Sanitized technical details are "
+            "available below; useful artifacts were preserved."
+        )
+    message = str(error)
+    normalized = message.casefold()
+    if any(
+        term in normalized
+        for term in (
+            "login",
+            "expired",
+            "unavailable",
+            "permission",
+            "substantive",
+            "linkedin",
+        )
+    ):
+        return (
+            f"{message} Use a UTF-8 job file or pasted description as a safe fallback."
+        )
+    return message
+
+
+_TECHNICAL_BLOCK = re.compile(
+    r"BEGIN_[A-Z0-9_]+\s.*?END_[A-Z0-9_]+",
+    flags=re.DOTALL,
+)
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY)_[A-Z0-9_]*(?:KEY|TOKEN)"
+    r"\s*=\s*[^\s]+"
+)
+
+
+def _sanitized_technical_details(error: BaseException) -> str:
+    detail = _TECHNICAL_BLOCK.sub(
+        "[delimited prompt content omitted]",
+        str(error).strip(),
+    )
+    detail = _SENSITIVE_ASSIGNMENT.sub("[credential omitted]", detail)
+    lines: list[str] = []
+    for line in detail.splitlines()[:40]:
+        lines.append(line if len(line) <= 500 else line[:497] + "...")
+    sanitized = "\n".join(lines).strip()
+    if len(sanitized) > 3_000:
+        sanitized = sanitized[:2_997] + "..."
+    return sanitized or type(error).__name__
+
+
+def _render(
+    app: FastAPI,
+    request: Request,
+    template_name: str,
+    context: Mapping[str, Any],
+    *,
+    status_code: int = 200,
+) -> HTMLResponse:
+    environment: Environment = app.state.templates
+    template = environment.get_template(template_name)
+    html = template.render(
+        request=request,
+        csrf_token=app.state.settings.launch_token,
+        version=__version__,
+        workflow_stages=WORKFLOW_STAGES,
+        **context,
+    )
+    response = HTMLResponse(html, status_code=status_code)
+    response.set_cookie(
+        COOKIE_NAME,
+        app.state.settings.launch_token,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+        path="/",
+    )
+    return response
+
+
+def _session_valid(request: Request) -> bool:
+    expected = request.app.state.settings.launch_token
+    supplied = request.cookies.get(COOKIE_NAME, "")
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+def _require_session(request: Request) -> None:
+    if not _session_valid(request):
+        raise HTTPException(status_code=403, detail="Invalid localhost UI session.")
+
+
+def _require_csrf(request: Request, form: FormData) -> None:
+    _require_session(request)
+    supplied = str(form.get("csrf_token", ""))
+    expected = request.app.state.settings.launch_token
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token.")
+
+
+async def _limited_form(request: Request, *, max_files: int) -> FormData:
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit():
+        if int(content_length) > MAX_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"The submitted form exceeds the {MAX_REQUEST_BYTES:,}-byte "
+                    "request limit."
+                ),
+            )
+    return await request.form(
+        max_files=max_files,
+        max_fields=20,
+        max_part_size=MAX_JOB_BYTES,
+    )
+
+
+async def _upload_bytes(
+    upload: UploadFile,
+    *,
+    maximum: int,
+    label: str,
+) -> bytes:
+    value = await upload.read(maximum + 1)
+    if len(value) > maximum:
+        raise InputError(f"{label} exceeds the {maximum:,}-byte upload limit.")
+    if not value:
+        raise InputError(f"{label} is empty.")
+    return value
+
+
+def _validate_docx_archive(path: Path) -> None:
+    if not zipfile.is_zipfile(path):
+        raise InputError("The uploaded résumé is not a valid DOCX archive.")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            expanded_size = sum(item.file_size for item in archive.infolist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise InputError("The uploaded résumé could not be read as DOCX.") from exc
+    if "[Content_Types].xml" not in names or "word/document.xml" not in names:
+        raise InputError("The uploaded file does not contain a Word document.")
+    if expanded_size > 25 * 1024 * 1024:
+        raise InputError("The uploaded DOCX expands beyond the 25 MiB safety limit.")
+    validate_template(Document(path))
+
+
+def _form_text(form: FormData, name: str) -> str:
+    value = form.get(name, "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+async def _prepare_namespace(
+    *,
+    request: Request,
+    form: FormData,
+    manager: RunManager,
+) -> tuple[argparse.Namespace, Path, str, str | None, str | None]:
+    source_mode = _form_text(form, "job_mode")
+    if source_mode not in {"url", "pasted", "file"}:
+        raise InputError("Choose exactly one job-description input mode.")
+    resume_mode = _form_text(form, "resume_mode") or "master"
+    if resume_mode not in {"master", "upload"}:
+        raise InputError("Choose the bundled master résumé or a DOCX upload.")
+
+    staging = manager.create_staging_directory()
+    try:
+        if resume_mode == "master":
+            resume_path = manager.settings.master_resume
+            if not resume_path.is_file():
+                raise InputError(
+                    "The bundled master résumé is missing from this installation."
+                )
+        else:
+            upload = form.get("resume_upload")
+            if not isinstance(upload, UploadFile) or not upload.filename:
+                raise InputError("Choose a .docx résumé to upload.")
+            if Path(upload.filename).suffix.casefold() != ".docx":
+                raise InputError("Uploaded résumés must use the .docx extension.")
+            value = await _upload_bytes(
+                upload,
+                maximum=MAX_RESUME_BYTES,
+                label="Résumé upload",
+            )
+            resume_path = staging / "uploaded-resume.docx"
+            resume_path.write_bytes(value)
+            _validate_docx_archive(resume_path)
+
+        company: str | None = None
+        role: str | None = None
+        job_url: str | None = None
+        job_file: Path | None = None
+        if source_mode == "url":
+            job_url = _form_text(form, "job_url")
+            if not job_url:
+                raise InputError("Enter a LinkedIn job URL.")
+            job_url = validate_linkedin_url(job_url).normalized
+        else:
+            company = _validate_label(_form_text(form, "company"), "Company")
+            role = _validate_label(_form_text(form, "role"), "Role")
+            if source_mode == "pasted":
+                description = _form_text(form, "pasted_description")
+                if not description:
+                    raise InputError("Paste a complete job description.")
+                if len(description.encode("utf-8")) > MAX_JOB_BYTES:
+                    raise InputError(
+                        "The pasted job description exceeds the 500,000-byte limit."
+                    )
+            else:
+                upload = form.get("job_file")
+                if not isinstance(upload, UploadFile) or not upload.filename:
+                    raise InputError("Choose a UTF-8 .txt job-description file.")
+                if Path(upload.filename).suffix.casefold() != ".txt":
+                    raise InputError("Job-description uploads must use .txt.")
+                value = await _upload_bytes(
+                    upload,
+                    maximum=MAX_JOB_BYTES,
+                    label="Job-description upload",
+                )
+                try:
+                    description = value.decode("utf-8-sig").strip()
+                except UnicodeDecodeError as exc:
+                    raise InputError(
+                        "The job-description upload must be UTF-8 text."
+                    ) from exc
+                if not description:
+                    raise InputError("The job-description upload is empty.")
+            job_file = staging / "job-description.txt"
+            atomic_write_text(job_file, description.rstrip() + "\n")
+
+        namespace = argparse.Namespace(
+            resume=resume_path,
+            clipboard=False,
+            job_file=job_file,
+            job_url=job_url,
+            company=company,
+            role=role,
+            output_dir=manager.settings.output_directory,
+            yes=False,
+            keep_workdir=False,
+            timeout=manager.settings.timeout,
+        )
+        return namespace, staging, source_mode, company, role
+    except Exception:
+        _safe_remove_staging(staging, manager._staging_root)
+        raise
+
+
+def create_app(
+    *,
+    output_directory: Path | None = None,
+    master_resume: Path | None = None,
+    launch_token: str | None = None,
+    timeout: tuple[int, str] | None = None,
+    port: int = DEFAULT_PORT,
+    pipeline_runner: PipelineRunner = run_pipeline,
+) -> FastAPI:
+    root = _project_root()
+    static_directory = root / "resume_tailor" / "static"
+    template_directory = root / "resume_tailor" / "templates"
+    settings = UISettings(
+        host=DEFAULT_HOST,
+        port=port,
+        output_directory=(output_directory or default_output_directory())
+        .expanduser()
+        .resolve(),
+        master_resume=(master_resume or default_master_resume()).expanduser().resolve(),
+        launch_token=launch_token or secrets.token_urlsafe(32),
+        timeout=timeout or parse_duration("15m"),
+    )
+    settings.output_directory.mkdir(parents=True, exist_ok=True)
+    manager = RunManager(settings=settings, pipeline_runner=pipeline_runner)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        manager.shutdown()
+
+    app = FastAPI(
+        title="resume-tailor",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+    app.state.settings = settings
+    app.state.manager = manager
+    app.state.templates = Environment(
+        loader=FileSystemLoader(str(template_directory)),
+        autoescape=select_autoescape(("html", "xml")),
+        enable_async=False,
+    )
+    app.mount("/static", StaticFiles(directory=static_directory), name="static")
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Callable[..., Any]):
+        response = await call_next(request)
+        inline_pdf = (
+            request.url.path.casefold().endswith(".pdf")
+            and request.query_params.get("inline", "").casefold() in {"1", "true"}
+            and response.headers.get("content-type", "").casefold().startswith(
+                "application/pdf"
+            )
+        )
+        frame_ancestors = "'self'" if inline_pdf else "'none'"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; frame-src 'self'; object-src 'none'; "
+            f"base-uri 'none'; form-action 'self'; frame-ancestors {frame_ancestors}"
+        )
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = (
+            "SAMEORIGIN" if inline_pdf else "DENY"
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/health", response_class=JSONResponse)
+    async def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "application": "resume-tailor",
+            "version": __version__,
+            "bind_host": settings.host,
+        }
+
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard(request: Request) -> HTMLResponse:
+        return _render(
+            app,
+            request,
+            "dashboard.html",
+            {
+                "history": manager.history(),
+                "master_resume_name": settings.master_resume.name,
+                "form_error": None,
+                "form_values": {},
+            },
+        )
+
+    @app.post("/runs", response_class=HTMLResponse)
+    async def start_run(request: Request):
+        form = await _limited_form(request, max_files=2)
+        _require_csrf(request, form)
+        staging: Path | None = None
+        try:
+            namespace, staging, source_mode, company, role = await _prepare_namespace(
+                request=request,
+                form=form,
+                manager=manager,
+            )
+            record = manager.start(
+                namespace=namespace,
+                staging_directory=staging,
+                source_mode=source_mode,
+                company=company,
+                role=role,
+            )
+        except ActiveRunError as exc:
+            if staging is not None:
+                _safe_remove_staging(staging, manager._staging_root)
+            return _render(
+                app,
+                request,
+                "dashboard.html",
+                {
+                    "history": manager.history(),
+                    "master_resume_name": settings.master_resume.name,
+                    "form_error": str(exc),
+                    "form_values": _safe_form_values(form),
+                },
+                status_code=409,
+            )
+        except ResumeTailorError as exc:
+            return _render(
+                app,
+                request,
+                "dashboard.html",
+                {
+                    "history": manager.history(),
+                    "master_resume_name": settings.master_resume.name,
+                    "form_error": str(exc),
+                    "form_values": _safe_form_values(form),
+                },
+                status_code=422,
+            )
+        return RedirectResponse(f"/runs/{record.run_id}", status_code=303)
+
+    @app.get("/runs/{run_id}", response_class=HTMLResponse)
+    async def run_detail(request: Request, run_id: str) -> HTMLResponse:
+        _require_session(request)
+        try:
+            run = manager.snapshot(run_id)
+        except InputError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _render(app, request, "run.html", {"run": run})
+
+    @app.get("/api/runs/{run_id}", response_class=JSONResponse)
+    async def run_status(request: Request, run_id: str) -> dict[str, Any]:
+        _require_session(request)
+        try:
+            snapshot = manager.snapshot(run_id)
+        except InputError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            key: snapshot[key]
+            for key in (
+                "run_id",
+                "company",
+                "role",
+                "status",
+                "stage",
+                "stage_index",
+                "message",
+                "events",
+                "revision",
+            )
+        } | {"approval_kind": (snapshot["approval"] or {}).get("kind")}
+
+    @app.post("/runs/{run_id}/approval")
+    async def approval(request: Request, run_id: str):
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            manager.respond_to_approval(
+                run_id,
+                action=_form_text(form, "action"),
+                job_description=_form_text(form, "fallback_description"),
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return RedirectResponse(f"/runs/{run_id}", status_code=303)
+
+    @app.post("/runs/{run_id}/cancel")
+    async def cancel(request: Request, run_id: str):
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            manager.cancel(run_id)
+        except InputError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return RedirectResponse(f"/runs/{run_id}", status_code=303)
+
+    @app.get("/runs/{run_id}/artifacts/{artifact_name:path}")
+    async def artifact(
+        request: Request,
+        run_id: str,
+        artifact_name: str,
+        inline: bool = False,
+    ):
+        _require_session(request)
+        try:
+            path = manager.resolve_artifact(run_id, artifact_name)
+        except InputError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        media_type = {
+            ".docx": (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".json": "application/json",
+            ".md": "text/markdown; charset=utf-8",
+            ".txt": "text/plain; charset=utf-8",
+        }.get(path.suffix.casefold(), "application/octet-stream")
+        disposition = (
+            "inline"
+            if inline and path.suffix.casefold() == ".pdf"
+            else "attachment"
+        )
+
+        async def file_chunks():
+            with path.open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    yield chunk
+
+        encoded_name = quote(path.name, safe="")
+        return StreamingResponse(
+            file_chunks(),
+            media_type=media_type,
+            headers={
+                "Content-Disposition": (
+                    f"{disposition}; filename*=UTF-8''{encoded_name}"
+                )
+            },
+        )
+
+    return app
+
+
+def _safe_form_values(form: FormData) -> dict[str, str]:
+    allowed = {
+        "resume_mode",
+        "job_mode",
+        "job_url",
+        "company",
+        "role",
+        "pasted_description",
+    }
+    return {
+        name: value[:10_000]
+        for name in allowed
+        if isinstance((value := form.get(name)), str)
+    }

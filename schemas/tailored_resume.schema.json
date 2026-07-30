@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Antigravity tailored resume response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "message", "questions_for_user", "tailored_resume"],
+  "properties": {
+    "status": {"type": "string", "enum": ["READY", "WAITING", "ERROR"]},
+    "message": {"type": "string"},
+    "questions_for_user": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "tailored_resume": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/resume"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "READY"}}},
+      "then": {
+        "properties": {
+          "tailored_resume": {"$ref": "#/$defs/resume"},
+          "questions_for_user": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"enum": ["WAITING", "ERROR"]}}},
+      "then": {"properties": {"tailored_resume": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "labelled_text": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "text"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1}
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "technologies", "bullets"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "technologies": {"type": "string", "minLength": 1},
+        "bullets": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "maxItems": 8
+        }
+      }
+    },
+    "resume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "professional_summary",
+        "education",
+        "skill_groups",
+        "projects",
+        "open_source",
+        "experience"
+      ],
+      "properties": {
+        "professional_summary": {"type": "string", "minLength": 1},
+        "education": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "institution",
+            "degree_details",
+            "coursework",
+            "certifications"
+          ],
+          "properties": {
+            "institution": {"type": "string", "minLength": 1},
+            "degree_details": {"type": "string", "minLength": 1},
+            "coursework": {"$ref": "#/$defs/labelled_text"},
+            "certifications": {"$ref": "#/$defs/labelled_text"}
+          }
+        },
+        "skill_groups": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/labelled_text"},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "projects": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/project"},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "open_source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "technologies", "bullet"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "technologies": {"type": "string", "minLength": 1},
+            "bullet": {"type": "string", "minLength": 1}
+          }
+        },
+        "experience": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "employer_location", "dates", "bullets"],
+          "properties": {
+            "role": {"type": "string", "minLength": 1},
+            "employer_location": {"type": "string", "minLength": 1},
+            "dates": {"type": "string", "minLength": 1},
+            "bullets": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1},
+              "minItems": 1,
+              "maxItems": 4
+            }
+          }
+        }
+      }
+    }
+  }
+}

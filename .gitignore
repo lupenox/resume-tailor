@@ -1,0 +1,84 @@
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+credentials/
+secrets/
+
+# Python environments, packages, and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+
+# Real résumés and generated office artifacts
+*.docx
+*.pdf
+!template/sample_resume.docx
+tailored-output/
+output/
+outputs/
+uploads/
+artifacts/
+runs/
+run-history/
+local-data/
+private/
+
+# Job postings, analyses, and local run records
+job-description*.txt
+job_description*.txt
+job-posting*.txt
+linkedin-job*.json
+run-*.json
+analysis-output*.json
+final-qa*.json
+
+# Logs, lock files, temporary files, and browser profiles
+*.log
+*.trace
+*.tmp
+*.swp
+*.swo
+.~lock.*#
+.ui-staging/
+chrome-profile*/
+playwright-report/
+test-results/
+
+# Installer and managed-installation backups
+*.backup-*
+backups/
+installer-backups/
+managed-installation/
+.resume-tailor.install.*/
+
+# Agent transcripts and private design-review material
+.agents/
+.antigravity/
+.codex/
+agent-transcripts/
+*transcript*
+design-references/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

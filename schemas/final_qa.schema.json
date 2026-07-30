@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Final resume QA",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "checks",
+    "material_issues",
+    "improvement_assessment"
+  ],
+  "properties": {
+    "status": {"type": "string", "enum": ["PASS", "REVIEW_REQUIRED", "ERROR"]},
+    "summary": {"type": "string", "minLength": 1},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "status", "finding"],
+        "properties": {
+          "category": {"type": "string", "minLength": 1},
+          "status": {"type": "string", "enum": ["PASS", "WARN", "FAIL"]},
+          "finding": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "material_issues": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "improvement_assessment": {"type": "string", "minLength": 1}
+  }
+}

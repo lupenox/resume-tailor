@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#08101e">
+    <title>{% block title %}resume-tailor{% endblock %}</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="resume-tailor dashboard">
+        <span class="brand-mark" aria-hidden="true">
+          <img src="/static/favicon.svg" alt="">
+        </span>
+        <span>
+          <strong>resume-tailor</strong>
+          <small>Truthful AI-assisted tailoring</small>
+        </span>
+      </a>
+      <div class="local-badge">
+        <span class="status-dot" aria-hidden="true"></span>
+        Localhost only
+      </div>
+    </header>
+
+    <main class="page-shell">
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+      <span>Local UI · v{{ version }}</span>
+      <span>Model calls occur only after your approval gates.</span>
+    </footer>
+  </body>
+</html>

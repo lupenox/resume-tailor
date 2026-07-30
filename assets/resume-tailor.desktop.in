@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=resume-tailor
+GenericName=Résumé Tailoring
+Comment=Create truthful, human-approved tailored résumés
+Exec=@UI_LAUNCHER@
+Icon=@ICON_PATH@
+Terminal=false
+Categories=Office;
+StartupNotify=true
+X-Resume-Tailor-Managed=true

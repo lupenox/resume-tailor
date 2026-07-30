@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+if "--version" in sys.argv:
+    print("codex-cli stub-0.0")
+    raise SystemExit(0)
+
+mode = os.environ.get("STUB_CODEX_MODE", "ready")
+if mode == "process_error":
+    print("stub Codex failure", file=sys.stderr)
+    raise SystemExit(9)
+
+try:
+    output_path = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
+except (ValueError, IndexError):
+    print("missing --output-last-message", file=sys.stderr)
+    raise SystemExit(2)
+try:
+    transport_schema_path = Path(sys.argv[sys.argv.index("--output-schema") + 1])
+    transport_schema = json.loads(transport_schema_path.read_text(encoding="utf-8"))
+except (ValueError, IndexError, OSError, json.JSONDecodeError):
+    print("missing or invalid --output-schema", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def schema_keywords(value: object):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield key
+            yield from schema_keywords(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from schema_keywords(child)
+
+
+for unsupported in ("uniqueItems", "minLength", "maxLength"):
+    if unsupported in set(schema_keywords(transport_schema)):
+        print(
+            f"invalid_json_schema: unsupported keyword {unsupported}",
+            file=sys.stderr,
+        )
+        raise SystemExit(22)
+
+schema_log = os.environ.get("STUB_CODEX_SCHEMA_LOG")
+if schema_log:
+    with Path(schema_log).open("a", encoding="utf-8") as handle:
+        handle.write(f"{transport_schema_path}\n")
+
+prompt = sys.stdin.read()
+output_path.parent.mkdir(parents=True, exist_ok=True)
+if mode == "bad_json":
+    output_path.write_text("not-json", encoding="utf-8")
+    raise SystemExit(0)
+
+if "Perform a fresh, read-only final QA review" in prompt:
+    if mode == "qa_fail":
+        payload = {
+            "status": "REVIEW_REQUIRED",
+            "summary": "A material visual issue needs review.",
+            "checks": [
+                {
+                    "category": "visual layout",
+                    "status": "FAIL",
+                    "finding": "Stubbed clipping finding.",
+                }
+            ],
+            "material_issues": ["Stubbed clipping finding."],
+            "improvement_assessment": "Cannot approve until reviewed.",
+        }
+    else:
+        payload = {
+            "status": "PASS",
+            "summary": "Stubbed read-only QA passed.",
+            "checks": [
+                {
+                    "category": "truthfulness",
+                    "status": "PASS",
+                    "finding": "No unsupported claims detected.",
+                },
+                {
+                    "category": "visual layout",
+                    "status": "PASS",
+                    "finding": "One readable page with no clipping detected.",
+                },
+            ],
+            "material_issues": [],
+            "improvement_assessment": "Alignment is at least as strong as the source.",
+        }
+else:
+    questions = (
+        ["Please confirm a factual detail."]
+        if mode == "questions"
+        else []
+    )
+    payload = {
+        "role_summary": "Stubbed target role analysis.",
+        "fit_assessment": {
+            "overall": "Supported fit based on the supplied master resume.",
+            "strengths": ["Agentic AI project evidence"],
+            "gaps": ["No unsupported experience should be claimed"],
+        },
+        "matched_requirements": ["Python"],
+        "evidence_map": [
+            {
+                "requirement": "Python",
+                "resume_evidence": ["Python"],
+                "strength": "strong",
+            }
+        ],
+        "supported_ats_keywords": ["Python"],
+        "missing_or_unsupported_requirements": [],
+        "recommended_edits": [],
+        "immutable_facts": [
+            "University of Wisconsin–Milwaukee",
+            "Expected Dec 2026",
+            "June 2026 – Present",
+        ],
+        "forbidden_claims": [
+            "RAG",
+            "GraphQL",
+            "distributed production scale",
+        ],
+        "content_budget_guidance": [],
+        "questions_for_user": questions,
+    }
+    if mode == "duplicates":
+        payload["fit_assessment"]["strengths"].append(
+            payload["fit_assessment"]["strengths"][0]
+        )
+        payload["matched_requirements"].append(payload["matched_requirements"][0])
+        payload["supported_ats_keywords"].append(
+            payload["supported_ats_keywords"][0]
+        )
+
+output_path.write_text(
+    json.dumps(payload, ensure_ascii=False),
+    encoding="utf-8",
+)
+print("stub complete")
