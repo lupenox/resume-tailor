@@ -55,6 +55,7 @@ from .utilities import (
     CancellationError,
     CodexSchemaCompatibilityError,
     InputError,
+    LinkedInResponseEnvelopeError,
     ModelError,
     ResumeTailorError,
     SourceEvidenceError,
@@ -87,6 +88,7 @@ _STAGE_INDEX = {name: index for index, (name, _) in enumerate(WORKFLOW_STAGES)}
 _TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
 _DOWNLOAD_EXACT = {
     "job-source.json",
+    "linkedin-response-envelope.json",
     "job-description.txt",
     "job-requirements.json",
     "extracted-master-resume.json",
@@ -788,6 +790,13 @@ class RunManager:
                 "argument vector before provider startup. Prompt content is omitted."
             )
             message = _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
+        elif failure_kind == "linkedin_response_envelope":
+            technical = (
+                "Antigravity's terminal LinkedIn retrieval event did not contain "
+                "one schema-valid structured result. Provider prose and posting "
+                "content are omitted."
+            )
+            message = _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE
         elif failure_kind == "antigravity_response_envelope":
             technical = (
                 "Antigravity returned a documented print-mode JSON wrapper, but "
@@ -1111,6 +1120,10 @@ _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE = (
 _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE = (
     "Antigravity returned JSON in an unsupported response format."
 )
+_LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE = (
+    "Antigravity could not return the LinkedIn posting in its documented "
+    "structured-output envelope. No résumé analysis or tailoring was started."
+)
 _ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE = (
     "Antigravity did not apply the approved tailoring plan and returned a "
     "non-actionable request for another task. All authenticated inputs were "
@@ -1137,6 +1150,11 @@ def _failure_kind_for_error(
         and "Argument list too long" in str(error)
     ):
         return "antigravity_launch_size"
+    if isinstance(error, LinkedInResponseEnvelopeError) or (
+        stage in {"fetching_job", "confirming_posting"}
+        and isinstance(error, AntigravityResponseEnvelopeError)
+    ):
+        return "linkedin_response_envelope"
     if isinstance(error, AntigravityResponseEnvelopeError):
         return "antigravity_response_envelope"
     if isinstance(error, AntigravityTailoringContractError):
@@ -1159,6 +1177,19 @@ def _failure_kind_for_error(
 def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
     if metadata.get("failure_class") == "source-evidence-analysis":
         return "source_evidence"
+    error = metadata.get("error")
+    error_type = error.get("type") if isinstance(error, Mapping) else None
+    error_message = error.get("message") if isinstance(error, Mapping) else None
+    stage = str(metadata.get("stage", ""))
+    if (
+        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
+        and (
+            metadata.get("failure_class") == "linkedin-response-envelope"
+            or error_type
+            in {"LinkedInResponseEnvelopeError", "AntigravityResponseEnvelopeError"}
+        )
+    ):
+        return "linkedin_response_envelope"
     antigravity_failure = antigravity_retry_failure_kind(dict(metadata))
     if antigravity_failure == "launch_size":
         return "antigravity_launch_size"
@@ -1173,10 +1204,6 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         return "antigravity_cannot_apply"
     if antigravity_failure == "technical_failure":
         return "antigravity_technical_failure"
-    error = metadata.get("error")
-    error_type = error.get("type") if isinstance(error, Mapping) else None
-    error_message = error.get("message") if isinstance(error, Mapping) else None
-    stage = str(metadata.get("stage", ""))
     if (
         stage == "codex-analysis"
         and error_type in {"SourceEvidenceError", "TruthfulnessError"}
@@ -1221,6 +1248,8 @@ def _safe_error_message(error: ResumeTailorError) -> str:
         and "agy" in str(error)
     ):
         return _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
+    if isinstance(error, LinkedInResponseEnvelopeError):
+        return _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE
     if isinstance(error, AntigravityResponseEnvelopeError):
         return _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE
     if isinstance(error, AntigravityTailoringContractError):
