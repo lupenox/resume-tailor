@@ -174,6 +174,29 @@ def test_prompt_free_argument_array_contains_only_flags_and_short_paths() -> Non
     assert all(len(value.encode("utf-8")) < 4_096 for value in args)
 
 
+def test_linkedin_transport_selects_documented_stream_json_format() -> None:
+    args = antigravity_print_args(
+        executable="/synthetic/bin/agy",
+        schema=Path("/synthetic/linkedin.schema.json"),
+        print_timeout="30s",
+        agent_mode="plan",
+        output_format="stream-json",
+    )
+
+    assert args[args.index("--output-format") + 1] == "stream-json"
+    assert "--mode=plan" in args
+
+
+def test_unknown_antigravity_output_format_is_rejected() -> None:
+    with pytest.raises(DependencyError, match="output format"):
+        antigravity_print_args(
+            executable="/synthetic/bin/agy",
+            schema=Path("/synthetic/schema.json"),
+            print_timeout="30s",
+            output_format="synthetic-unknown",
+        )
+
+
 def test_cancellation_hides_prompt_from_cmdline_and_stops_process_group(
     master_resume: Path,
     tmp_path: Path,
