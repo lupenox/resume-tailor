@@ -21,7 +21,8 @@ The web UI is optional. `tailor-resume` remains the complete terminal interface;
 1. Read a job posting from the Linux clipboard or a UTF-8 text file, or ask
    Antigravity to read and strictly extract one public LinkedIn job URL.
 2. For URL mode, validate HTTPS/hostname/path/redirect/job-ID consistency, save
-   `job-source.json`, display the derived posting identity, and require approval.
+   `job-source.json`, consume one typed terminal `stream-json` result, display
+   the derived posting identity, and require approval.
 3. Validate and structurally extract the master DOCX with `python-docx`.
 4. Send the extracted resume and untrusted posting to Codex in an ephemeral,
    read-only session with a strict analysis schema.
@@ -627,7 +628,9 @@ Tailoring accepts only one complete documented structured-output candidate. A
 direct-root result, a supported JSON-wrapper field, or one typed terminal
 `stream-json` result is decoded once and validated strictly. Resume Tailor never
 extracts braces from prose, removes Markdown fences, joins fragments, or chooses
-among multiple candidates.
+among conflicting candidates. If `structured_output` and `response` contain
+canonically identical complete JSON values, they are treated as two documented
+representations of the same result and `structured_output` is preferred.
 
 The UI classifies this as **Antigravity returned JSON in an unsupported response
 format.** If the preserved bytes already contain one valid complete result and
@@ -636,6 +639,15 @@ authenticates, **Reprocess preserved Antigravity response** creates a new
 provider-free run and pauses at the content-diff gate. Otherwise, offline salvage
 is unavailable; authenticated **Retry Antigravity tailoring** remains available
 without rerunning LinkedIn or Codex.
+
+LinkedIn URL retrieval uses the documented `stream-json` terminal
+`{"event":"result","result":{...}}` envelope. A malformed, missing, conflicting,
+or schema-invalid terminal result is shown as **LinkedIn response-format
+failure**, writes only content-free hashes/types to
+`linkedin-response-envelope.json`, and stops before résumé analysis. Tailoring
+retry and offline tailoring-response reprocessing are never offered for this
+stage; use a UTF-8 job file or pasted description while correcting provider
+compatibility.
 
 ### The UI does not open
 
@@ -689,7 +701,8 @@ Development and inspection verified these local interfaces:
   `--output-schema`, `--output-last-message`, and `--image`.
 - Antigravity CLI `1.1.8`: `--prompt` print mode with UTF-8 stdin, optional
   `--mode=plan` for passive LinkedIn retrieval, `--sandbox`,
-  `--output-format json`, typed `stream-json` terminal results,
+  `--output-format json` for tailoring, `--output-format stream-json` with an
+  `event=result` terminal envelope for LinkedIn retrieval,
   `--json-schema`, and `--print-timeout`.
 - LibreOffice `26.2.4.2`.
 - Poppler `26.07.0`.
