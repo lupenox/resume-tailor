@@ -58,6 +58,7 @@ from .utilities import (
     ExitCode,
     InputError,
     IntegrityError,
+    LinkedInResponseEnvelopeError,
     QAError,
     ResumeTailorError,
     SourceEvidenceError,
@@ -1171,7 +1172,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["failure_class"] = "source-evidence-analysis"
         if isinstance(exc, AntigravityLaunchSizeError):
             metadata["failure_class"] = "antigravity-launch-size"
-        if isinstance(exc, AntigravityResponseEnvelopeError):
+        if isinstance(exc, LinkedInResponseEnvelopeError):
+            metadata["failure_class"] = "linkedin-response-envelope"
+        elif isinstance(exc, AntigravityResponseEnvelopeError):
             metadata["failure_class"] = "antigravity-response-envelope"
         if isinstance(exc, AntigravityTailoringContractError):
             metadata["failure_class"] = "antigravity-tailoring-contract"
@@ -1186,6 +1189,8 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             "message": str(exc),
             "exit_code": int(exc.exit_code),
         }
+        if isinstance(exc, AntigravityResponseEnvelopeError):
+            metadata["error"]["response_envelope_type"] = exc.envelope_type
         raise
     except Exception as exc:
         caught_error = InputError(f"Unexpected internal error: {type(exc).__name__}: {exc}")
