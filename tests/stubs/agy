@@ -231,6 +231,85 @@ if "LINKEDIN_JOB_EXTRACTION_REQUEST" in prompt:
         "ai_focus_areas": ["Model evaluation", "AI orchestration"],
         "warnings": warnings,
     }
+    if linkedin_mode in {
+        "print_response_string",
+        "print_response_object",
+        "nested_response_structured_output",
+        "print_response_prose",
+        "print_response_fenced",
+        "ambiguous_response",
+        "schema_mismatch",
+    }:
+        schema_index = sys.argv.index("--json-schema")
+        expected_schema = json.loads(
+            Path(sys.argv[schema_index + 1]).read_text(encoding="utf-8")
+        )
+        embedded_schema = (
+            {"type": "object"}
+            if linkedin_mode == "schema_mismatch"
+            else expected_schema
+        )
+        if linkedin_mode == "print_response_string":
+            response = json.dumps(structured, ensure_ascii=False)
+            output = {
+                "conversation_id": "00000000-0000-4000-8000-000000000000",
+                "duration_seconds": 1.25,
+                "json_schema": embedded_schema,
+                "num_turns": 2,
+                "response": response,
+                "status": "SUCCESS",
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 5,
+                    "total_tokens": 25,
+                },
+            }
+        elif linkedin_mode == "print_response_object":
+            output = {
+                "json_schema": embedded_schema,
+                "response": structured,
+                "status": "SUCCESS",
+            }
+        elif linkedin_mode == "nested_response_structured_output":
+            output = {
+                "json_schema": embedded_schema,
+                "response": {"structured_output": structured},
+                "status": "SUCCESS",
+            }
+        elif linkedin_mode == "print_response_prose":
+            output = {
+                "json_schema": embedded_schema,
+                "response": (
+                    "Extraction complete.\n"
+                    + json.dumps(structured, ensure_ascii=False)
+                ),
+                "status": "SUCCESS",
+            }
+        elif linkedin_mode == "print_response_fenced":
+            output = {
+                "json_schema": embedded_schema,
+                "response": (
+                    "```json\n"
+                    + json.dumps(structured, ensure_ascii=False)
+                    + "\n```"
+                ),
+                "status": "SUCCESS",
+            }
+        elif linkedin_mode == "ambiguous_response":
+            output = {
+                "json_schema": embedded_schema,
+                "structured_output": structured,
+                "response": json.dumps(structured, ensure_ascii=False),
+                "status": "SUCCESS",
+            }
+        else:
+            output = {
+                "json_schema": embedded_schema,
+                "response": json.dumps(structured, ensure_ascii=False),
+                "status": "SUCCESS",
+            }
+        print(json.dumps(output, ensure_ascii=False))
+        raise SystemExit(0)
     print(json.dumps({"structured_output": structured}, ensure_ascii=False))
     raise SystemExit(0)
 
