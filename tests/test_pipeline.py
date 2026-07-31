@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import resume_tailor.cli as cli_module
 from resume_tailor.cli import main
 from resume_tailor.utilities import ExitCode, sha256_file
 
@@ -247,6 +248,41 @@ def test_user_rejecting_linkedin_confirmation_stops_before_codex(
     assert not (run / "codex-analysis.json").exists()
     assert not list(run.glob("*.docx"))
     assert prompts == ['LinkedIn posting: type "approve" to continue: ']
+
+
+def test_linkedin_envelope_failure_is_stage_specific_and_stops_before_codex(
+    master_resume: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUB_LINKEDIN_MODE", "print_response_prose")
+    monkeypatch.setattr(
+        cli_module,
+        "_dependency_versions",
+        lambda _cwd: {
+            "resume_tailor": "0.1.0",
+            "codex": "stub",
+            "antigravity": "stub",
+        },
+    )
+    output_dir = tmp_path / "url-output"
+
+    code = main(_url_arguments(master_resume, output_dir))
+
+    assert code == ExitCode.MODEL
+    run = next(output_dir.iterdir())
+    metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["stage"] == "linkedin-job-extraction"
+    assert metadata["failure_class"] == "linkedin-response-envelope"
+    assert metadata["error"]["type"] == "LinkedInResponseEnvelopeError"
+    assert metadata["error"]["response_envelope_type"].startswith(
+        "stream-json-event-result:"
+    )
+    assert (run / "linkedin-response-envelope.json").is_file()
+    assert not (run / "codex-analysis.json").exists()
+    assert not (run / "antigravity-response.json").exists()
+    assert not list(run.glob("*.docx"))
 
 
 def test_url_pipeline_continues_after_explicit_confirmation(
