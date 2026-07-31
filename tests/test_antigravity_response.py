@@ -96,19 +96,42 @@ def test_wrapper_may_carry_non_candidate_human_response_text(
     assert located.envelope_type == "json-wrapper-structured_output"
 
 
-def test_stream_json_accepts_one_documented_terminal_result(
+def test_wrapper_accepts_identical_documented_structured_output_and_response(
     synthetic_content: dict[str, Any],
 ) -> None:
     complete = _complete(copy.deepcopy(synthetic_content))
+    response = {
+        "status": "SUCCESS",
+        "structured_output": complete,
+        "response": json.dumps(complete, ensure_ascii=False),
+    }
+
+    located = locate_json_tailoring_candidate(response)
+
+    assert located.envelope_type == "json-wrapper-structured_output"
+    assert located.payload == complete
+
+
+def test_stream_json_accepts_current_documented_terminal_result(
+    synthetic_content: dict[str, Any],
+) -> None:
+    complete = _complete(copy.deepcopy(synthetic_content))
+    schema = load_schema("tailored_resume.schema.json")
     stream = "\n".join(
         (
-            json.dumps({"step_type": "init", "conversation_id": "synthetic"}),
-            json.dumps({"step_type": "step_update", "status": "running"}),
+            json.dumps({"event": "init", "init": {"conversation_id": "synthetic"}}),
+            json.dumps(
+                {"event": "step_update", "step_update": {"status": "running"}}
+            ),
             json.dumps(
                 {
-                    "step_type": "result",
-                    "result": complete,
-                    "json_schema": load_schema("tailored_resume.schema.json"),
+                    "event": "result",
+                    "result": {
+                        "status": "SUCCESS",
+                        "structured_output": complete,
+                        "response": json.dumps(complete, ensure_ascii=False),
+                        "json_schema": schema,
+                    },
                 },
                 ensure_ascii=False,
             ),
@@ -121,11 +144,39 @@ def test_stream_json_accepts_one_documented_terminal_result(
     )
 
     assert len(events) == 3
-    assert candidate.envelope_type == "stream-json-terminal-result"
+    assert (
+        candidate.envelope_type
+        == "stream-json-event-result:json-wrapper-structured_output"
+    )
     assert resolve_tailoring_response(
         candidate.payload,
         approved_analysis=_analysis(),
     ) == synthetic_content
+
+
+def test_stream_json_retains_legacy_terminal_compatibility(
+    synthetic_content: dict[str, Any],
+) -> None:
+    complete = _complete(copy.deepcopy(synthetic_content))
+    stream = json.dumps(
+        {
+            "step_type": "result",
+            "result": complete,
+            "json_schema": load_schema("tailored_resume.schema.json"),
+        },
+        ensure_ascii=False,
+    )
+
+    events, candidate = parse_stream_json_output(
+        stream,
+        expected_schema=load_schema("tailored_resume.schema.json"),
+    )
+
+    assert len(events) == 1
+    assert (
+        candidate.envelope_type
+        == "stream-json-legacy-step-result:json-wrapper-result"
+    )
 
 
 def test_exact_print_wrapper_shape_is_rejected_without_prose_scraping(
@@ -160,7 +211,7 @@ def test_exact_print_wrapper_shape_is_rejected_without_prose_scraping(
         (
             {
                 "structured_output": {"synthetic": True},
-                "result": {"synthetic": True},
+                "result": {"synthetic": False},
             },
             "json-wrapper-multiple-structured-candidates",
         ),
