@@ -15,10 +15,11 @@ reasoning.
 
 ## Conservative parsing
 
-Plan-mode LinkedIn extraction and print-mode tailoring use separate adapters.
-For tailoring, local code accepts only one unambiguous whole-document candidate:
+Plan-mode LinkedIn extraction and print-mode tailoring retain separate schemas
+and adapters, but share the same conservative envelope locator. Local code
+accepts only one unambiguous whole-document candidate:
 
-- the tailored schema object at the JSON root;
+- the current stage's schema object at the JSON root;
 - one documented JSON-wrapper field whose object or complete JSON string is the
   candidate;
 - one terminal `result` event in Antigravity 1.1.8 `stream-json`, with the
@@ -29,11 +30,14 @@ not scan prose for braces, strip Markdown fences, join fragments, or choose amon
 multiple candidates. Missing, malformed, ambiguous, schema-mismatched, or
 schema-invalid output is rejected before content validation or rendering.
 
-Every accepted candidate is validated against `tailored_resume.schema.json` and
-then against the local approved-edit and factual-integrity contracts. Run
-metadata records the CLI version, print mode, output format, envelope type,
-schema hash, response-artifact hash, and validation result. Logs and exceptions
-contain no provider response text.
+Every accepted candidate is validated against its stage's canonical schema.
+Tailoring is then validated against the local approved-edit and
+factual-integrity contracts. LinkedIn extraction is separately validated
+against the requested URL, stable job ID, allowed redirect scope, safe text, and
+minimum substantive-description rules. Run metadata records the CLI version,
+mode, output format, envelope type, schema hash, response-artifact hash, and
+validation result where applicable. Logs and exceptions contain no provider
+response text.
 
 ## Recovery
 
