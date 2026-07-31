@@ -54,8 +54,16 @@ class InputError(ResumeTailorError):
     exit_code = ExitCode.INPUT
 
 
+class ApifyConfigurationError(InputError):
+    """Apify URL retrieval was selected without a usable local configuration."""
+
+
 class ModelError(ResumeTailorError):
     exit_code = ExitCode.MODEL
+
+
+class ApifyProviderError(ModelError):
+    """Apify failed to return one locally verifiable job posting."""
 
 
 class AntigravityTailoringContractError(ModelError):

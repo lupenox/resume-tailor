@@ -318,7 +318,7 @@ def _linkedin_envelope_error(
     )
 
 
-def _diagnostic_payload(requested_url: str, warning: str) -> dict[str, Any]:
+def diagnostic_job_payload(requested_url: str, warning: str) -> dict[str, Any]:
     safe_warning = "".join(
         character
         for character in warning
@@ -367,12 +367,12 @@ def _soft_permission_payload(
         return None
     if not any(word in normalized for word in ("denied", "required", "approval", "allow")):
         return None
-    payload = _diagnostic_payload(requested_url, message)
+    payload = diagnostic_job_payload(requested_url, message)
     payload["fetch_status"] = "permission_denied"
     return payload
 
 
-def _normalize_description(value: str) -> str:
+def normalize_job_description(value: str) -> str:
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in value.splitlines()]
     normalized_lines: list[str] = []
@@ -449,7 +449,8 @@ def validate_job_source(
     )
     if returned_request.normalized != requested.normalized:
         raise InputError(
-            "Antigravity returned a different requested URL than the one supplied. "
+            "The LinkedIn retrieval provider returned a different requested URL "
+            "than the one supplied. "
             "Retry with --job-file PATH or --clipboard."
         )
 
@@ -499,7 +500,7 @@ def validate_job_source(
             "LinkedIn extraction omitted the company or job title. Retry with "
             "--job-file PATH or --clipboard."
         )
-    description = _normalize_description(payload["normalized_job_description"])
+    description = normalize_job_description(payload["normalized_job_description"])
     if (
         len(description) < _MINIMUM_DESCRIPTION_CHARACTERS
         or len(description.split()) < _MINIMUM_DESCRIPTION_WORDS
@@ -540,7 +541,7 @@ def invoke_linkedin_job_extraction(
     except ModelError as exc:
         atomic_write_json(
             artifact_path,
-            _diagnostic_payload(requested_url.normalized, str(exc)),
+            diagnostic_job_payload(requested_url.normalized, str(exc)),
         )
         raise
 
@@ -567,7 +568,7 @@ def invoke_linkedin_job_extraction(
         atomic_write_json(response_metadata_path, diagnostic)
         atomic_write_json(
             artifact_path,
-            _diagnostic_payload(requested_url.normalized, str(exc)),
+            diagnostic_job_payload(requested_url.normalized, str(exc)),
         )
         raise _linkedin_envelope_error(
             envelope_type=str(diagnostic["response_envelope_type"]),
@@ -634,7 +635,7 @@ def invoke_linkedin_job_extraction(
             )
         atomic_write_json(
             artifact_path,
-            _diagnostic_payload(requested_url.normalized, str(exc)),
+            diagnostic_job_payload(requested_url.normalized, str(exc)),
         )
         raise
 
@@ -643,11 +644,11 @@ def invoke_linkedin_job_extraction(
     except InputError as exc:
         atomic_write_json(
             artifact_path,
-            _diagnostic_payload(requested_url.normalized, str(exc)),
+            diagnostic_job_payload(requested_url.normalized, str(exc)),
         )
         raise
     prepared_candidate = dict(candidate)
-    prepared_candidate["normalized_job_description"] = _normalize_description(
+    prepared_candidate["normalized_job_description"] = normalize_job_description(
         candidate["normalized_job_description"]
     )
     atomic_write_json(artifact_path, prepared_candidate)

@@ -250,6 +250,86 @@ def test_user_rejecting_linkedin_confirmation_stops_before_codex(
     assert prompts == ['LinkedIn posting: type "approve" to continue: ']
 
 
+def test_apify_provider_dispatches_locally_before_confirmation(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posting = {
+        "fetch_status": "success",
+        "requested_url": (
+            "https://www.linkedin.com/jobs/view/general-ai-role-4123456789/"
+        ),
+        "final_resolved_url": (
+            "https://www.linkedin.com/jobs/view/general-ai-role-4123456789/"
+        ),
+        "linkedin_job_id": "4123456789",
+        "job_title": "Synthetic AI Engineer",
+        "company": "Example Systems",
+        "location": "Remote",
+        "workplace_type": "remote",
+        "employment_type": "Full-time",
+        "salary": None,
+        "normalized_job_description": (
+            "Build safe Python services for synthetic evidence workflows. "
+            "Collaborate with engineers, validate structured inputs, write tests, "
+            "document decisions, maintain APIs, review failures, and improve "
+            "reliable automation across a privacy-conscious local application. "
+            "This additional synthetic detail ensures the posting is substantive "
+            "without containing personal, company-confidential, or résumé data."
+        ),
+        "responsibilities": [],
+        "required_qualifications": [],
+        "preferred_qualifications": [],
+        "technologies_and_skills": [],
+        "ai_focus_areas": [],
+        "warnings": ["Synthetic Apify fixture."],
+    }
+    calls: list[str] = []
+
+    def apify_fetch(**_: object) -> dict[str, object]:
+        calls.append("apify")
+        return posting
+
+    monkeypatch.setattr(cli_module, "invoke_apify_job_extraction", apify_fetch)
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_linkedin_job_extraction",
+        lambda **_: pytest.fail("Antigravity URL retrieval was invoked"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_dependency_versions",
+        lambda _: {
+            "resume_tailor": "0.1.0",
+            "codex": "stub",
+            "antigravity": "stub",
+            "libreoffice": "stub",
+        },
+    )
+    monkeypatch.setattr("builtins.input", lambda _: "reject")
+    output_dir = tmp_path / "url-output"
+
+    code = main(
+        [
+            *_url_arguments(master_resume, output_dir),
+            "--linkedin-provider",
+            "apify",
+        ]
+    )
+
+    assert code == ExitCode.APPROVAL
+    assert calls == ["apify"]
+    run = next(output_dir.iterdir())
+    metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["linkedin_retrieval"] == {
+        "requested_provider": "apify",
+        "resolved_provider": "apify",
+        "automatic_fallback": False,
+    }
+    assert not (run / "codex-analysis.json").exists()
+
+
 def test_linkedin_envelope_failure_is_stage_specific_and_stops_before_codex(
     master_resume: Path,
     tmp_path: Path,

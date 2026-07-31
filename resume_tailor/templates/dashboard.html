@@ -99,6 +99,27 @@
             <p class="field-help">
               HTTPS LinkedIn job pages only. No login, Apply interaction, or account access.
             </p>
+            <div class="provider-field">
+              <label for="linkedin-provider">Retrieval provider</label>
+              <select id="linkedin-provider" name="linkedin_provider">
+                <option value="auto"
+                  {% if form_values.get("linkedin_provider", "auto") == "auto" %}selected{% endif %}>
+                  Automatic — Apify when configured
+                </option>
+                <option value="apify"
+                  {% if form_values.get("linkedin_provider") == "apify" %}selected{% endif %}>
+                  Apify job details
+                </option>
+                <option value="antigravity"
+                  {% if form_values.get("linkedin_provider") == "antigravity" %}selected{% endif %}>
+                  Antigravity fallback
+                </option>
+              </select>
+              <p class="field-help">
+                Apify maps the exact job-detail URL locally. Automatic does not call a
+                second provider after a failed paid request.
+              </p>
+            </div>
           </div>
 
           <div class="input-panel" data-job-panel="pasted" hidden>

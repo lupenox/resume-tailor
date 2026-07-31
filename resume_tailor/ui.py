@@ -30,6 +30,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.datastructures import FormData, UploadFile
 
 from . import __version__
+from .apify_job import resolve_linkedin_provider
 from .cli import _validate_label, run_pipeline
 from .docx_extract import validate_template
 from .linkedin_job import validate_linkedin_url
@@ -45,6 +46,8 @@ from .retry import (
     build_retry_context,
 )
 from .utilities import (
+    ApifyConfigurationError,
+    ApifyProviderError,
     ApprovalError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
@@ -88,6 +91,7 @@ _STAGE_INDEX = {name: index for index, (name, _) in enumerate(WORKFLOW_STAGES)}
 _TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
 _DOWNLOAD_EXACT = {
     "job-source.json",
+    "apify-job-response.json",
     "linkedin-response-envelope.json",
     "job-description.txt",
     "job-requirements.json",
@@ -797,6 +801,18 @@ class RunManager:
                 "content are omitted."
             )
             message = _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE
+        elif failure_kind == "apify_configuration":
+            technical = (
+                "Apify URL retrieval was selected without a usable local API-token "
+                "configuration. No token value is stored or displayed."
+            )
+            message = _APIFY_CONFIGURATION_UI_MESSAGE
+        elif failure_kind == "apify_retrieval":
+            technical = (
+                "Apify did not return exactly one locally verifiable, schema-valid "
+                "job-detail record. Provider response content is omitted."
+            )
+            message = _APIFY_RETRIEVAL_UI_MESSAGE
         elif failure_kind == "antigravity_response_envelope":
             technical = (
                 "Antigravity returned a documented print-mode JSON wrapper, but "
@@ -1124,6 +1140,14 @@ _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE = (
     "Antigravity could not return the LinkedIn posting in its documented "
     "structured-output envelope. No résumé analysis or tailoring was started."
 )
+_APIFY_CONFIGURATION_UI_MESSAGE = (
+    "Apify retrieval is not configured. Add APIFY_API_TOKEN to the local launch "
+    "environment or choose Antigravity, pasted text, or a UTF-8 job file."
+)
+_APIFY_RETRIEVAL_UI_MESSAGE = (
+    "Apify could not return one locally verified LinkedIn job-detail record. "
+    "No résumé analysis or tailoring was started."
+)
 _ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE = (
     "Antigravity did not apply the approved tailoring plan and returned a "
     "non-actionable request for another task. All authenticated inputs were "
@@ -1145,6 +1169,10 @@ def _failure_kind_for_error(
 ) -> str:
     if isinstance(error, SourceEvidenceError):
         return "source_evidence"
+    if isinstance(error, ApifyConfigurationError):
+        return "apify_configuration"
+    if isinstance(error, ApifyProviderError):
+        return "apify_retrieval"
     if isinstance(error, AntigravityLaunchSizeError) or (
         stage == "antigravity_tailoring"
         and "Argument list too long" in str(error)
@@ -1190,6 +1218,16 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         )
     ):
         return "linkedin_response_envelope"
+    if (
+        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
+        and error_type == "ApifyConfigurationError"
+    ):
+        return "apify_configuration"
+    if (
+        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
+        and error_type == "ApifyProviderError"
+    ):
+        return "apify_retrieval"
     antigravity_failure = antigravity_retry_failure_kind(dict(metadata))
     if antigravity_failure == "launch_size":
         return "antigravity_launch_size"
@@ -1243,6 +1281,10 @@ def _ui_stage_from_metadata(stage: str) -> str:
 def _safe_error_message(error: ResumeTailorError) -> str:
     if isinstance(error, SourceEvidenceError):
         return _SOURCE_EVIDENCE_UI_MESSAGE
+    if isinstance(error, ApifyConfigurationError):
+        return _APIFY_CONFIGURATION_UI_MESSAGE
+    if isinstance(error, ApifyProviderError):
+        return _APIFY_RETRIEVAL_UI_MESSAGE
     if isinstance(error, AntigravityLaunchSizeError) or (
         "Argument list too long" in str(error)
         and "agy" in str(error)
@@ -1461,12 +1503,18 @@ async def _prepare_namespace(
         company: str | None = None
         role: str | None = None
         job_url: str | None = None
+        linkedin_provider = "auto"
         job_file: Path | None = None
         if source_mode == "url":
             job_url = _form_text(form, "job_url")
             if not job_url:
                 raise InputError("Enter a LinkedIn job URL.")
             job_url = validate_linkedin_url(job_url).normalized
+            linkedin_provider = _form_text(form, "linkedin_provider") or "auto"
+            resolve_linkedin_provider(
+                linkedin_provider,
+                environment={},
+            )
         else:
             company = _validate_label(_form_text(form, "company"), "Company")
             role = _validate_label(_form_text(form, "role"), "Role")
@@ -1505,6 +1553,7 @@ async def _prepare_namespace(
             clipboard=False,
             job_file=job_file,
             job_url=job_url,
+            linkedin_provider=linkedin_provider,
             company=company,
             role=role,
             output_dir=manager.settings.output_directory,
@@ -1797,6 +1846,7 @@ def _safe_form_values(form: FormData) -> dict[str, str]:
         "resume_mode",
         "job_mode",
         "job_url",
+        "linkedin_provider",
         "company",
         "role",
         "pasted_description",

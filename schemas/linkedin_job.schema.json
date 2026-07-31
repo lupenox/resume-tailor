@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Antigravity LinkedIn job extraction",
+  "title": "LinkedIn job extraction",
   "type": "object",
   "additionalProperties": false,
   "required": [

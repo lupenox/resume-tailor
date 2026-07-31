@@ -77,7 +77,8 @@ a:hover {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -90,6 +91,7 @@ button:focus-visible,
 a:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
+select:focus-visible,
 summary:focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 2px;
@@ -502,7 +504,8 @@ label,
 input[type="text"],
 input[type="url"],
 input[type="file"],
-textarea {
+textarea,
+select {
   width: 100%;
   border: 1px solid var(--border);
   border-radius: 11px;
@@ -513,8 +516,13 @@ textarea {
 
 input[type="text"],
 input[type="url"],
-textarea {
+textarea,
+select {
   padding: 12px 13px;
+}
+
+select {
+  min-height: 44px;
 }
 
 input[type="file"] {
@@ -540,14 +548,16 @@ textarea {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   border-color: rgba(150, 217, 239, 0.76);
   outline: 0;
   box-shadow: 0 0 0 3px rgba(150, 217, 239, 0.13);
 }
 
 input:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+select:focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 2px;
 }
@@ -586,6 +596,10 @@ textarea::placeholder {
   margin: 7px 0 0;
   color: var(--muted);
   font-size: 12px;
+}
+
+.provider-field {
+  margin-top: 16px;
 }
 
 .privacy-note,
