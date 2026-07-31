@@ -136,9 +136,25 @@ def locate_json_candidate(
     if not candidates:
         raise _envelope_error("json-wrapper-missing-structured-output")
     if len(candidates) != 1:
-        raise _envelope_error(
-            "json-wrapper-multiple-structured-candidates",
-            "Antigravity returned multiple ambiguous structured-output candidates.",
+        canonical_payloads = {
+            _canonical_json(candidate.payload) for candidate in candidates
+        }
+        if len(canonical_payloads) != 1:
+            raise _envelope_error(
+                "json-wrapper-multiple-structured-candidates",
+                "Antigravity returned multiple ambiguous structured-output candidates.",
+            )
+        preference = {
+            "json-wrapper-structured_output": 0,
+            "stream-json-terminal-structured_output": 0,
+            "json-wrapper-result": 1,
+            "stream-json-terminal-result": 1,
+            "json-wrapper-response": 2,
+            "direct-root": 3,
+        }
+        return min(
+            candidates,
+            key=lambda candidate: preference.get(candidate.envelope_type, 10),
         )
     return candidates[0]
 
@@ -175,12 +191,10 @@ def parse_json_output(
     )
 
 
-def parse_stream_json_output(
+def parse_stream_json_envelope(
     text: str,
-    *,
-    expected_schema: dict[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], AntigravityResponseCandidate]:
-    """Parse Antigravity 1.1.8's documented typed NDJSON terminal result."""
+) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    """Parse one documented Antigravity NDJSON terminal envelope."""
     events: list[dict[str, Any]] = []
     for line in text.splitlines():
         if not line.strip():
@@ -195,7 +209,13 @@ def parse_stream_json_output(
         if not isinstance(event, dict):
             raise _envelope_error("stream-json-event-not-object")
         events.append(event)
-    terminal = [event for event in events if event.get("step_type") == "result"]
+    current_terminal = [event for event in events if event.get("event") == "result"]
+    legacy_terminal = [
+        event
+        for event in events
+        if event.get("step_type") == "result" and event.get("event") is None
+    ]
+    terminal = current_terminal + legacy_terminal
     if len(terminal) != 1:
         kind = (
             "stream-json-missing-terminal-result"
@@ -205,28 +225,28 @@ def parse_stream_json_output(
         raise _envelope_error(kind)
 
     event = terminal[0]
-    embedded_schema = event.get("json_schema")
-    if embedded_schema is not None:
-        if (
-            expected_schema is None
-            or not isinstance(embedded_schema, dict)
-            or _canonical_json(embedded_schema) != _canonical_json(expected_schema)
-        ):
-            raise _envelope_error("stream-json-schema-mismatch")
+    if event.get("event") == "result":
+        envelope = event.get("result")
+        if not isinstance(envelope, dict):
+            raise _envelope_error("stream-json-terminal-result-not-object")
+        return events, envelope, "stream-json-event-result"
+    return events, event, "stream-json-legacy-step-result"
 
-    fields = [
-        field for field in ("structured_output", "result") if field in event
-    ]
-    if len(fields) != 1:
-        kind = (
-            "stream-json-missing-result-candidate"
-            if not fields
-            else "stream-json-multiple-result-candidates"
-        )
-        raise _envelope_error(kind)
-    field = fields[0]
-    candidate = _parse_exact_object(event[field], field=field)
+
+def parse_stream_json_output(
+    text: str,
+    *,
+    expected_schema: dict[str, Any] | None = None,
+    required_fields: frozenset[str] = _TAILORING_FIELDS,
+) -> tuple[list[dict[str, Any]], AntigravityResponseCandidate]:
+    """Parse Antigravity 1.1.8's documented typed NDJSON terminal result."""
+    events, envelope, stream_type = parse_stream_json_envelope(text)
+    candidate = locate_json_candidate(
+        envelope,
+        required_fields=required_fields,
+        expected_schema=expected_schema,
+    )
     return events, AntigravityResponseCandidate(
-        payload=candidate,
-        envelope_type=f"stream-json-terminal-{field}",
+        payload=candidate.payload,
+        envelope_type=f"{stream_type}:{candidate.envelope_type}",
     )
