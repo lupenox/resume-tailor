@@ -150,13 +150,40 @@
                   </div>
                 </div>
                 <div class="report-section">
+                  <h3>Requirement-to-source review</h3>
+                  <p class="field-help">Requirement text and résumé evidence below are resolved locally from immutable catalogs. Nonverbatim support is a Codex assessment for your review, not a local proof of semantic equivalence.</p>
+                  {% for item in analysis.requirement_assessment if item.status != "unsupported" %}
+                    <article class="edit-card requirement-evidence-card">
+                      <div class="keyword-status keyword-status-{{ item.status|replace('_', '-') }}">
+                        <strong>{{ item.requirement }}</strong>
+                        <span>
+                          {% if item.status == "present_verbatim" %}Locally present verbatim
+                          {% else %}Codex-assessed support · human review required{% endif %}
+                        </span>
+                      </div>
+                      <small><code>{{ item.requirement_id }}</code> · {{ item.category|replace('_', ' ')|title }} · {{ item.strength|title }}</small>
+                      <ul class="source-evidence-list" aria-label="Exact résumé blocks cited for this job requirement">
+                        {% for evidence in item.resolved_evidence %}
+                          <li><code>{{ evidence.source_id }}</code><span>{{ evidence.exact_text }}</span></li>
+                        {% endfor %}
+                      </ul>
+                    </article>
+                  {% else %}
+                    <p class="muted">No supported requirement mappings were returned.</p>
+                  {% endfor %}
+                </div>
+                <div class="report-section">
                   <h3>Proposed summary changes</h3>
                   {% for edit in run.approval.grouped_edits.summary %}
                     <article class="edit-card">
-                      <del>{{ edit.existing_claim }}</del>
-                      <ins>{{ edit.proposed_replacement }}</ins>
+                      <del>{{ edit.existing_text }}</del>
+                      <ins>{{ edit.proposed_text }}</ins>
                       <p>{{ edit.alignment_rationale }}</p>
-                      <small>Evidence: {{ edit.exact_supporting_evidence }}</small>
+                      <ul class="source-evidence-list" aria-label="Resolved source evidence">
+                        {% for evidence in edit.resolved_evidence %}
+                          <li><code>{{ evidence.source_id }}</code><span>{{ evidence.exact_text }}</span></li>
+                        {% endfor %}
+                      </ul>
                     </article>
                   {% else %}<p class="muted">No summary changes proposed.</p>{% endfor %}
                 </div>
@@ -164,21 +191,44 @@
                   <div class="report-section">
                     <h3>Experience changes</h3>
                     {% for edit in run.approval.grouped_edits.experience %}
-                      <article class="edit-card"><del>{{ edit.existing_claim }}</del><ins>{{ edit.proposed_replacement }}</ins><small>Evidence: {{ edit.exact_supporting_evidence }}</small></article>
+                      <article class="edit-card">
+                        <del>{{ edit.existing_text }}</del><ins>{{ edit.proposed_text }}</ins>
+                        <ul class="source-evidence-list" aria-label="Resolved source evidence">
+                          {% for evidence in edit.resolved_evidence %}
+                            <li><code>{{ evidence.source_id }}</code><span>{{ evidence.exact_text }}</span></li>
+                          {% endfor %}
+                        </ul>
+                      </article>
                     {% else %}<p class="muted">No experience changes proposed.</p>{% endfor %}
                   </div>
                   <div class="report-section">
                     <h3>Project changes</h3>
                     {% for edit in run.approval.grouped_edits.projects %}
-                      <article class="edit-card"><del>{{ edit.existing_claim }}</del><ins>{{ edit.proposed_replacement }}</ins><small>Evidence: {{ edit.exact_supporting_evidence }}</small></article>
+                      <article class="edit-card">
+                        <del>{{ edit.existing_text }}</del><ins>{{ edit.proposed_text }}</ins>
+                        <ul class="source-evidence-list" aria-label="Resolved source evidence">
+                          {% for evidence in edit.resolved_evidence %}
+                            <li><code>{{ evidence.source_id }}</code><span>{{ evidence.exact_text }}</span></li>
+                          {% endfor %}
+                        </ul>
+                      </article>
                     {% else %}<p class="muted">No project changes proposed.</p>{% endfor %}
                   </div>
                 </div>
                 <div class="report-split">
                   <div class="report-section">
                     <h3>Keyword alignment</h3>
-                    <div class="tag-list">
-                      {% for item in analysis.supported_ats_keywords %}<span>{{ item }}</span>{% else %}<span>No supported keywords returned</span>{% endfor %}
+                    <div class="keyword-assessment">
+                      {% for item in analysis.ats_keyword_assessment %}
+                        <div class="keyword-status keyword-status-{{ item.status|replace('_', '-') }}">
+                          <strong>{{ item.keyword }}</strong>
+                          <span>
+                            {% if item.status == "present_verbatim" %}Already present verbatim
+                            {% elif item.status == "supported_by_source" %}Supported by cited source, not verbatim
+                            {% else %}Unsupported{% endif %}
+                          </span>
+                        </div>
+                      {% else %}<p class="muted">No ATS keyword candidates returned.</p>{% endfor %}
                     </div>
                   </div>
                   <div class="report-section">
@@ -355,10 +405,73 @@
                 {% endfor %}
               </div>
             {% endif %}
-            <div class="alert alert-info">
-              <strong>LinkedIn fallback</strong>
-              <span>If retrieval was blocked, retry with a UTF-8 text file or pasted description.</span>
-            </div>
+            {% if run.failure_kind == "source_evidence" %}
+              <div class="alert alert-warning">
+                <strong>Model evidence-contract failure</strong>
+                <span>Codex returned a job-requirement or résumé-source reference that did not satisfy the authoritative local catalogs. The confirmed job description was preserved and can be reused by a verified retry.</span>
+              </div>
+              {% if run.retry_eligible %}
+                <form action="/runs/{{ run.run_id }}/retry-codex-analysis" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="primary-button" type="submit">Retry Codex analysis <span>→</span></button>
+                </form>
+                <p class="field-help">{{ run.retry_reason }} The retry creates a new isolated run and stops at the normal analysis approval gate.</p>
+              {% elif run.retry_reason %}
+                <div class="alert alert-info">
+                  <strong>New run required</strong>
+                  <span>{{ run.retry_reason }}</span>
+                </div>
+              {% endif %}
+            {% elif run.failure_kind in ["antigravity_launch_size", "antigravity_response_envelope", "antigravity_tailoring_contract", "antigravity_cannot_apply", "antigravity_technical_failure"] %}
+              <div class="alert alert-warning">
+                {% if run.failure_kind == "antigravity_launch_size" %}
+                  <strong>Antigravity launch-size failure</strong>
+                  <span>The confirmed posting and approved Codex analysis were preserved.</span>
+                {% elif run.failure_kind == "antigravity_response_envelope" %}
+                  <strong>Antigravity response-format failure</strong>
+                  <span>Antigravity returned JSON in an unsupported response format. The completed response was preserved without exposing provider prose.</span>
+                {% elif run.failure_kind == "antigravity_tailoring_contract" %}
+                  <strong>Post-approval tailoring contract failure</strong>
+                  <span>Antigravity did not apply the approved plan. This is not a request for missing experience or another job description.</span>
+                {% elif run.failure_kind == "antigravity_cannot_apply" %}
+                  <strong>Approved edit could not be applied</strong>
+                  <span>Antigravity identified a bounded conflict with one approved edit without requesting new factual claims.</span>
+                {% else %}
+                  <strong>Antigravity technical failure</strong>
+                  <span>Antigravity reported a bounded execution problem rather than a factual-input question.</span>
+                {% endif %}
+                <span>Recovery is offered only when every approved input and approval record still matches its authenticated hash.</span>
+              </div>
+              {% if run.antigravity_reprocess_eligible %}
+                <form action="/runs/{{ run.run_id }}/reprocess-antigravity-response" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="primary-button" type="submit">Reprocess preserved Antigravity response <span>→</span></button>
+                </form>
+                <p class="field-help">{{ run.antigravity_reprocess_reason }} Reprocessing makes no provider call and stops at the normal validated-content-diff approval gate.</p>
+              {% elif run.failure_kind == "antigravity_response_envelope" and run.antigravity_reprocess_reason %}
+                <div class="alert alert-info">
+                  <strong>Offline reprocessing unavailable</strong>
+                  <span>{{ run.antigravity_reprocess_reason }}</span>
+                </div>
+              {% endif %}
+              {% if run.antigravity_retry_eligible %}
+                <form action="/runs/{{ run.run_id }}/retry-antigravity-tailoring" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="primary-button" type="submit">Retry Antigravity tailoring <span>→</span></button>
+                </form>
+                <p class="field-help">{{ run.antigravity_retry_reason }} The recovery creates a new isolated run, skips LinkedIn and Codex, and stops at the normal validated-content-diff approval gate.</p>
+              {% elif run.antigravity_retry_reason %}
+                <div class="alert alert-info">
+                  <strong>New run required</strong>
+                  <span>{{ run.antigravity_retry_reason }}</span>
+                </div>
+              {% endif %}
+            {% elif run.failure_kind == "retrieval" %}
+              <div class="alert alert-info">
+                <strong>LinkedIn retrieval fallback</strong>
+                <span>If retrieval was blocked, retry with a UTF-8 text file or pasted description.</span>
+              </div>
+            {% endif %}
             <a class="primary-button" href="/">Start a new run <span>→</span></a>
           </section>
 

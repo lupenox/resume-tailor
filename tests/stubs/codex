@@ -93,6 +93,26 @@ if "Perform a fresh, read-only final QA review" in prompt:
             "improvement_assessment": "Alignment is at least as strong as the source.",
         }
 else:
+    requirement_ids = transport_schema["properties"][
+        "unsupported_requirement_ids"
+    ]["items"]["enum"]
+    catalog_marker = "BEGIN_LOCAL_JOB_REQUIREMENT_CATALOG\n"
+    catalog_end = "\nEND_LOCAL_JOB_REQUIREMENT_CATALOG"
+    catalog = json.loads(
+        prompt.split(catalog_marker, 1)[1].split(catalog_end, 1)[0]
+    )
+    requirement_text = {
+        item["requirement_id"]: item["exact_text"]
+        for item in catalog["requirements"]
+    }
+    supported_id = next(
+        (
+            requirement_id
+            for requirement_id in requirement_ids
+            if requirement_text.get(requirement_id, "").casefold() == "python"
+        ),
+        requirement_ids[0],
+    )
     questions = (
         ["Please confirm a factual detail."]
         if mode == "questions"
@@ -105,21 +125,23 @@ else:
             "strengths": ["Agentic AI project evidence"],
             "gaps": ["No unsupported experience should be claimed"],
         },
-        "matched_requirements": ["Python"],
-        "evidence_map": [
+        "supported_requirement_mappings": [
             {
-                "requirement": "Python",
-                "resume_evidence": ["Python"],
+                "requirement_id": supported_id,
+                "evidence_source_ids": ["skill_groups.0"],
                 "strength": "strong",
             }
         ],
-        "supported_ats_keywords": ["Python"],
-        "missing_or_unsupported_requirements": [],
+        "unsupported_requirement_ids": [
+            requirement_id
+            for requirement_id in requirement_ids
+            if requirement_id != supported_id
+        ],
         "recommended_edits": [],
         "immutable_facts": [
-            "University of Wisconsin–Milwaukee",
-            "Expected Dec 2026",
-            "June 2026 – Present",
+            "Example Institute",
+            "Synthetic credential",
+            "2024–Present",
         ],
         "forbidden_claims": [
             "RAG",
@@ -133,10 +155,21 @@ else:
         payload["fit_assessment"]["strengths"].append(
             payload["fit_assessment"]["strengths"][0]
         )
-        payload["matched_requirements"].append(payload["matched_requirements"][0])
-        payload["supported_ats_keywords"].append(
-            payload["supported_ats_keywords"][0]
+        payload["supported_requirement_mappings"].append(
+            payload["supported_requirement_mappings"][0]
         )
+    if mode == "source_id_failure":
+        payload["recommended_edits"] = [
+            {
+                "target_source_id": "professional_summary",
+                "operation": "replace",
+                "proposed_text": "Synthetic proposed text.",
+                "alignment_rationale": "Synthetic regression case.",
+                "evidence_source_ids": ["paragraph 3 describes the summary"],
+            }
+        ]
+    if mode == "empty_source_ids":
+        payload["supported_requirement_mappings"][0]["evidence_source_ids"] = [""]
 
 output_path.write_text(
     json.dumps(payload, ensure_ascii=False),

@@ -26,9 +26,25 @@ def test_known_master_structure(master_resume: Path) -> None:
     assert document["page"]["left_margin_inches"] == 0.5
     assert len(document["hyperlinks"]) == 6
     assert tuple(len(project.bullets) for project in mapping.projects) == EXPECTED_PROJECT_BULLETS
+    assert len(extracted["source_blocks"]) == 32
+    assert len({block["source_id"] for block in extracted["source_blocks"]}) == 32
+    summary = next(
+        block
+        for block in extracted["source_blocks"]
+        if block["source_id"] == "professional_summary"
+    )
+    assert summary["editable"] is True
+    assert summary["evidence_allowed"] is True
+    section = next(
+        block
+        for block in extracted["source_blocks"]
+        if block["source_id"] == "section.objective_summary"
+    )
+    assert section["evidence_allowed"] is False
+    assert section["editable"] is False
 
 
-def test_real_list_bullet_and_run_formatting(master_resume: Path) -> None:
+def test_synthetic_list_bullet_and_run_formatting(master_resume: Path) -> None:
     extracted, _ = extract_resume(master_resume)
     list_paragraphs = [
         paragraph for paragraph in extracted["paragraphs"] if paragraph["is_list"]

@@ -11,14 +11,22 @@ from typing import Any, AsyncIterator
 import httpx
 import pytest
 
+import resume_tailor.cli as cli_module
 from resume_tailor.cli import run_pipeline
-from resume_tailor.orchestration import PipelineHooks
+from resume_tailor.docx_extract import extract_resume
+from resume_tailor.job_requirements import build_job_requirement_catalog
+from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
+from resume_tailor.retry import analysis_input_manifest
+from resume_tailor.schemas import load_schema
 from resume_tailor.ui import COOKIE_NAME, DEFAULT_HOST, create_app
 from resume_tailor.ui_cli import build_parser as build_ui_parser
 from resume_tailor.utilities import (
     CancellationError,
     CodexSchemaCompatibilityError,
+    AntigravityLaunchSizeError,
     InputError,
+    atomic_write_json,
+    sha256_file,
 )
 
 
@@ -62,15 +70,60 @@ def _analysis() -> dict[str, Any]:
         },
         "matched_requirements": ["Python"],
         "evidence_map": [],
+        "requirement_assessment": [
+            {
+                "requirement_id": "skill.001",
+                "requirement": "Python",
+                "category": "technology_and_skill",
+                "status": "present_verbatim",
+                "support_provenance": "local_exact_phrase",
+                "strength": "strong",
+                "evidence_source_ids": ["skill_groups.0"],
+                "resolved_evidence": [
+                    {
+                        "source_id": "skill_groups.0",
+                        "section_context": "TECHNICAL SKILLS",
+                        "exact_text": "Languages: Python, JavaScript, SQL",
+                    }
+                ],
+            }
+        ],
+        "ats_keywords": [
+            {"keyword": "Python", "evidence_source_ids": ["skill_groups.0"]}
+        ],
+        "ats_keyword_assessment": [
+            {
+                "keyword": "Python",
+                "status": "present_verbatim",
+                "evidence_source_ids": ["skill_groups.0"],
+                "resolved_evidence": [
+                    {
+                        "source_id": "skill_groups.0",
+                        "section_context": "TECHNICAL SKILLS",
+                        "exact_text": "Languages: Python, JavaScript, SQL",
+                    }
+                ],
+            }
+        ],
         "supported_ats_keywords": ["Python"],
+        "unsupported_ats_keywords": [],
         "missing_or_unsupported_requirements": ["RAG is not supported"],
         "recommended_edits": [
             {
+                "target_source_id": "professional_summary",
+                "operation": "replace",
+                "proposed_text": "Evidence-backed summary",
+                "evidence_source_ids": ["skill_groups.0"],
                 "resume_section": "Professional Summary",
-                "existing_claim": "Existing summary",
-                "proposed_replacement": "Evidence-backed summary",
+                "existing_text": "Existing summary",
                 "alignment_rationale": "Surfaces supported Python work.",
-                "exact_supporting_evidence": "Python",
+                "resolved_evidence": [
+                    {
+                        "source_id": "skill_groups.0",
+                        "section_context": "TECHNICAL SKILLS",
+                        "exact_text": "Languages: Python, JavaScript, SQL",
+                    }
+                ],
             }
         ],
         "immutable_facts": ["Expected Dec 2026"],
@@ -303,6 +356,214 @@ async def _approve(
     )
 
 
+def _write_synthetic_source_failure(
+    output_directory: Path,
+    synthetic_resume: Path,
+    *,
+    name: str = "synthetic-source-evidence-failure",
+) -> Path:
+    run = output_directory / name
+    run.mkdir(parents=True, mode=0o700)
+    job_description = "Build a synthetic Python evidence-validation service.\n"
+    (run / "job-description.txt").write_text(job_description, encoding="utf-8")
+    atomic_write_json(
+        run / "job-requirements.json",
+        build_job_requirement_catalog(job_description),
+    )
+    extracted, _ = extract_resume(synthetic_resume)
+    atomic_write_json(run / "extracted-master-resume.json", extracted)
+    source_hash = sha256_file(synthetic_resume)
+    metadata = {
+        "application": "resume-tailor",
+        "application_version": "0.1.0",
+        "status": "FAILED",
+        "stage": "codex-analysis",
+        "failure_class": "source-evidence-analysis",
+        "created_at": "2026-07-30T12:00:00+00:00",
+        "company": "Synthetic Systems",
+        "role": "Evidence Engineer",
+        "job_source": "linkedin-url",
+        "source_resume": {
+            "filename": synthetic_resume.name,
+            "sha256_before": source_hash,
+            "sha256_after": source_hash,
+            "unchanged": True,
+        },
+        "analysis_inputs": analysis_input_manifest(
+            run,
+            source_resume_sha256=source_hash,
+        ),
+        "error": {
+            "type": "SourceEvidenceError",
+            "message": (
+                "Codex analysis failed local source-evidence validation:\n"
+                "- PRIVATE SYNTHETIC SOURCE QUOTATION MUST NOT RENDER"
+            ),
+            "exit_code": 13,
+        },
+        "artifacts": [],
+    }
+    atomic_write_json(run / "run-metadata.json", metadata)
+    return run
+
+
+def _write_synthetic_antigravity_launch_failure(
+    output_directory: Path,
+    synthetic_resume: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    job = output_directory.parent / "synthetic-antigravity-job.txt"
+    job.write_text(
+        "Build synthetic Python evidence validation workflows.\n",
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        resume=synthetic_resume,
+        clipboard=False,
+        job_file=job,
+        job_url=None,
+        company="Synthetic Systems",
+        role="Evidence Engineer",
+        output_dir=output_directory,
+        yes=False,
+        keep_workdir=False,
+        timeout=(30, "30s"),
+    )
+    original = cli_module.invoke_antigravity
+
+    def fail_before_provider(**_kwargs: Any) -> dict[str, Any]:
+        raise AntigravityLaunchSizeError(
+            "Antigravity could not start because the request exceeded the "
+            "operating system's command-line size."
+        )
+
+    monkeypatch.setattr(cli_module, "invoke_antigravity", fail_before_provider)
+    try:
+        with pytest.raises(AntigravityLaunchSizeError):
+            run_pipeline(
+                args,
+                hooks=PipelineHooks(
+                    approval_handler=lambda request: (
+                        ApprovalResponse("approve")
+                        if request.kind == "codex_analysis"
+                        else pytest.fail(
+                            "Initial synthetic failure passed the analysis gate"
+                        )
+                    )
+                ),
+            )
+    finally:
+        monkeypatch.setattr(cli_module, "invoke_antigravity", original)
+    run = next(
+        child
+        for child in output_directory.iterdir()
+        if child.is_dir() and not child.name.startswith(".")
+    )
+    assert (run / "codex-analysis-approval.json").is_file()
+    return run
+
+
+def _write_synthetic_antigravity_waiting_failure(
+    output_directory: Path,
+    synthetic_resume: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    run = _write_synthetic_antigravity_launch_failure(
+        output_directory,
+        synthetic_resume,
+        monkeypatch,
+    )
+    atomic_write_json(
+        run / "antigravity-response.json",
+        {
+            "status": "SUCCESS",
+            "structured_output": {
+                "status": "WAITING",
+                "message": (
+                    "Plan mode activated. Ready after synthetic requirements "
+                    "are provided."
+                ),
+                "questions_for_user": [
+                    "What synthetic task would you like to plan?"
+                ],
+                "tailored_resume": None,
+            },
+        },
+    )
+    metadata_path = run / "run-metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("failure_class", None)
+    metadata["error"] = {
+        "type": "WaitingError",
+        "message": (
+            "Antigravity needs more information; review the synthetic questions."
+        ),
+        "exit_code": 3,
+    }
+    atomic_write_json(metadata_path, metadata)
+    return run
+
+
+def _write_synthetic_antigravity_envelope_failure(
+    output_directory: Path,
+    synthetic_resume: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    valid_response: bool,
+) -> Path:
+    run = _write_synthetic_antigravity_launch_failure(
+        output_directory,
+        synthetic_resume,
+        monkeypatch,
+    )
+    extracted = json.loads(
+        (run / "extracted-master-resume.json").read_text(encoding="utf-8")
+    )
+    complete = {
+        "status": "complete",
+        "message": "Applied the approved synthetic edit plan.",
+        "cannot_apply": None,
+        "technical_failure": None,
+        "tailored_resume": extracted["content"],
+    }
+    atomic_write_json(
+        run / "antigravity-response.json",
+        {
+            "conversation_id": "00000000-0000-4000-8000-000000000000",
+            "duration_seconds": 1.25,
+            "json_schema": load_schema("tailored_resume.schema.json"),
+            "num_turns": 1,
+            "response": (
+                json.dumps(complete, ensure_ascii=False)
+                if valid_response
+                else "Synthetic prose with {\"status\":\"complete\"}."
+            ),
+            "status": "SUCCESS",
+            "usage": {
+                "cache_read_tokens": 10,
+                "input_tokens": 20,
+                "output_tokens": 5,
+                "thinking_tokens": 2,
+                "total_tokens": 25,
+            },
+        },
+    )
+    metadata_path = run / "run-metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["failure_class"] = "antigravity-response-envelope"
+    metadata["error"] = {
+        "type": "AntigravityResponseEnvelopeError",
+        "message": "Antigravity returned JSON in an unsupported response format.",
+        "exit_code": 10,
+    }
+    metadata["tools"]["antigravity"] = "1.1.8-stub"
+    metadata["artifacts"] = sorted(
+        path.name for path in run.iterdir() if path.is_file()
+    )
+    atomic_write_json(metadata_path, metadata)
+    return run
+
+
 def test_ui_startup_health_and_localhost_binding(
     master_resume: Path,
     tmp_path: Path,
@@ -526,6 +787,10 @@ def test_resume_change_approval_and_rejection(
             await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
             page = await client.get(f"/runs/{run_id}")
             assert "Review evidence-backed recommendations" in page.text
+            assert "Requirement-to-source review" in page.text
+            assert "model-assessed semantic match" not in page.text.casefold()
+            assert "Languages: Python, JavaScript, SQL" in page.text
+            assert "skill.001" in page.text
             assert "Evidence-backed summary" in page.text
             assert "RAG is not supported" in page.text
             await _approve(client, token, run_id)
@@ -649,6 +914,480 @@ def test_codex_schema_failure_is_concise_with_collapsed_sanitized_details(
             assert "Sanitized technical details" in page.text
             assert '<details class="diff-details technical-details">' in page.text
             assert secret_prompt not in page.text
+
+    asyncio.run(scenario())
+
+
+def test_source_evidence_failure_guidance_and_safe_retry(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_directory = tmp_path / "output"
+    source_run = _write_synthetic_source_failure(
+        output_directory,
+        master_resume,
+    )
+    monkeypatch.setattr(
+        "resume_tailor.cli._tailoring_dependency_versions",
+        lambda _: pytest.fail("Antigravity dependencies checked before approval"),
+    )
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            source_id = f"history-{source_run.name}"
+            page = await client.get(f"/runs/{source_id}")
+            assert page.status_code == 200
+            assert "Model evidence-contract failure" in page.text
+            assert "violated the authoritative local evidence contract" in page.text
+            assert "Retry Codex analysis" in page.text
+            assert "LinkedIn fallback" not in page.text
+            assert "job-file" not in page.text
+            assert "PRIVATE SYNTHETIC SOURCE QUOTATION" not in page.text
+            assert '<details class="diff-details technical-details">' in page.text
+
+            retry = await client.post(
+                f"/runs/{source_id}/retry-codex-analysis",
+                data={"csrf_token": token},
+            )
+            assert retry.status_code == 303
+            retry_id = retry.headers["location"].rsplit("/", 1)[-1]
+            renewed = await _wait(
+                app,
+                retry_id,
+                "AWAITING_APPROVAL",
+                "codex_analysis",
+            )
+            assert renewed["source_mode"] == "retry"
+            retry_directory = Path(renewed["artifact_directory"])
+            assert retry_directory != source_run
+            assert not (retry_directory / "job-source.json").exists()
+            assert (retry_directory / "job-requirements.json").is_file()
+            assert not (retry_directory / "antigravity-response.json").exists()
+            assert (retry_directory / "codex-analysis-resolved.json").is_file()
+            metadata = json.loads(
+                (retry_directory / "run-metadata.json").read_text(encoding="utf-8")
+            )
+            assert metadata["job_source"] == "source-evidence-retry"
+            assert metadata["retry_of"] == source_run.name
+
+    asyncio.run(scenario())
+
+
+def test_antigravity_launch_failure_guidance_and_authenticated_recovery(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_directory = tmp_path / "output"
+    source_run = _write_synthetic_antigravity_launch_failure(
+        output_directory,
+        master_resume,
+        monkeypatch,
+    )
+    before = {
+        path.name: sha256_file(path)
+        for path in source_run.iterdir()
+        if path.is_file()
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_codex_analysis",
+        lambda **_kwargs: pytest.fail("Codex ran during Antigravity recovery"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_linkedin_job_extraction",
+        lambda **_kwargs: pytest.fail(
+            "LinkedIn ran during Antigravity recovery"
+        ),
+    )
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            source_id = f"history-{source_run.name}"
+            page = await client.get(f"/runs/{source_id}")
+            assert page.status_code == 200
+            assert (
+                "Antigravity could not start because the request exceeded the "
+                "operating system’s command-line size."
+            ) in page.text
+            assert "confirmed posting and approved Codex analysis were preserved" in (
+                page.text
+            )
+            assert "Retry Antigravity tailoring" in page.text
+            assert "Retry Codex analysis" not in page.text
+            assert "LinkedIn retrieval fallback" not in page.text
+            assert "codex-analysis-approval.json" not in page.text
+            assert '<details class="diff-details technical-details">' in page.text
+
+            retry = await client.post(
+                f"/runs/{source_id}/retry-antigravity-tailoring",
+                data={"csrf_token": token},
+            )
+            assert retry.status_code == 303
+            retry_id = retry.headers["location"].rsplit("/", 1)[-1]
+            recovered = await _wait(
+                app,
+                retry_id,
+                "AWAITING_APPROVAL",
+                "tailored_content",
+            )
+            assert recovered["source_mode"] == "antigravity-retry"
+            recovery_directory = Path(recovered["artifact_directory"])
+            assert recovery_directory != source_run
+            assert not (recovery_directory / "codex-analysis.json").exists()
+            assert (
+                recovery_directory / "codex-analysis-resolved.json"
+            ).is_file()
+            assert (
+                recovery_directory / "codex-analysis-approval.json"
+            ).is_file()
+            assert (recovery_directory / "antigravity-response.json").is_file()
+            assert (recovery_directory / "tailored-content.json").is_file()
+            assert (recovery_directory / "content-diff.md").is_file()
+            assert not list(recovery_directory.glob("*.docx"))
+            metadata = json.loads(
+                (recovery_directory / "run-metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert metadata["retry_kind"] == "antigravity-tailoring"
+            assert metadata["retry_of"] == source_run.name
+            assert metadata["approved_analysis_reused"] is True
+            assert metadata["recovery_inputs"]["approval_record_sha256"]
+            cancel = await _approve(
+                client,
+                token,
+                retry_id,
+                action="cancel",
+            )
+            assert cancel.status_code == 303
+            await _wait(app, retry_id, "CANCELLED")
+
+    asyncio.run(scenario())
+    assert before == {
+        path.name: sha256_file(path)
+        for path in source_run.iterdir()
+        if path.is_file()
+    }
+
+
+def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_directory = tmp_path / "output"
+    source_run = _write_synthetic_antigravity_waiting_failure(
+        output_directory,
+        master_resume,
+        monkeypatch,
+    )
+    before = {
+        path.name: sha256_file(path)
+        for path in source_run.iterdir()
+        if path.is_file()
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_codex_analysis",
+        lambda **_kwargs: pytest.fail("Codex ran during Antigravity recovery"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_linkedin_job_extraction",
+        lambda **_kwargs: pytest.fail(
+            "LinkedIn ran during Antigravity recovery"
+        ),
+    )
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            source_id = f"history-{source_run.name}"
+            page = await client.get(f"/runs/{source_id}")
+            assert page.status_code == 200
+            assert "Post-approval tailoring contract failure" in page.text
+            assert "did not apply the approved tailoring plan" in page.text
+            assert "not a request for missing experience" in page.text
+            assert "Retry Antigravity tailoring" in page.text
+            assert "Retry Codex analysis" not in page.text
+            assert "LinkedIn retrieval fallback" not in page.text
+            assert "Plan mode activated" not in page.text
+            assert "What synthetic task" not in page.text
+            assert '<details class="diff-details technical-details">' in page.text
+
+            retry = await client.post(
+                f"/runs/{source_id}/retry-antigravity-tailoring",
+                data={"csrf_token": token},
+            )
+            assert retry.status_code == 303
+            retry_id = retry.headers["location"].rsplit("/", 1)[-1]
+            recovered = await _wait(
+                app,
+                retry_id,
+                "AWAITING_APPROVAL",
+                "tailored_content",
+            )
+            recovery_directory = Path(recovered["artifact_directory"])
+            assert recovered["source_mode"] == "antigravity-retry"
+            assert recovery_directory != source_run
+            assert not (recovery_directory / "codex-analysis.json").exists()
+            assert (recovery_directory / "antigravity-response.json").is_file()
+            assert (recovery_directory / "tailored-content.json").is_file()
+            assert (recovery_directory / "content-diff.md").is_file()
+            assert not list(recovery_directory.glob("*.docx"))
+            assert not list(recovery_directory.glob("*.pdf"))
+            metadata = json.loads(
+                (recovery_directory / "run-metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert metadata["retry_kind"] == "antigravity-tailoring"
+            assert metadata["retry_of"] == source_run.name
+            assert metadata["approved_analysis_reused"] is True
+            cancel = await _approve(
+                client,
+                token,
+                retry_id,
+                action="cancel",
+            )
+            assert cancel.status_code == 303
+            await _wait(app, retry_id, "CANCELLED")
+
+    asyncio.run(scenario())
+    assert before == {
+        path.name: sha256_file(path)
+        for path in source_run.iterdir()
+        if path.is_file()
+    }
+
+
+def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_directory = tmp_path / "output"
+    source_run = _write_synthetic_antigravity_envelope_failure(
+        output_directory,
+        master_resume,
+        monkeypatch,
+        valid_response=True,
+    )
+    before = {
+        path.name: sha256_file(path)
+        for path in source_run.iterdir()
+        if path.is_file()
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_codex_analysis",
+        lambda **_kwargs: pytest.fail("Codex ran during offline reprocessing"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_linkedin_job_extraction",
+        lambda **_kwargs: pytest.fail("LinkedIn ran during offline reprocessing"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_antigravity",
+        lambda **_kwargs: pytest.fail("Antigravity ran during offline reprocessing"),
+    )
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            source_id = f"history-{source_run.name}"
+            page = await client.get(f"/runs/{source_id}")
+            assert page.status_code == 200
+            assert "Antigravity response-format failure" in page.text
+            assert "Reprocess preserved Antigravity response" in page.text
+            assert "Retry Antigravity tailoring" in page.text
+            assert "Synthetic prose" not in page.text
+
+            response = await client.post(
+                f"/runs/{source_id}/reprocess-antigravity-response",
+                data={"csrf_token": token},
+            )
+            assert response.status_code == 303
+            run_id = response.headers["location"].rsplit("/", 1)[-1]
+            reprocessed = await _wait(
+                app,
+                run_id,
+                "AWAITING_APPROVAL",
+                "tailored_content",
+            )
+            assert reprocessed["source_mode"] == "antigravity-response-reprocess"
+            directory = Path(reprocessed["artifact_directory"])
+            assert directory != source_run
+            assert (directory / "antigravity-response.json").is_file()
+            assert (directory / "tailored-content.json").is_file()
+            assert (directory / "content-diff.md").is_file()
+            assert not (directory / "codex-analysis.json").exists()
+            assert not list(directory.glob("*.docx"))
+            assert not list(directory.glob("*.pdf"))
+            metadata = json.loads(
+                (directory / "run-metadata.json").read_text(encoding="utf-8")
+            )
+            assert metadata["retry_kind"] == "antigravity-response-reprocess"
+            assert metadata["provider_calls_reused"] == {
+                "linkedin": False,
+                "codex_analysis": False,
+                "antigravity_tailoring": False,
+            }
+            assert metadata["antigravity_response"]["reprocessed_offline"] is True
+            cancel = await _approve(client, token, run_id, action="cancel")
+            assert cancel.status_code == 303
+            await _wait(app, run_id, "CANCELLED")
+
+    asyncio.run(scenario())
+    assert before == {
+        path.name: sha256_file(path)
+        for path in source_run.iterdir()
+        if path.is_file()
+    }
+
+
+def test_unstructured_preserved_response_offers_retry_but_not_reprocessing(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_directory = tmp_path / "output"
+    source_run = _write_synthetic_antigravity_envelope_failure(
+        output_directory,
+        master_resume,
+        monkeypatch,
+        valid_response=False,
+    )
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            source_id = f"history-{source_run.name}"
+            page = await client.get(f"/runs/{source_id}")
+            assert page.status_code == 200
+            assert "Offline reprocessing unavailable" in page.text
+            assert "Reprocess preserved Antigravity response" not in page.text
+            assert "Retry Antigravity tailoring" in page.text
+            response = await client.post(
+                f"/runs/{source_id}/reprocess-antigravity-response",
+                data={"csrf_token": token},
+            )
+            assert response.status_code == 409
+            assert app.state.manager._records == {}
+
+    asyncio.run(scenario())
+
+
+def test_antigravity_recovery_is_not_offered_without_approval_record(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_directory = tmp_path / "output"
+    source_run = _write_synthetic_antigravity_launch_failure(
+        output_directory,
+        master_resume,
+        monkeypatch,
+    )
+    metadata_path = source_run / "run-metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("codex_analysis_approval")
+    atomic_write_json(metadata_path, metadata)
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            source_id = f"history-{source_run.name}"
+            page = await client.get(f"/runs/{source_id}")
+            assert page.status_code == 200
+            assert "New run required" in page.text
+            assert "predates the authenticated Codex approval record" in page.text
+            assert "Retry Antigravity tailoring" not in page.text
+            retry = await client.post(
+                f"/runs/{source_id}/retry-antigravity-tailoring",
+                data={"csrf_token": token},
+            )
+            assert retry.status_code == 409
+            assert app.state.manager._records == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("changed_input", ["job", "extraction", "requirements"])
+def test_source_evidence_retry_refuses_changed_input_hash(
+    changed_input: str,
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    output_directory = tmp_path / "output"
+    source_run = _write_synthetic_source_failure(
+        output_directory,
+        master_resume,
+        name=f"changed-{changed_input}",
+    )
+    changed = {
+        "job": source_run / "job-description.txt",
+        "extraction": source_run / "extracted-master-resume.json",
+        "requirements": source_run / "job-requirements.json",
+    }[changed_input]
+    changed.write_bytes(changed.read_bytes() + b" ")
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            source_id = f"history-{source_run.name}"
+            page = await client.get(f"/runs/{source_id}")
+            assert page.status_code == 200
+            assert "New run required" in page.text
+            assert "Retry Codex analysis" not in page.text
+            retry = await client.post(
+                f"/runs/{source_id}/retry-codex-analysis",
+                data={"csrf_token": token},
+            )
+            assert retry.status_code == 409
+            assert app.state.manager._records == {}
 
     asyncio.run(scenario())
 

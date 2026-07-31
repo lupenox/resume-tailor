@@ -194,9 +194,7 @@
                   <code title="{{ item.artifact_directory }}">{{ item.artifact_directory }}</code>
                 {% endif %}
                 <div class="history-actions">
-                  {% if not item.is_history %}
-                    <a href="/runs/{{ item.run_id }}">View run</a>
-                  {% endif %}
+                  <a href="/runs/{{ item.run_id }}">View run</a>
                   {% for artifact in item.artifacts %}
                     {% if artifact.kind in ["DOCX", "PDF"] %}
                       <a href="/runs/{{ item.run_id }}/artifacts/{{ artifact.name }}">{{ artifact.kind }}</a>

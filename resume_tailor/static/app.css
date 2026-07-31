@@ -1342,6 +1342,71 @@ textarea::placeholder {
   font-size: 12px;
 }
 
+.source-evidence-list {
+  display: grid;
+  gap: 7px;
+  margin: 3px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.source-evidence-list li {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 8px 9px;
+  border-left: 2px solid rgba(150, 217, 239, 0.38);
+  background: rgba(31, 69, 99, 0.12);
+  color: var(--text-soft);
+  font-size: 11.5px;
+}
+
+.source-evidence-list code {
+  color: var(--cyan);
+  overflow-wrap: anywhere;
+}
+
+.keyword-assessment {
+  display: grid;
+  gap: 7px;
+}
+
+.keyword-status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 7px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: rgba(8, 20, 35, 0.5);
+  font-size: 11.5px;
+}
+
+.keyword-status span {
+  color: var(--text-soft);
+}
+
+.keyword-status strong,
+.keyword-status span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.requirement-evidence-card > small {
+  overflow-wrap: anywhere;
+}
+
+.keyword-status-present-verbatim,
+.keyword-status-supported-by-source {
+  border-color: rgba(101, 216, 163, 0.3);
+}
+
+.keyword-status-unsupported {
+  border-color: rgba(240, 166, 179, 0.3);
+}
+
 .check-list {
   gap: 6px;
   color: var(--text-soft);
@@ -1703,6 +1768,21 @@ textarea::placeholder {
 
 .terminal-card > .primary-button {
   margin-top: 8px;
+}
+
+.terminal-card > form {
+  margin-top: 17px;
+}
+
+.terminal-card > .field-help {
+  max-width: 760px;
+  margin: 8px 0 14px;
+}
+
+@media (max-width: 640px) {
+  .source-evidence-list li {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 1080px) {

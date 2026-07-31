@@ -38,13 +38,26 @@ from .orchestration import (
     ApprovalResponse,
     PipelineHooks,
 )
+from .retry import (
+    antigravity_retry_failure_kind,
+    build_antigravity_reprocess_context,
+    build_antigravity_retry_context,
+    build_retry_context,
+)
 from .utilities import (
     ApprovalError,
+    AntigravityCannotApplyError,
+    AntigravityLaunchSizeError,
+    AntigravityResponseEnvelopeError,
+    AntigravityTailoringContractError,
+    AntigravityTailoringPreflightError,
+    AntigravityTechnicalFailureError,
     CancellationError,
     CodexSchemaCompatibilityError,
     InputError,
     ModelError,
     ResumeTailorError,
+    SourceEvidenceError,
     atomic_write_text,
     parse_duration,
     utc_now_iso,
@@ -75,9 +88,12 @@ _TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
 _DOWNLOAD_EXACT = {
     "job-source.json",
     "job-description.txt",
+    "job-requirements.json",
     "extracted-master-resume.json",
     "codex-analysis.json",
+    "codex-analysis-resolved.json",
     "codex-analysis-normalization-warnings.json",
+    "codex-analysis-transport.schema.json",
     "antigravity-response.json",
     "tailored-content.json",
     "content-diff.md",
@@ -119,6 +135,7 @@ class RunRecord:
     message: str = "Run queued."
     artifact_directory: Path | None = None
     error: str | None = None
+    failure_kind: str | None = None
     events: list[dict[str, str]] = field(default_factory=list)
     approval: ApprovalRequest | None = None
     approval_response: ApprovalResponse | None = None
@@ -132,7 +149,7 @@ def _project_root() -> Path:
 
 
 def default_master_resume() -> Path:
-    return _project_root() / "template" / "sample_resume.docx"
+    return _project_root() / "template" / "master_resume.docx"
 
 
 def default_output_directory() -> Path:
@@ -352,6 +369,7 @@ class RunManager:
             with self._condition:
                 record.status = "FAILED"
                 record.error = _sanitized_technical_details(exc)
+                record.failure_kind = _failure_kind_for_error(exc, record.stage)
                 record.message = _safe_error_message(exc)
                 record.approval = None
                 record.events.append(
@@ -366,6 +384,7 @@ class RunManager:
         except Exception as exc:  # defensive boundary for a localhost UI thread
             with self._condition:
                 record.status = "FAILED"
+                record.failure_kind = "internal"
                 record.error = (
                     _sanitized_technical_details(
                         RuntimeError(
@@ -545,6 +564,8 @@ class RunManager:
             self._condition.notify_all()
 
     def snapshot(self, run_id: str) -> dict[str, Any]:
+        if run_id.startswith("history-"):
+            return self._historical_snapshot(run_id)
         with self._condition:
             record = self._require_record(run_id)
             return self._snapshot_locked(record)
@@ -569,6 +590,25 @@ class RunManager:
         role = record.role or metadata.get("role")
         artifacts = _artifact_entries(record.artifact_directory)
         pdf = next((item["name"] for item in artifacts if item["kind"] == "PDF"), None)
+        failure_kind = record.failure_kind or _failure_kind_from_metadata(metadata)
+        retry_eligible, retry_reason = self._retry_state(
+            record.artifact_directory,
+            failure_kind=failure_kind,
+        )
+        (
+            antigravity_retry_eligible,
+            antigravity_retry_reason,
+        ) = self._antigravity_retry_state(
+            record.artifact_directory,
+            failure_kind=failure_kind,
+        )
+        (
+            antigravity_reprocess_eligible,
+            antigravity_reprocess_reason,
+        ) = self._antigravity_reprocess_state(
+            record.artifact_directory,
+            failure_kind=failure_kind,
+        )
         return {
             "run_id": record.run_id,
             "created_at": record.created_at,
@@ -585,6 +625,13 @@ class RunManager:
                 else None
             ),
             "error": record.error,
+            "failure_kind": failure_kind,
+            "retry_eligible": retry_eligible,
+            "retry_reason": retry_reason,
+            "antigravity_retry_eligible": antigravity_retry_eligible,
+            "antigravity_retry_reason": antigravity_retry_reason,
+            "antigravity_reprocess_eligible": antigravity_reprocess_eligible,
+            "antigravity_reprocess_reason": antigravity_reprocess_reason,
             "events": [dict(item) for item in record.events],
             "approval": approval,
             "revision": record.revision,
@@ -592,6 +639,342 @@ class RunManager:
             "pdf_name": pdf,
             "metadata": metadata,
         }
+
+    def _history_directory(self, run_id: str) -> Path:
+        directory_name = run_id.removeprefix("history-")
+        if (
+            not run_id.startswith("history-")
+            or Path(directory_name).name != directory_name
+            or directory_name.startswith(".")
+        ):
+            raise InputError("Invalid historical run identifier.")
+        run_directory = self.settings.output_directory / directory_name
+        if (
+            run_directory.is_symlink()
+            or not run_directory.is_dir()
+            or not _is_direct_child(run_directory, self.settings.output_directory)
+        ):
+            raise InputError("The requested historical run is not available.")
+        metadata = _safe_json(run_directory / "run-metadata.json")
+        if metadata.get("application") != "resume-tailor":
+            raise InputError("The requested directory is not a validated run.")
+        return run_directory.resolve()
+
+    def _retry_state(
+        self,
+        run_directory: Path | None,
+        *,
+        failure_kind: str | None,
+    ) -> tuple[bool, str]:
+        if failure_kind != "source_evidence" or run_directory is None:
+            return False, ""
+        try:
+            context = build_retry_context(
+                run_directory,
+                current_resume=self.settings.master_resume,
+            )
+        except InputError as exc:
+            return False, str(exc)
+        legacy = " Legacy inputs were cross-checked." if context.legacy_verified else ""
+        return True, f"Stored input hashes match.{legacy}"
+
+    def _antigravity_retry_state(
+        self,
+        run_directory: Path | None,
+        *,
+        failure_kind: str | None,
+    ) -> tuple[bool, str]:
+        if failure_kind not in {
+            "antigravity_launch_size",
+            "antigravity_response_envelope",
+            "antigravity_tailoring_contract",
+            "antigravity_cannot_apply",
+            "antigravity_technical_failure",
+        } or run_directory is None:
+            return False, ""
+        try:
+            build_antigravity_retry_context(
+                run_directory,
+                current_resume=self.settings.master_resume,
+            )
+        except InputError as exc:
+            if "predates the authenticated Codex approval record" in str(exc):
+                return (
+                    False,
+                    "This run predates the authenticated Codex approval record; "
+                    "a new run is required.",
+                )
+            return (
+                False,
+                "At least one approved input or its authenticated hash no longer "
+                "matches; a new run is required.",
+            )
+        return (
+            True,
+            "The source résumé, confirmed job input, requirement catalog, "
+            "transport schema, resolved analysis, and approval record all match "
+            "their authenticated hashes.",
+        )
+
+    def _antigravity_reprocess_state(
+        self,
+        run_directory: Path | None,
+        *,
+        failure_kind: str | None,
+    ) -> tuple[bool, str]:
+        if failure_kind != "antigravity_response_envelope" or run_directory is None:
+            return False, ""
+        try:
+            build_antigravity_reprocess_context(
+                run_directory,
+                current_resume=self.settings.master_resume,
+            )
+        except InputError:
+            return (
+                False,
+                "The preserved response is not one complete, schema-valid "
+                "tailoring result, so it cannot be reprocessed offline.",
+            )
+        return (
+            True,
+            "The preserved response, expected schema, approved edits, source "
+            "résumé, requirement catalog, resolved analysis, approval record, "
+            "and recovery ancestry all match their authenticated hashes.",
+        )
+
+    def _historical_snapshot(self, run_id: str) -> dict[str, Any]:
+        run_directory = self._history_directory(run_id)
+        metadata = _safe_json(run_directory / "run-metadata.json")
+        status = str(metadata.get("status", "UNKNOWN"))
+        stage = _ui_stage_from_metadata(str(metadata.get("stage", "")))
+        failure_kind = _failure_kind_from_metadata(metadata)
+        artifacts = _artifact_entries(run_directory)
+        pdf = next((item["name"] for item in artifacts if item["kind"] == "PDF"), None)
+        retry_eligible, retry_reason = self._retry_state(
+            run_directory,
+            failure_kind=failure_kind,
+        )
+        (
+            antigravity_retry_eligible,
+            antigravity_retry_reason,
+        ) = self._antigravity_retry_state(
+            run_directory,
+            failure_kind=failure_kind,
+        )
+        (
+            antigravity_reprocess_eligible,
+            antigravity_reprocess_reason,
+        ) = self._antigravity_reprocess_state(
+            run_directory,
+            failure_kind=failure_kind,
+        )
+        error_payload = metadata.get("error")
+        error_message = (
+            error_payload.get("message")
+            if isinstance(error_payload, dict)
+            and isinstance(error_payload.get("message"), str)
+            else ""
+        )
+        if failure_kind == "source_evidence":
+            technical = (
+                "Local evidence-contract validation rejected model requirement or "
+                "source references. "
+                "Exact résumé and job text are omitted from this view."
+            )
+            message = _SOURCE_EVIDENCE_UI_MESSAGE
+        elif failure_kind == "antigravity_launch_size":
+            technical = (
+                "The operating system rejected the legacy Antigravity process "
+                "argument vector before provider startup. Prompt content is omitted."
+            )
+            message = _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
+        elif failure_kind == "antigravity_response_envelope":
+            technical = (
+                "Antigravity returned a documented print-mode JSON wrapper, but "
+                "no single supported structured-output candidate passed strict "
+                "schema validation. Provider prose is omitted."
+            )
+            message = _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE
+        elif failure_kind == "antigravity_tailoring_contract":
+            technical = (
+                "Antigravity returned a post-approval status that did not apply "
+                "the authenticated edit plan. Provider prose and prompt content "
+                "are omitted."
+            )
+            message = _ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE
+        elif failure_kind == "antigravity_cannot_apply":
+            technical = (
+                "Antigravity returned a bounded cannot_apply result for one "
+                "approved edit. Provider prose is omitted."
+            )
+            message = _ANTIGRAVITY_CANNOT_APPLY_UI_MESSAGE
+        elif failure_kind == "antigravity_technical_failure":
+            technical = (
+                "Antigravity returned a structured technical_failure result. "
+                "Provider prose is omitted."
+            )
+            message = _ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE
+        else:
+            technical = (
+                _sanitized_technical_details(RuntimeError(error_message))
+                if error_message
+                else None
+            )
+            message = (
+                "Run complete. DOCX, PDF, and reports are ready."
+                if status == "COMPLETE"
+                else "The preserved run stopped safely."
+            )
+        return {
+            "run_id": run_id,
+            "created_at": metadata.get("created_at", ""),
+            "source_mode": metadata.get("job_source", ""),
+            "company": metadata.get("company"),
+            "role": metadata.get("role"),
+            "status": status,
+            "stage": stage,
+            "stage_index": _STAGE_INDEX.get(stage, 0),
+            "message": message,
+            "artifact_directory": str(run_directory),
+            "error": technical,
+            "failure_kind": failure_kind,
+            "retry_eligible": retry_eligible,
+            "retry_reason": retry_reason,
+            "antigravity_retry_eligible": antigravity_retry_eligible,
+            "antigravity_retry_reason": antigravity_retry_reason,
+            "antigravity_reprocess_eligible": antigravity_reprocess_eligible,
+            "antigravity_reprocess_reason": antigravity_reprocess_reason,
+            "events": [
+                {
+                    "time": "—",
+                    "stage": stage,
+                    "message": message,
+                }
+            ],
+            "approval": None,
+            "revision": 0,
+            "artifacts": artifacts,
+            "pdf_name": pdf,
+            "metadata": metadata,
+            "is_history": True,
+        }
+
+    def retry_codex_analysis(self, run_id: str) -> RunRecord:
+        if run_id.startswith("history-"):
+            source_directory = self._history_directory(run_id)
+        else:
+            with self._condition:
+                source = self._require_record(run_id)
+                source_directory = source.artifact_directory
+            if source_directory is None:
+                raise InputError("The failed run has no preserved input directory.")
+        context = build_retry_context(
+            source_directory,
+            current_resume=self.settings.master_resume,
+        )
+        staging = self.create_staging_directory()
+        namespace = argparse.Namespace(
+            resume=self.settings.master_resume,
+            clipboard=False,
+            job_file=None,
+            job_url=None,
+            company=context.company,
+            role=context.role,
+            output_dir=self.settings.output_directory,
+            yes=False,
+            keep_workdir=False,
+            timeout=self.settings.timeout,
+            retry_context=context,
+        )
+        try:
+            return self.start(
+                namespace=namespace,
+                staging_directory=staging,
+                source_mode="retry",
+                company=context.company,
+                role=context.role,
+            )
+        except Exception:
+            _safe_remove_staging(staging, self._staging_root)
+            raise
+
+    def retry_antigravity_tailoring(self, run_id: str) -> RunRecord:
+        if run_id.startswith("history-"):
+            source_directory = self._history_directory(run_id)
+        else:
+            with self._condition:
+                source = self._require_record(run_id)
+                source_directory = source.artifact_directory
+            if source_directory is None:
+                raise InputError("The failed run has no preserved input directory.")
+        context = build_antigravity_retry_context(
+            source_directory,
+            current_resume=self.settings.master_resume,
+        )
+        staging = self.create_staging_directory()
+        namespace = argparse.Namespace(
+            resume=self.settings.master_resume,
+            clipboard=False,
+            job_file=None,
+            job_url=None,
+            company=context.company,
+            role=context.role,
+            output_dir=self.settings.output_directory,
+            yes=False,
+            keep_workdir=False,
+            timeout=self.settings.timeout,
+            antigravity_retry_context=context,
+        )
+        try:
+            return self.start(
+                namespace=namespace,
+                staging_directory=staging,
+                source_mode="antigravity-retry",
+                company=context.company,
+                role=context.role,
+            )
+        except Exception:
+            _safe_remove_staging(staging, self._staging_root)
+            raise
+
+    def reprocess_antigravity_response(self, run_id: str) -> RunRecord:
+        if run_id.startswith("history-"):
+            source_directory = self._history_directory(run_id)
+        else:
+            with self._condition:
+                source = self._require_record(run_id)
+                source_directory = source.artifact_directory
+            if source_directory is None:
+                raise InputError("The failed run has no preserved response directory.")
+        context = build_antigravity_reprocess_context(
+            source_directory,
+            current_resume=self.settings.master_resume,
+        )
+        staging = self.create_staging_directory()
+        namespace = argparse.Namespace(
+            resume=self.settings.master_resume,
+            clipboard=False,
+            job_file=None,
+            job_url=None,
+            company=context.retry_context.company,
+            role=context.retry_context.role,
+            output_dir=self.settings.output_directory,
+            yes=False,
+            keep_workdir=False,
+            timeout=self.settings.timeout,
+            antigravity_reprocess_context=context,
+        )
+        try:
+            return self.start(
+                namespace=namespace,
+                staging_directory=staging,
+                source_mode="antigravity-response-reprocess",
+                company=context.retry_context.company,
+                role=context.retry_context.role,
+            )
+        except Exception:
+            _safe_remove_staging(staging, self._staging_root)
+            raise
 
     def history(self) -> list[dict[str, Any]]:
         with self._condition:
@@ -716,7 +1099,141 @@ def _clock_text() -> str:
     return datetime.now().astimezone().strftime("%H:%M:%S")
 
 
+_SOURCE_EVIDENCE_UI_MESSAGE = (
+    "Codex returned job-requirement or résumé-source references that violated "
+    "the authoritative local evidence contract. This is a model evidence-contract "
+    "failure; changing or refetching the confirmed job input will not correct it."
+)
+_ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE = (
+    "Antigravity could not start because the request exceeded the operating "
+    "system’s command-line size."
+)
+_ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE = (
+    "Antigravity returned JSON in an unsupported response format."
+)
+_ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE = (
+    "Antigravity did not apply the approved tailoring plan and returned a "
+    "non-actionable request for another task. All authenticated inputs were "
+    "already present; no factual information is requested."
+)
+_ANTIGRAVITY_CANNOT_APPLY_UI_MESSAGE = (
+    "Antigravity could not safely apply one approved edit. The authenticated "
+    "inputs and approved plan were preserved for a manual step-6 retry."
+)
+_ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE = (
+    "Antigravity reported a bounded technical tailoring failure. The authenticated "
+    "inputs and approved plan were preserved."
+)
+
+
+def _failure_kind_for_error(
+    error: ResumeTailorError,
+    stage: str,
+) -> str:
+    if isinstance(error, SourceEvidenceError):
+        return "source_evidence"
+    if isinstance(error, AntigravityLaunchSizeError) or (
+        stage == "antigravity_tailoring"
+        and "Argument list too long" in str(error)
+    ):
+        return "antigravity_launch_size"
+    if isinstance(error, AntigravityResponseEnvelopeError):
+        return "antigravity_response_envelope"
+    if isinstance(error, AntigravityTailoringContractError):
+        return "antigravity_tailoring_contract"
+    if isinstance(error, AntigravityCannotApplyError):
+        return "antigravity_cannot_apply"
+    if isinstance(error, AntigravityTechnicalFailureError):
+        return "antigravity_technical_failure"
+    if isinstance(error, AntigravityTailoringPreflightError):
+        return "antigravity_tailoring_preflight"
+    if isinstance(error, CodexSchemaCompatibilityError):
+        return "schema"
+    if stage in {"fetching_job", "confirming_posting"}:
+        return "retrieval"
+    if isinstance(error, ModelError):
+        return "model"
+    return "pipeline"
+
+
+def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    if metadata.get("failure_class") == "source-evidence-analysis":
+        return "source_evidence"
+    antigravity_failure = antigravity_retry_failure_kind(dict(metadata))
+    if antigravity_failure == "launch_size":
+        return "antigravity_launch_size"
+    if antigravity_failure == "response_envelope":
+        return "antigravity_response_envelope"
+    if antigravity_failure in {
+        "tailoring_contract",
+        "legacy_needs_information",
+    }:
+        return "antigravity_tailoring_contract"
+    if antigravity_failure == "cannot_apply":
+        return "antigravity_cannot_apply"
+    if antigravity_failure == "technical_failure":
+        return "antigravity_technical_failure"
+    error = metadata.get("error")
+    error_type = error.get("type") if isinstance(error, Mapping) else None
+    error_message = error.get("message") if isinstance(error, Mapping) else None
+    stage = str(metadata.get("stage", ""))
+    if (
+        stage == "codex-analysis"
+        and error_type in {"SourceEvidenceError", "TruthfulnessError"}
+        and isinstance(error_message, str)
+        and error_message.startswith(
+            "Codex analysis failed local source-evidence validation:"
+        )
+    ):
+        return "source_evidence"
+    if stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}:
+        return "retrieval"
+    return None
+
+
+def _ui_stage_from_metadata(stage: str) -> str:
+    return {
+        "initializing": "validating_input",
+        "dependency-check": "validating_input",
+        "linkedin-job-extraction": "fetching_job",
+        "linkedin-posting-confirmation": "confirming_posting",
+        "extracting-master": "codex_analysis",
+        "codex-analysis-schema-preflight": "codex_analysis",
+        "codex-analysis": "codex_analysis",
+        "tailoring-dependency-check": "antigravity_tailoring",
+        "antigravity-recovery-verification": "antigravity_tailoring",
+        "antigravity-tailoring-preflight": "antigravity_tailoring",
+        "antigravity-tailoring": "antigravity_tailoring",
+        "antigravity-response-reprocessing": "antigravity_tailoring",
+        "local-evidence-check": "evidence_validation",
+        "docx-render": "rendering",
+        "pdf-export-validation": "rendering",
+        "final-codex-qa": "final_qa",
+        "complete": "complete",
+    }.get(stage, "validating_input")
+
+
 def _safe_error_message(error: ResumeTailorError) -> str:
+    if isinstance(error, SourceEvidenceError):
+        return _SOURCE_EVIDENCE_UI_MESSAGE
+    if isinstance(error, AntigravityLaunchSizeError) or (
+        "Argument list too long" in str(error)
+        and "agy" in str(error)
+    ):
+        return _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
+    if isinstance(error, AntigravityResponseEnvelopeError):
+        return _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE
+    if isinstance(error, AntigravityTailoringContractError):
+        return _ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE
+    if isinstance(error, AntigravityCannotApplyError):
+        return _ANTIGRAVITY_CANNOT_APPLY_UI_MESSAGE
+    if isinstance(error, AntigravityTechnicalFailureError):
+        return _ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE
+    if isinstance(error, AntigravityTailoringPreflightError):
+        return (
+            "The authenticated tailoring inputs failed local completeness "
+            "preflight. No Antigravity request was launched."
+        )
     if isinstance(error, CodexSchemaCompatibilityError):
         return "Codex could not start because its output schema was incompatible."
     if isinstance(error, ModelError):
@@ -1167,6 +1684,36 @@ def create_app(
         except InputError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return RedirectResponse(f"/runs/{run_id}", status_code=303)
+
+    @app.post("/runs/{run_id}/retry-codex-analysis")
+    async def retry_codex_analysis(request: Request, run_id: str):
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            record = manager.retry_codex_analysis(run_id)
+        except InputError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return RedirectResponse(f"/runs/{record.run_id}", status_code=303)
+
+    @app.post("/runs/{run_id}/retry-antigravity-tailoring")
+    async def retry_antigravity_tailoring(request: Request, run_id: str):
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            record = manager.retry_antigravity_tailoring(run_id)
+        except InputError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return RedirectResponse(f"/runs/{record.run_id}", status_code=303)
+
+    @app.post("/runs/{run_id}/reprocess-antigravity-response")
+    async def reprocess_antigravity_response(request: Request, run_id: str):
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            record = manager.reprocess_antigravity_response(run_id)
+        except InputError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return RedirectResponse(f"/runs/{record.run_id}", status_code=303)
 
     @app.get("/runs/{run_id}/artifacts/{artifact_name:path}")
     async def artifact(

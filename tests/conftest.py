@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,36 @@ def repository_root() -> Path:
 
 @pytest.fixture
 def master_resume(repository_root: Path) -> Path:
+    """Compatibility fixture name backed only by the synthetic test DOCX."""
     return repository_root / "template" / "sample_resume.docx"
+
+
+@pytest.fixture
+def installer_source(repository_root: Path, tmp_path: Path) -> Path:
+    """Minimal installer checkout containing only the synthetic résumé fixture."""
+    root = tmp_path / "synthetic-installer-source"
+    root.mkdir()
+    for directory in ("resume_tailor", "schemas", "assets"):
+        shutil.copytree(repository_root / directory, root / directory)
+    for name in (
+        "install.sh",
+        "uninstall.sh",
+        "tailor-resume",
+        "tailor-resume-ui",
+        "pyproject.toml",
+        "README.md",
+        "LICENSE",
+    ):
+        shutil.copy2(repository_root / name, root / name)
+    (root / "template").mkdir()
+    shutil.copy2(
+        repository_root / "template" / "sample_resume.docx",
+        root / "template" / "master_resume.docx",
+    )
+    environment = repository_root / ".venv"
+    if (environment / "bin" / "python").is_file():
+        (root / ".venv").symlink_to(environment, target_is_directory=True)
+    return root
 
 
 @pytest.fixture(autouse=True)

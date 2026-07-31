@@ -124,7 +124,7 @@ cp -a "${SOURCE_DIR}/resume_tailor/"*.py "${STAGING}/resume_tailor/"
 cp -a "${SOURCE_DIR}/resume_tailor/static" "${STAGING}/resume_tailor/static"
 cp -a "${SOURCE_DIR}/resume_tailor/templates" "${STAGING}/resume_tailor/templates"
 cp -a "${SOURCE_DIR}/schemas/"*.json "${STAGING}/schemas/"
-cp -a "${SOURCE_DIR}/template/sample_resume.docx" "${STAGING}/template/sample_resume.docx"
+cp -a "${SOURCE_DIR}/template/master_resume.docx" "${STAGING}/template/master_resume.docx"
 cp -a \
   "${SOURCE_DIR}/pyproject.toml" \
   "${SOURCE_DIR}/README.md" \

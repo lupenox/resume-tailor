@@ -1,0 +1,53 @@
+{
+  "role_summary": "Synthetic validation role with explicit unsupported gaps.",
+  "fit_assessment": {
+    "overall": "Partial synthetic fit.",
+    "strengths": [
+      "Python and JSON Schema are present in the synthetic fixture"
+    ],
+    "gaps": [
+      "Absent technologies remain unsupported"
+    ]
+  },
+  "supported_requirement_mappings": [
+    {
+      "requirement_id": "skill.001",
+      "evidence_source_ids": [
+        "skill_groups.0"
+      ],
+      "strength": "strong"
+    },
+    {
+      "requirement_id": "skill.002",
+      "evidence_source_ids": [
+        "skill_groups.2"
+      ],
+      "strength": "strong"
+    },
+    {
+      "requirement_id": "skill.003",
+      "evidence_source_ids": [
+        "professional_summary"
+      ],
+      "strength": "partial"
+    }
+  ],
+  "unsupported_requirement_ids": [
+    "text.001",
+    "skill.004",
+    "skill.005",
+    "skill.006",
+    "responsibility.001"
+  ],
+  "recommended_edits": [],
+  "immutable_facts": [
+    "Synthetic fixture only"
+  ],
+  "forbidden_claims": [
+    "RAG",
+    "Kubernetes",
+    "rule-based link scoring"
+  ],
+  "content_budget_guidance": [],
+  "questions_for_user": []
+}

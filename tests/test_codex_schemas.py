@@ -8,12 +8,16 @@ import pytest
 
 import resume_tailor.codex_analysis as codex_analysis_module
 from resume_tailor.codex_analysis import invoke_codex_analysis
+from resume_tailor.job_requirements import build_job_requirement_catalog
 from resume_tailor.schemas import (
     audit_codex_transport_schema,
+    build_codex_analysis_transport_schema,
     codex_transport_schema_path,
     derive_codex_transport_schema,
     load_schema,
     normalize_unique_arrays,
+    prepare_codex_analysis_transport_schema,
+    validate_codex_analysis_transport_artifact,
     validate_payload,
 )
 from resume_tailor.utilities import CodexSchemaCompatibilityError
@@ -37,22 +41,27 @@ def _valid_analysis() -> dict[str, Any]:
             "strengths": ["Python"],
             "gaps": ["No unsupported scale evidence"],
         },
-        "matched_requirements": ["Python"],
-        "evidence_map": [
+        "supported_requirement_mappings": [
             {
-                "requirement": "Python",
-                "resume_evidence": ["Python"],
+                "requirement_id": "skill.001",
+                "evidence_source_ids": ["skill_groups.0"],
                 "strength": "strong",
             }
         ],
-        "supported_ats_keywords": ["Python"],
-        "missing_or_unsupported_requirements": ["RAG"],
+        "unsupported_requirement_ids": ["skill.002"],
         "recommended_edits": [],
         "immutable_facts": ["Expected Dec 2026"],
         "forbidden_claims": ["GraphQL"],
         "content_budget_guidance": [],
         "questions_for_user": [],
     }
+
+
+def _job_catalog() -> dict[str, Any]:
+    return build_job_requirement_catalog(
+        "Skills: Python and RAG.",
+        structured_job={"technologies_and_skills": ["Python", "RAG"]},
+    )
 
 
 @pytest.mark.parametrize(
@@ -143,7 +152,9 @@ def test_transport_preserves_supported_bounds_and_references() -> None:
 def test_exact_duplicates_are_removed_and_warning_is_recorded() -> None:
     payload = _valid_analysis()
     payload["fit_assessment"]["strengths"] = ["Python", "Python", "Testing"]
-    payload["supported_ats_keywords"] = ["Python", "Python"]
+    payload["supported_requirement_mappings"].append(
+        dict(payload["supported_requirement_mappings"][0])
+    )
 
     normalized, warnings = normalize_unique_arrays(
         payload,
@@ -151,8 +162,8 @@ def test_exact_duplicates_are_removed_and_warning_is_recorded() -> None:
     )
 
     assert normalized["fit_assessment"]["strengths"] == ["Python", "Testing"]
-    assert normalized["supported_ats_keywords"] == ["Python"]
-    assert len(warnings) == 2
+    assert len(normalized["supported_requirement_mappings"]) == 2
+    assert len(warnings) == 1
     assert all("exact duplicate" in warning for warning in warnings)
     validate_payload(
         normalized,
@@ -173,7 +184,7 @@ def test_schema_preflight_fails_before_codex_process_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def incompatible_schema(_: str) -> Path:
+    def incompatible_schema(*args: Any, **kwargs: Any) -> Any:
         raise CodexSchemaCompatibilityError("nested unsupported keyword")
 
     def forbidden_process_launch(*args: Any, **kwargs: Any) -> Any:
@@ -181,7 +192,7 @@ def test_schema_preflight_fails_before_codex_process_launch(
 
     monkeypatch.setattr(
         codex_analysis_module,
-        "codex_transport_schema_path",
+        "prepare_codex_analysis_transport_schema",
         incompatible_schema,
     )
     monkeypatch.setattr(
@@ -197,6 +208,7 @@ def test_schema_preflight_fails_before_codex_process_launch(
         invoke_codex_analysis(
             extracted_resume={"paragraphs": []},
             job_description="Python role",
+            job_requirements=_job_catalog(),
             company="Example",
             role="Developer",
             run_directory=tmp_path,
@@ -221,6 +233,7 @@ def test_codex_adapter_uses_transport_and_persists_normalization_warning(
     payload = invoke_codex_analysis(
         extracted_resume=extracted,
         job_description="Python role",
+        job_requirements=_job_catalog(),
         company="Example",
         role="Developer",
         run_directory=tmp_path,
@@ -228,10 +241,11 @@ def test_codex_adapter_uses_transport_and_persists_normalization_warning(
         executable=str(stubs_on_path / "codex"),
     )
 
-    assert payload["matched_requirements"] == ["Python"]
-    assert payload["supported_ats_keywords"] == ["Python"]
+    assert payload["supported_requirement_mappings"][0]["requirement_id"] == (
+        "skill.001"
+    )
     used_schema = Path(schema_log.read_text(encoding="utf-8").strip())
-    assert used_schema.name == "codex_analysis.openai.schema.json"
+    assert used_schema.name == "codex-analysis-transport.schema.json"
     assert (
         tmp_path / "codex-analysis-normalization-warnings.json"
     ).is_file()
@@ -239,3 +253,175 @@ def test_codex_adapter_uses_transport_and_persists_normalization_warning(
         (tmp_path / "codex-analysis.json").read_text(encoding="utf-8")
     )
     assert persisted == payload
+
+
+def test_run_schema_uses_separate_evidence_and_editable_enums(
+    master_resume: Path,
+) -> None:
+    from resume_tailor.docx_extract import extract_resume
+
+    extracted, _ = extract_resume(master_resume)
+    transport, evidence_ids, editable_ids, requirement_ids = (
+        build_codex_analysis_transport_schema(
+            extracted,
+            _job_catalog(),
+        )
+    )
+    properties = transport["properties"]
+    evidence_arrays = (
+        properties["supported_requirement_mappings"]["items"]["properties"][
+            "evidence_source_ids"
+        ],
+        properties["recommended_edits"]["items"]["properties"][
+            "evidence_source_ids"
+        ],
+    )
+    for array_schema in evidence_arrays:
+        assert array_schema["minItems"] == 1
+        assert array_schema["items"]["enum"] == evidence_ids
+        assert "" not in array_schema["items"]["enum"]
+        assert "section.technical_skills" not in array_schema["items"]["enum"]
+    requirement_field = properties["supported_requirement_mappings"]["items"][
+        "properties"
+    ]["requirement_id"]
+    assert requirement_field["enum"] == requirement_ids
+    assert properties["unsupported_requirement_ids"]["items"]["enum"] == (
+        requirement_ids
+    )
+
+    for name in ("recommended_edits", "content_budget_guidance"):
+        target = properties[name]["items"]["properties"]["target_source_id"]
+        assert target["enum"] == editable_ids
+        assert "projects.0.heading" not in target["enum"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("evidence", ""),
+        ("evidence", "source.unknown"),
+        ("evidence", "section.technical_skills"),
+        ("evidence_array", []),
+        ("requirement", ""),
+        ("requirement", "requirement.unknown"),
+        ("target", ""),
+        ("target", "source.unknown"),
+        ("target", "projects.0.heading"),
+    ],
+)
+def test_run_schema_rejects_malformed_or_inappropriate_ids(
+    field: str,
+    value: Any,
+    master_resume: Path,
+) -> None:
+    import jsonschema
+    from resume_tailor.docx_extract import extract_resume
+
+    extracted, _ = extract_resume(master_resume)
+    transport, _, _, _ = build_codex_analysis_transport_schema(
+        extracted,
+        _job_catalog(),
+    )
+    payload = _valid_analysis()
+    if field == "evidence":
+        payload["supported_requirement_mappings"][0]["evidence_source_ids"] = [value]
+    elif field == "evidence_array":
+        payload["supported_requirement_mappings"][0]["evidence_source_ids"] = value
+    elif field == "requirement":
+        payload["supported_requirement_mappings"][0]["requirement_id"] = value
+    else:
+        payload["recommended_edits"] = [
+            {
+                "target_source_id": value,
+                "operation": "replace",
+                "proposed_text": "Synthetic edit.",
+                "alignment_rationale": "Synthetic test.",
+                "evidence_source_ids": ["professional_summary"],
+            }
+        ]
+
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(payload, transport)
+
+
+def test_generated_schema_artifact_is_hashed_and_revalidated(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    from resume_tailor.docx_extract import extract_resume
+
+    extracted, _ = extract_resume(master_resume)
+    artifact = prepare_codex_analysis_transport_schema(
+        extracted,
+        _job_catalog(),
+        tmp_path,
+    )
+
+    assert artifact.path.name == "codex-analysis-transport.schema.json"
+    assert len(artifact.sha256) == 64
+    assert artifact.size_bytes == artifact.path.stat().st_size
+    validate_codex_analysis_transport_artifact(
+        artifact,
+        extracted,
+        _job_catalog(),
+        tmp_path,
+    )
+
+    artifact.path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(
+        CodexSchemaCompatibilityError,
+        match="changed before Codex launch",
+    ):
+        validate_codex_analysis_transport_artifact(
+            artifact,
+            extracted,
+            _job_catalog(),
+            tmp_path,
+        )
+
+
+def test_generated_schema_rejects_requirement_catalog_drift(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    from resume_tailor.docx_extract import extract_resume
+
+    extracted, _ = extract_resume(master_resume)
+    catalog = _job_catalog()
+    artifact = prepare_codex_analysis_transport_schema(
+        extracted,
+        catalog,
+        tmp_path,
+    )
+    changed = _job_catalog()
+    changed["requirements"][0]["requirement_id"] = "skill.003"
+
+    with pytest.raises(
+        CodexSchemaCompatibilityError,
+        match="source or job-requirement catalog",
+    ):
+        validate_codex_analysis_transport_artifact(
+            artifact,
+            extracted,
+            changed,
+            tmp_path,
+        )
+
+
+def test_generated_schema_complexity_fails_closed_without_fallback() -> None:
+    extracted = {
+        "source_blocks": [
+            {
+                "source_id": "x" * 513,
+                "evidence_allowed": True,
+                "editable": True,
+                "exact_text": "Synthetic source.",
+            }
+        ]
+    }
+
+    with pytest.raises(
+        CodexSchemaCompatibilityError,
+        match="enum string exceeds.*512-byte safety limit",
+    ):
+        build_codex_analysis_transport_schema(extracted, _job_catalog())

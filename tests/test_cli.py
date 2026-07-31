@@ -132,14 +132,14 @@ def test_yes_skips_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_output_naming_and_path_safety() -> None:
-    assert slugify("../../RG Talent") == "rg-talent"
+    assert slugify("../../Example Talent") == "example-talent"
     assert filename_component("SAMPLE CANDIDATE") == "Sample-Candidate"
-    assert filename_component("RG Talent") == "RG-Talent"
+    assert filename_component("Example Talent") == "Example-Talent"
     assert filename_component("Agentic AI Developer") == "Agentic-AI-Developer"
 
 
 def test_existing_installation_refuses_overwrite(
-    repository_root: Path,
+    installer_source: Path,
     tmp_path: Path,
 ) -> None:
     fake_home = tmp_path / "home"
@@ -147,8 +147,8 @@ def test_existing_installation_refuses_overwrite(
     environment = os.environ.copy()
     environment["HOME"] = str(fake_home)
     first = subprocess.run(
-        ["bash", str(repository_root / "install.sh")],
-        cwd=repository_root,
+        ["bash", str(installer_source / "install.sh")],
+        cwd=installer_source,
         env=environment,
         text=True,
         capture_output=True,
@@ -157,13 +157,14 @@ def test_existing_installation_refuses_overwrite(
     assert first.returncode == 0, first.stderr
     installed = fake_home / ".local" / "share" / "resume-tailor"
     assert (installed / "resume_tailor" / "linkedin_job.py").is_file()
+    assert (installed / "resume_tailor" / "smoke.py").is_file()
     assert (installed / "resume_tailor" / "ui.py").is_file()
     assert (installed / "resume_tailor" / "templates" / "dashboard.html").is_file()
     assert (installed / "resume_tailor" / "static" / "app.css").is_file()
     assert (installed / "schemas" / "linkedin_job.schema.json").is_file()
-    if (repository_root / ".venv" / "bin" / "python").is_file():
+    if (installer_source / ".venv" / "bin" / "python").is_file():
         assert (installed / ".venv").is_symlink()
-        assert (installed / ".venv").resolve() == repository_root / ".venv"
+        assert (installed / ".venv").resolve() == (installer_source / ".venv").resolve()
     else:
         assert not (installed / ".venv").exists()
     assert (fake_home / ".local" / "bin" / "tailor-resume-ui").is_file()
@@ -187,8 +188,8 @@ def test_existing_installation_refuses_overwrite(
         fake_home / ".local" / "share" / "applications" / "resume-tailor.desktop"
     ).exists()
     second = subprocess.run(
-        ["bash", str(repository_root / "install.sh")],
-        cwd=repository_root,
+        ["bash", str(installer_source / "install.sh")],
+        cwd=installer_source,
         env=environment,
         text=True,
         capture_output=True,
@@ -199,7 +200,7 @@ def test_existing_installation_refuses_overwrite(
 
 
 def test_desktop_launcher_requires_explicit_installer_option(
-    repository_root: Path,
+    installer_source: Path,
     tmp_path: Path,
 ) -> None:
     fake_home = tmp_path / "home"
@@ -207,8 +208,8 @@ def test_desktop_launcher_requires_explicit_installer_option(
     environment = os.environ.copy()
     environment["HOME"] = str(fake_home)
     result = subprocess.run(
-        ["bash", str(repository_root / "install.sh"), "--desktop"],
-        cwd=repository_root,
+        ["bash", str(installer_source / "install.sh"), "--desktop"],
+        cwd=installer_source,
         env=environment,
         text=True,
         capture_output=True,
@@ -239,7 +240,7 @@ def test_desktop_launcher_requires_explicit_installer_option(
 
 
 def test_desktop_installer_refuses_unrelated_shortcut_even_with_force(
-    repository_root: Path,
+    installer_source: Path,
     tmp_path: Path,
 ) -> None:
     fake_home = tmp_path / "home"
@@ -254,11 +255,11 @@ def test_desktop_installer_refuses_unrelated_shortcut_even_with_force(
     result = subprocess.run(
         [
             "bash",
-            str(repository_root / "install.sh"),
+            str(installer_source / "install.sh"),
             "--force",
             "--desktop",
         ],
-        cwd=repository_root,
+        cwd=installer_source,
         env=environment,
         text=True,
         capture_output=True,

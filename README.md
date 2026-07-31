@@ -1,332 +1,758 @@
-# Resume Tailor
+# resume-tailor
 
-Resume Tailor is a truthfulness-first résumé tailoring pipeline with a
-localhost-only review interface. It uses Codex for evidence analysis and final
-QA, Antigravity for constrained rewriting and optional public LinkedIn
-extraction, and deterministic local checks before producing DOCX and PDF
-artifacts.
+`resume-tailor` is a local Linux CLI and polished localhost web application that
+creates a truthful, job-tailored resume from a structured master DOCX. Both
+interfaces share one Python pipeline: OpenAI Codex CLI performs evidence
+analysis, Google Antigravity CLI produces schema-constrained wording,
+deterministic local code preserves DOCX formatting, LibreOffice and Poppler
+validate a one-page PDF, and Codex performs a final read-only visual/content
+review.
 
-The project is designed around a simple rule: a desired qualification is not
-evidence. Model output remains advisory until it passes local validation and the
-user approves the relevant gate.
+The application never asks either model to edit the document. Models return
+structured content; Python validates it and inserts approved text into a copy of
+the master. The source DOCX is hashed before and after every run and is never an
+output target.
 
-![Resume Tailor dashboard](docs/screenshots/dashboard-desktop.png)
+The web UI is optional. `tailor-resume` remains the complete terminal interface;
+`tailor-resume-ui` starts the browser interface on `127.0.0.1`.
 
-## What it demonstrates
+## Pipeline architecture
 
-- Multi-agent orchestration with explicit, bounded responsibilities
-- Structured model output backed by JSON Schema
-- Local evidence validation that rejects unsupported claims
-- Human approval gates before analysis and content changes advance
-- Format-preserving DOCX editing and one-page PDF validation
-- Prompt-injection boundaries around untrusted job-posting text
-- A responsive, accessible FastAPI interface bound only to localhost
-- Safe Linux installation with managed desktop entries and timestamped backups
+1. Read a job posting from the Linux clipboard or a UTF-8 text file, or ask
+   Antigravity to read and strictly extract one public LinkedIn job URL.
+2. For URL mode, validate HTTPS/hostname/path/redirect/job-ID consistency, save
+   `job-source.json`, display the derived posting identity, and require approval.
+3. Validate and structurally extract the master DOCX with `python-docx`.
+4. Send the extracted resume and untrusted posting to Codex in an ephemeral,
+   read-only session with a strict analysis schema.
+5. Print the analysis. Stop on unanswered factual questions; otherwise require
+   explicit approval.
+6. Run a local completeness and hash-authentication preflight, then send the
+   original content, immutable résumé source catalog, and approved edit catalog
+   to Antigravity over UTF-8 stdin in sandboxed print mode with a strict
+   tailored-content schema. Tailoring is an execution task, not generic plan
+   mode. Prompt text is never placed in argv or environment variables.
+7. Select exactly one documented Antigravity print-mode response candidate,
+   validate it strictly against the tailoring schema, and then run immutable-fact,
+   approved-edit, technology, metrics, seniority, availability, structure, and
+   content-budget checks. Prose, Markdown fences, fragments, and ambiguous
+   candidates fail closed.
+8. Write and display a section-by-section before/after diff. Refuse questionable
+   claims; otherwise require explicit approval.
+9. Copy the master, replace only mapped text runs, and verify that paragraph/run
+   formatting, hyperlinks, contact information, section geometry, and list
+   structure remain unchanged.
+10. Export one PDF page through a unique LibreOffice profile, validate text and
+   bounding boxes with Poppler, and render `preview.png`.
+11. Give Codex the preview and complete evidence bundle for a fresh read-only QA.
+    A material QA finding returns a nonzero status and preserves every artifact.
 
-## Architecture
+Codex uses two schema layers. The full Draft 2020-12 schemas
+`codex_analysis.schema.json` and `final_qa.schema.json` remain canonical for
+local validation and retain constraints such as `uniqueItems` and nonempty
+strings. The checked-in `codex_analysis.openai.schema.json` and
+`final_qa.openai.schema.json` files are compatibility sentinels derived for
+OpenAI's Structured Outputs subset. After the posting is confirmed and the résumé
+is extracted, local code builds two immutable catalogs: exact résumé source blocks
+and exact job requirements with stable IDs and categories. Analysis receives a
+fresh run-specific transport schema whose requirement, evidence, and edit-target
+enums contain only IDs from those catalogs. Required evidence arrays cannot be
+empty. The generated schema is size-bounded, recursively preflighted, hashed into
+run metadata, and revalidated immediately before `codex exec`. Final QA uses the
+checked-in transport schema. Unsupported requirements, incomplete or conflicting
+classifications, object-shape drift, empty or unknown IDs, and schema/catalog
+mismatches stop locally without a live request or unconstrained fallback.
 
-```text
-Résumé DOCX + job input
-          |
-          v
-Local DOCX extraction and structural validation
-          |
-          +--> Optional public LinkedIn extraction (Antigravity)
-          |              |
-          |              v
-          |      Human posting confirmation
-          |
-          v
-Read-only evidence analysis (Codex)
-          |
-          v
-Local schema + evidence validation
-          |
-          v
-Human analysis approval
-          |
-          v
-Plan-only constrained rewrite (Antigravity)
-          |
-          v
-Local factual-integrity and content-budget validation
-          |
-          v
-Human content-diff approval
-          |
-          v
-Deterministic DOCX render + LibreOffice PDF export
-          |
-          v
-Local page, text, geometry, and package checks
-          |
-          v
-Read-only visual/factual QA (Codex)
-          |
-          v
-Local DOCX, PDF, preview, QA report, and metadata
-```
+Codex classifies every catalog requirement into exactly one of two collections:
+a supported mapping with one or more résumé source IDs, or an unsupported ID with
+no evidence. Human-facing requirement text and cited résumé text are resolved
+locally. A conservative case/dash/whitespace match may be labeled `present_verbatim`;
+otherwise a supported mapping is explicitly labeled as a model-assessed semantic
+match requiring human review. Local code never claims to prove semantic equivalence.
 
-### Agent responsibilities
+Exact duplicate values in canonically unique arrays are removed in first-seen
+order before canonical validation. When this occurs, the normalized Codex
+artifact is saved and a `*-normalization-warnings.json` sidecar records every
+affected field. All remaining Draft 2020-12 constraints are enforced locally;
+the transport transformation does not weaken factual-integrity validation.
 
-Codex performs two read-only tasks:
+The current template validator expects the inspected design: one section, 32
+paragraphs, no tables, US Letter geometry, three skill groups, three projects
+with 3/4/3 bullets, one open-source entry, one experience entry, six hyperlinks,
+real `List Bullet` styles, and the established direct-run formatting patterns.
+This is a deliberate safety boundary. Significant template drift stops the run
+instead of risking edits to the wrong paragraphs.
 
-1. Compare the trusted résumé extraction with the untrusted posting and produce
-   evidence-linked recommendations.
-2. Review the final PDF preview and approved content diff for unsupported
-   claims, readability, clipping, missing information, and weak alignment.
+### Local web architecture
 
-Antigravity performs two plan/sandbox tasks:
+The UI uses FastAPI, server-rendered Jinja2 templates, local CSS, and a small
+amount of dependency-free JavaScript. There is no Node server, Electron runtime,
+external CDN, remote font, tracking, or analytics. A background worker calls the
+same `run_pipeline` function as the CLI through reusable progress, approval, and
+cancellation hooks.
 
-1. Extract a public LinkedIn posting when URL mode is selected. The application
-   accepts only HTTPS LinkedIn job URLs and never logs in or interacts with an
-   Apply flow.
-2. Return a schema-constrained tailored-content proposal based on the trusted
-   source and the approved Codex analysis.
+The workflow page polls a small structured status endpoint. It displays concise
+stage messages, never hidden reasoning, raw prompts, environment variables,
+provider transcripts, or credentials. During Codex analysis it reports elapsed time and periodic
+process-liveness heartbeats, distinguishes “still running” from “no process
+detected” during local validation, and never invents an ETA. Cancellation and bounded
+timeouts terminate the full subprocess group. Only one run can be active. A
+cancel request reaches the shared
+subprocess runner, terminates the complete process group, and preserves useful
+run artifacts.
 
-Neither agent renders the résumé or silently edits source files. DOCX mutation,
-PDF export, factual checks, artifact paths, and source-integrity verification are
-local code responsibilities.
+Provider failures use a concise public message. Sanitized, length-limited
+technical details are available in a collapsed disclosure instead of exposing a
+raw prompt or provider response by default.
 
-## Human approval gates
+After the Codex analysis gate, the pipeline writes a hash-only approval record
+binding the source résumé, confirmed job text, requirement catalog, generated
+transport schema, resolved analysis, company, and role. An Antigravity-only
+recovery is offered for authenticated post-approval launch, tailoring-contract,
+response-envelope, bounded `cannot_apply`, and technical failures when that
+record and every bound artifact still match. Recovery creates a new isolated
+run, skips LinkedIn and Codex, and pauses at the normal validated-content-diff
+approval gate. When a preserved response itself is one complete schema-valid
+result, a separate authenticated offline reprocessing path skips all providers;
+it is never offered for prose, fragments, or ambiguous output.
 
-The interactive pipeline pauses at three consequential boundaries:
+The dashboard includes the protected bundled master or a validated DOCX upload;
+LinkedIn URL, pasted-text, and text-file inputs; a ten-stage live workflow; three
+approval gates; run history; validated downloads; final QA and factual-integrity
+results; and an in-browser PDF preview.
 
-1. **Posting confirmation** — confirm the company, title, location, and extracted
-   posting before it reaches Codex. A pasted-description fallback is available.
-2. **Analysis approval** — review supported edits, immutable facts, forbidden
-   claims, and unanswered questions.
-3. **Content-diff approval** — inspect the exact proposed changes after local
-   evidence validation and before document rendering.
+### Synthetic UI preview
 
-The CLI includes `--yes` for controlled automation, but schema, evidence,
-formatting, source-hash, and final-QA checks remain enforced.
+All screenshots below were rendered from stubbed synthetic states. They contain
+no real résumé, posting, run history, provider transcript, or personal data.
 
-![Analysis approval state](docs/screenshots/analysis-approval-desktop.png)
+![Synthetic desktop dashboard](docs/screenshots/synthetic-dashboard-desktop.png)
 
-## Security model
+![Synthetic completed-run view](docs/screenshots/synthetic-success-desktop.png)
 
-- The UI host is fixed to `127.0.0.1`; there is no remote-binding option.
-- A random launch token protects the localhost session and CSRF-sensitive forms.
-- Session cookies are `HttpOnly` and `SameSite=Strict`.
-- HTML and XML templates auto-escape model and webpage content.
-- Content Security Policy allows only same-origin scripts, styles, images, forms,
-  and PDF framing.
-- Responses disable caching, MIME sniffing, external referrers, and cross-origin
-  framing.
-- Uploaded files and forms have byte, field, and expansion limits.
-- DOCX uploads must be valid ZIP packages with expected Word parts.
-- Artifact downloads enforce filename and directory boundaries.
-- External commands use argument arrays rather than a shell.
-- Codex runs are ephemeral and read-only; Antigravity runs in plan/sandbox mode.
-- Job descriptions are wrapped in unique untrusted-data delimiters with explicit
-  prompt-injection instructions.
-- The source résumé is hashed before and after every run and is never overwritten.
-- Internal work directories are removed unless explicitly retained for debugging.
+## Dependencies
 
-Résumé and posting content are sent through the user’s authenticated Codex and
-Antigravity CLI sessions. They are not confined to the local machine merely
-because the web interface binds to localhost. Review the data practices of those
-services before processing sensitive material.
+The installer does **not** install dependencies. Check and install them yourself:
 
-## Structured output and local validation
-
-Canonical schemas live in [`schemas/`](schemas/). Codex-compatible transport
-schemas are derived and audited locally so provider restrictions do not weaken
-the canonical contract.
-
-Model responses are parsed, normalized where explicitly allowed, and validated
-with `jsonschema`. Independent local checks then enforce:
-
-- evidence for recommended and rewritten claims;
-- immutable employment, education, date, metric, and certification facts;
-- allowed technology vocabulary;
-- section and bullet-count structure;
-- per-paragraph content budgets;
-- exact source-document hash preservation;
-- DOCX package and relationship preservation;
-- one-page PDF output, expected text, and visible bounding boxes.
-
-Model success is therefore necessary but not sufficient for a completed run.
-
-## Synthetic fixture
-
-The repository contains only
-[`template/sample_resume.docx`](template/sample_resume.docx), a clearly
-synthetic document generated from scratch by
-[`tools/build_synthetic_resume.py`](tools/build_synthetic_resume.py). Its names,
-organizations, links, dates, credentials, and achievements are fictional.
-
-Real résumés and generated DOCX/PDF files are ignored by Git. Keep private inputs
-outside the checkout and supply them at runtime.
-
-## Requirements
-
-- Linux
 - Python 3.11 or newer
+- `python-docx`
+- `jsonschema`
+- `fastapi`, `uvicorn`, `jinja2`, and `python-multipart` for the local UI
+- OpenAI Codex CLI
+- Google Antigravity CLI (`agy`)
 - LibreOffice
-- Poppler tools: `pdfinfo`, `pdftotext`, and `pdftoppm`
-- Authenticated `codex` CLI
-- Authenticated Antigravity CLI exposed as `agy`
-- Google Chrome or Chromium for the app-window experience
-- Optional clipboard utility: `wl-paste`, `xclip`, or `xsel`
+- Poppler (`pdfinfo`, `pdftotext`, and `pdftoppm`)
+- `wl-paste`, `xclip`, or `xsel` only when using `--clipboard`
 
-## Installation
+HTTPX is a test-only dependency for the stubbed UI suite.
 
-Create the repository-local environment and install the package:
+On EndeavourOS/Arch, an appropriate system dependency command is:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e '.[dev]'
+sudo pacman -S --needed python uv libreoffice-fresh poppler wl-clipboard
 ```
 
-Verify the required external tools:
+`xclip` or `xsel` may replace `wl-clipboard`. Development tools are optional:
+
+```bash
+sudo pacman -S --needed shellcheck
+```
+
+Install Codex CLI and Antigravity CLI through their official distribution
+channels. This project never runs `sudo`, package managers, or global installers.
+
+### Authentication prerequisites
+
+Before the first real pipeline run, authenticate Codex and Antigravity using
+their normal vendor login flows. Verify the exact executables used by your shell:
 
 ```bash
 codex --version
+codex exec --help
 agy --version
-libreoffice --version
-pdfinfo -v
-pdftotext -v
-pdftoppm -v
+agy --help
 ```
 
-The optional managed installer copies the application into
-`~/.local/share/resume-tailor`, installs launchers under `~/.local/bin`, and
-reuses the repository `.venv` through a symlink:
+`resume-tailor` does not read, copy, print, or store credentials. Authentication
+must already be available to each CLI in headless mode.
+
+URL mode additionally requires Antigravity permission for
+`read_url(linkedin.com)`. Grant only passive URL-read permission. The workflow
+does not require `execute_url`, interactive browser control, form submission, or
+LinkedIn-account access. A denied or soft-denied permission is handled as
+`permission_denied`, even when the Antigravity process exits successfully.
+
+## Local installation
+
+The public repository contains only the synthetic
+`template/sample_resume.docx`. It never publishes a real master résumé. Before
+installation, place your own compatible file at the ignored path
+`template/master_resume.docx`; see [template/README.md](template/README.md).
+
+Then, from the repository:
+
+```bash
+./install.sh
+```
+
+This copies the application to `~/.local/share/resume-tailor` and installs both
+launchers:
+
+```text
+~/.local/bin/tailor-resume
+~/.local/bin/tailor-resume-ui
+```
+
+It refuses an existing installation. `./install.sh --force` replaces one only
+after moving the old application and launchers to timestamped backups.
+
+The installer does not modify `.bashrc` or any other shell file. If
+`~/.local/bin` is not in `PATH`, it prints a notice.
+
+When the repository already contains a working `.venv`, the installed
+application reuses it through
+`~/.local/share/resume-tailor/.venv`. This is a symbolic link; dependencies
+remain physically inside the repository and are not reinstalled globally. Keep
+the checkout in place while using that linked environment.
+
+To explicitly add a KDE/Linux application-menu entry and a clickable desktop
+icon:
 
 ```bash
 ./install.sh --desktop
 ```
 
-Use `--force` for an upgrade. Existing managed files are moved to timestamped
-backups before replacement. Unrelated desktop files are never overwritten.
+This opt-in action creates
+`~/.local/share/applications/resume-tailor.desktop` and an executable
+`Resume Tailor.desktop` shortcut in the directory returned by
+`xdg-user-dir DESKTOP`. A validated `~/Desktop` is used if that utility is
+missing or returns an unsafe path. Both entries reuse the bundled Resume Tailor
+icon. The installer refuses to overwrite an unrelated desktop file, even with
+`--force`, and does not change KDE settings, MIME associations, or browser
+preferences. Use `./install.sh --force --desktop` when replacing a managed
+installation and its entries.
 
-The installer does not install dependencies or modify shell or desktop
-configuration.
-
-## Launching the interface
-
-From the checkout:
+If the source checkout has no `.venv`, create an isolated dependency
+environment manually after installation:
 
 ```bash
-./tailor-resume-ui
+uv venv "$HOME/.local/share/resume-tailor/.venv"
+uv pip install \
+  --python "$HOME/.local/share/resume-tailor/.venv/bin/python" \
+  -e "$HOME/.local/share/resume-tailor"
 ```
 
-After managed installation:
+The installed launcher automatically prefers that environment. No dependency is
+installed by `install.sh` itself.
+
+To uninstall, run:
+
+```bash
+"$HOME/.local/share/resume-tailor/uninstall.sh"
+```
+
+The uninstaller lists every existing application, CLI launcher, UI launcher, and
+optional desktop-entry target and requires typing `remove`.
+Generated resumes and timestamped installation backups are not deleted.
+
+## Usage
+
+### Local web UI
+
+Launch the server and open a dedicated Google Chrome application window:
 
 ```bash
 tailor-resume-ui
 ```
 
-The launcher reserves the localhost port before startup and detects an existing
-healthy instance, so repeated launches open the singleton dashboard instead of
-starting competing servers.
-
-Useful options:
+The default address is `http://127.0.0.1:8765/`. The bind host is intentionally
+fixed to `127.0.0.1`; no `--host` option is provided. Choose another local port
+or artifact directory when needed:
 
 ```bash
-tailor-resume-ui --no-browser
-tailor-resume-ui --port 8877
-tailor-resume-ui --output-dir /absolute/private/output/path
+tailor-resume-ui \
+  --port 8876 \
+  --output-dir "$HOME/Documents/Resumes/Tailored"
 ```
 
-The health endpoint is available at `http://127.0.0.1:8765/health`.
+Use `tailor-resume-ui --no-browser` when you want to open the address manually.
+Press `Ctrl+C` in the launching terminal to cancel active work safely and stop
+the server.
 
-## CLI usage
+Browser selection checks `google-chrome-stable`, `google-chrome`, and `chromium`
+in that order. Each is started with an argument array and receives the complete
+localhost session URL. If none is available—or launching it fails—the UI prints
+an actionable notice and safely uses the existing system-default browser. It
+never changes browser defaults or MIME associations.
 
-Use a private résumé outside the repository:
+Only one Resume Tailor server can own a configured port. Reopening the desktop
+icon probes the localhost health endpoint and opens the already-running
+dashboard instead of starting a conflicting process. A simultaneous-launch
+race is handled by reserving the listening socket before application startup.
+
+The bundled master is selected by default. LinkedIn URL mode derives company
+and role after extraction. Pasted-text and job-file modes ask for those labels.
+A compatible DOCX can be uploaded instead; uploads are limited to 5 MiB,
+inspected as DOCX archives, and checked against the safe template structure
+before the run starts.
+
+### Terminal CLI
+
+Clipboard mode:
 
 ```bash
 tailor-resume \
-  --resume /absolute/private/resume.docx \
-  --job-file /absolute/private/job-description.txt \
-  --company "Example Company" \
-  --role "AI Engineer"
+  --resume "/absolute/path/master_resume.docx" \
+  --clipboard \
+  --company "RG Talent" \
+  --role "Agentic AI Developer"
 ```
 
-Other input modes:
+Job-file mode:
 
 ```bash
-tailor-resume --resume /private/resume.docx --clipboard \
-  --company "Example Company" --role "AI Engineer"
-
-tailor-resume --resume /private/resume.docx \
-  --job-url "https://www.linkedin.com/jobs/view/example-role-1234567890/"
+tailor-resume \
+  --resume "/absolute/path/master_resume.docx" \
+  --job-file "/absolute/path/job-description.txt" \
+  --company "RG Talent" \
+  --role "Agentic AI Developer" \
+  --output-dir "$HOME/Documents/Resumes/Tailored"
 ```
 
-The URL shown above is a non-functional documentation placeholder.
-
-## Testing
-
-The suite uses stubbed model CLIs and the synthetic DOCX fixture. It must not
-require network access or a real résumé.
+LinkedIn URL mode derives the company and title from the fetched posting, so
+`--company` and `--role` must be omitted:
 
 ```bash
-.venv/bin/python -m pytest
+tailor-resume \
+  --resume "/absolute/path/master_resume.docx" \
+  --job-url "https://www.linkedin.com/jobs/view/example-ai-role-1234567890/" \
+  --output-dir "$HOME/Documents/Resumes/Tailored"
 ```
 
-Additional release checks:
+Only public `https://linkedin.com/jobs/view/...` and
+`https://www.linkedin.com/jobs/view/...` URLs are accepted initially. Tracking
+parameters are permitted when valid. Embedded credentials, other schemes,
+unrelated hosts, non-job paths, conflicting IDs, and suspicious redirects are
+rejected.
+
+For a source checkout with its local environment:
 
 ```bash
-.venv/bin/python -m compileall -q resume_tailor tests tools
-bash -n install.sh uninstall.sh tailor-resume tailor-resume-ui
-node --check resume_tailor/static/app.js
-jq empty schemas/*.json
-git diff --check
+./tailor-resume \
+  --resume "$(pwd)/template/master_resume.docx" \
+  --job-file "$(pwd)/job-description.txt" \
+  --company "RG Talent" \
+  --role "Agentic AI Developer"
 ```
 
-The document-rendering tests require LibreOffice and Poppler.
+Complete interface:
 
-## Interface
+```text
+tailor-resume --resume PATH
+              ((--clipboard | --job-file PATH) --company NAME --role NAME
+               | --job-url HTTPS_LINKEDIN_JOB_URL)
+              [--output-dir PATH]
+              [--yes]
+              [--keep-workdir]
+              [--timeout DURATION]
+```
 
-The responsive UI covers posting confirmation, active analysis, analysis
-approval, content-diff approval, failure handling, successful artifacts, and an
-inline PDF preview.
+Durations accept positive seconds, minutes, or hours such as `90s`, `15m`, and
+`1h`; the maximum is 24 hours. The default is `15m`.
 
-![Successful synthetic run](docs/screenshots/success-desktop.png)
+`--yes` skips interactive approval input. In URL mode the posting confirmation
+screen is still displayed and recorded as approved by `--yes`. The flag does
+**not** bypass URL/status/redirect validation, schema validation, unanswered
+factual questions, immutable-field checks, evidence checks, template validation,
+one-page checks, source integrity, or final QA.
 
-<img
-  src="docs/screenshots/dashboard-mobile.png"
-  width="390"
-  alt="Resume Tailor dashboard at a mobile viewport">
+`--keep-workdir` retains the run's internal `work/` directory, including the
+isolated LibreOffice profile and raw structured final-QA result. Normal output
+does not retain it.
 
-The interface uses local CSS and SVG only—no CDN, remote font, tracker, analytics
-script, or externally loaded decorative asset.
+The web UI intentionally has no `--yes` equivalent. Every browser approval gate
+requires an explicit button click; the terminal CLI retains its existing
+`--yes` behavior.
 
-See [`docs/design.md`](docs/design.md) for design tokens and the bounded
-Codex–Antigravity visual-review process.
+## Human approval stages
 
-## Limitations
+Without `--yes`, file and clipboard modes require typing the exact word
+`approve` twice:
 
-- The current renderer intentionally targets one strict résumé structure rather
-  than arbitrary DOCX layouts.
-- Public LinkedIn extraction can fail when a page requires authentication,
-  changes markup, blocks access, or is no longer available.
-- Model recommendations remain probabilistic and require informed human review.
-- Local validation prevents many unsupported edits but cannot guarantee hiring
-  outcomes, ATS ranking, or semantic perfection.
-- LibreOffice and font differences can affect pagination across systems.
-- The localhost UI is a single-user desktop tool, not a hardened multi-tenant
-  web service.
-- Windows and macOS installation workflows are not provided.
+1. after reading the Codex resume-to-job analysis;
+2. after reading the local section-by-section content diff.
 
-## Development disclosure
+URL mode adds an earlier gate—before any resume extraction or Codex analysis.
+The screen shows company, job title, location, requested URL, final URL,
+description preview, and extraction warnings. Confirm it with `approve`; any
+other response stops before a tailored DOCX or PDF can be generated.
 
-This project was designed and directed through AI-assisted development and
-prompt engineering. Codex contributed implementation, testing, security review,
-and documentation; Antigravity contributed bounded visual critique and serves a
-separate constrained role in the runtime pipeline. Human direction defined the
-requirements, safety boundaries, approval gates, review criteria, and release
-decisions.
+In the UI, the LinkedIn gate also offers **Use pasted description instead**.
+That action replaces the extracted description only with text you explicitly
+paste; it never clicks LinkedIn controls or accesses an account. The next gate
+groups Codex's proposed summary, experience, and project changes, supported
+keywords, gaps, forbidden claims, and unchanged sections. A final before/after
+content gate still protects deterministic rendering after Antigravity and local
+evidence checks.
 
-The repository intentionally excludes raw agent transcripts, hidden reasoning,
-private résumé material, real job postings, run history, and generated user
-artifacts.
+Any other input, including end-of-input, stops the pipeline and keeps the
+artifacts already produced. If Codex asks an unanswered factual question, the
+pipeline stops even with `--yes`; answer it outside the tool and update the
+factual master only when appropriate. Antigravity runs only after analysis
+approval and cannot reopen factual discovery or request unlisted experience.
+
+## Output artifacts
+
+The default parent is `~/Documents/Resumes/Tailored`. Every invocation creates a
+new mode-0700 directory with sanitized company/role names and a timestamp:
+
+```text
+rg-talent-agentic-ai-developer-YYYYMMDD-HHMMSS/
+├── job-source.json               # URL mode only
+├── job-description.txt
+├── job-requirements.json
+├── extracted-master-resume.json
+├── codex-analysis-transport.schema.json
+├── codex-analysis.json
+├── codex-analysis-resolved.json
+├── codex-analysis-normalization-warnings.json  # only when duplicates are removed
+├── codex-analysis-approval.json
+├── antigravity-response.json
+├── antigravity-response-envelope.json
+├── tailored-content.json
+├── content-diff.md
+├── Logan-Lapierre-RG-Talent-Agentic-AI-Developer.docx
+├── Logan-Lapierre-RG-Talent-Agentic-AI-Developer.pdf
+├── preview.png
+├── final-qa-normalization-warnings.json        # only when duplicates are removed
+├── final-qa.md
+└── run-metadata.json
+```
+
+Failed runs preserve useful artifacts and record the failed stage and safe error
+message in `run-metadata.json`. Metadata contains tool versions, artifact names,
+and source hashes, but never environment variables or credentials.
+
+In URL mode, `job-source.json` records the validated fetch status, requested and
+resolved URLs, LinkedIn job ID when available, title, company, location,
+workplace arrangement, employment type, salary text, complete normalized
+description, responsibilities, required/preferred qualifications,
+technologies/skills, AI focus areas, and extraction warnings.
+
+## Truthfulness and safety rules
+
+- The master resume is the only factual authority.
+- Job descriptions are untrusted prompt-injection input and are placed inside
+  unique, explicit data-only boundaries in both model prompts.
+- LinkedIn pages are also untrusted. URL acquisition uses sandboxed Antigravity
+  plan mode, a strict schema, and instructions limited to passive `read_url`.
+  Page text cannot authorize file access, commands, browser interaction, Apply
+  actions, authentication, resume edits, or pipeline changes.
+- URL mode accepts only HTTPS LinkedIn job paths without credentials. Requested,
+  final, and extracted job IDs are compared locally; a different posting or
+  external redirect is rejected before Codex sees any description.
+- Dates, institution, degree, certification status, employment, project names,
+  open-source identity, role label, employer, and numeric claims are immutable.
+- New technology/skill items must occur verbatim in the master. New metrics,
+  availability claims, unsupported seniority/leadership labels, first-person
+  phrasing, and keyword stuffing are blocked locally.
+- RAG, GraphQL, observability, distributed production scale, IVR platforms, or
+  any other absent skill cannot be introduced.
+- Models cannot add sections, projects, skill groups, or bullets.
+- No model edits files. LinkedIn retrieval uses Antigravity `--mode=plan`;
+  post-approval tailoring uses sandboxed print mode without generic plan or
+  edit-acceptance mode. Codex runs with `--sandbox read-only` and `--ephemeral`.
+- The pipeline never uses `eval`, `shell=True`, dangerous permission bypasses,
+  recursive agent calls, destructive Git commands, or source-file overwrite.
+- It does not send email, post to LinkedIn, submit applications, or upload output.
+- It never shrinks fonts below 9 points, reduces margins, removes contact data, or
+  hides overflow to force one page.
+
+Local heuristics are intentionally conservative. They may reject a supported
+rewrite that moves technology wording between sections; inspect the diff and
+adjust the structured request or master rather than bypassing the check.
+
+## Privacy disclosure
+
+When a real pipeline runs, resume content and the job description are sent
+through the authenticated Codex and Antigravity services. In URL mode,
+Antigravity also receives and passively reads the supplied public LinkedIn URL.
+The final PNG is sent to Codex for visual QA. Review those services' data
+controls before use.
+
+Generated artifacts otherwise remain on the local filesystem unless you
+explicitly upload or share them. No keys or environment variables are logged.
+Antigravity 1.1.8 print mode accepts stdin prompts. Resume Tailor keeps
+Antigravity argv limited to flags and short schema paths and sends prompt bytes
+through UTF-8 stdin, so résumé/job/prompt content is absent from process command
+lines. Malformed provider output diagnostics retain only byte counts and hashes,
+not raw stdout or stderr.
+
+For valid JSON responses, run metadata records only the Antigravity CLI version,
+execution/output mode, response-envelope type, tailoring-schema hash,
+response-artifact hash, and validation result. Provider prose remains escaped,
+bounded, collapsed, and omitted from exceptions.
+
+### Localhost security model
+
+- The server binds only to `127.0.0.1` and exposes no remote-bind option.
+- Every launch generates a fresh random session/CSRF token stored in a
+  `SameSite=Strict`, HTTP-only cookie; every state-changing form also carries the
+  token.
+- Responses set a restrictive Content Security Policy, deny framing, disable
+  MIME sniffing, and send no referrer.
+- Jinja auto-escaping and DOM `textContent` render webpage, model, and user text
+  as text, never trusted HTML.
+- Uploaded résumés must be structurally valid DOCX files; job uploads must be
+  UTF-8 `.txt`; request and expanded-archive sizes are bounded.
+- Download routes resolve only known direct files inside validated run-artifact
+  directories. Symlinks, traversal, and arbitrary paths are rejected.
+- The UI provides no filesystem browser, LinkedIn login automation, Apply
+  interaction, permission bypass, or application submission.
+
+Localhost is not a multi-user authorization boundary. Run the server only from a
+trusted local account, stop it when finished, and do not place a reverse proxy
+or public tunnel in front of it.
+
+## PDF and layout acceptance
+
+LibreOffice runs headlessly with a unique writable user profile and controlled
+temporary directory. The pipeline then requires:
+
+- exactly one US Letter PDF page;
+- extractable text containing the name, all contact-link labels, and all section
+  headings;
+- no replacement glyphs;
+- every Poppler text bounding box inside the page;
+- no detected overlapping text lines;
+- a nonempty PNG preview;
+- unchanged DOCX geometry, run/paragraph formatting, list structure, contact
+  information, and all six hyperlink targets.
+
+The final Codex review inspects clipping, overflow, readability, grammar,
+truthfulness, duplication, ATS alignment, and keyword density. It is read-only
+and never repairs the document. A material finding yields a nonzero exit while
+preserving DOCX, PDF, preview, diff, and QA report.
+
+## Troubleshooting
+
+### Codex reports `invalid_json_schema`
+
+Resume Tailor preflights the checked-in compatibility schemas and each generated
+source-bound analysis schema locally before launching Codex. If a bundled schema
+drifts or a generated schema is invalid, too large, or inconsistent with its
+source catalog, the run stops with `Codex could not start because its output
+schema was incompatible.` No model request is made. Expand **Sanitized technical
+details** in the UI or inspect the CLI error, fix the schema/derivation, and run
+the stubbed schema tests before retrying. Do not remove canonical
+factual-integrity constraints merely to make a provider transport schema pass.
+
+### Antigravity command-line-size launch failure
+
+Older runs placed the complete tailoring prompt in one Antigravity command-line
+argument. Linux can reject a single argument with `E2BIG` even when the system's
+aggregate `ARG_MAX` is larger. Current code uses Antigravity 1.1.8's documented
+stdin print-mode path and keeps argv prompt-free.
+
+The UI identifies this failure without displaying prompt content. **Retry
+Antigravity tailoring** appears only when a persisted Codex approval record and
+all approved input hashes can be verified. Eligible recovery creates a new run,
+does not retrieve the posting or invoke Codex, and pauses at the content-diff
+approval gate. Historical runs without the approval record require a new run;
+the application never infers approval merely because a later stage was reached.
+
+### No clipboard backend
+
+Install one clipboard tool, or use a text file:
+
+```bash
+tailor-resume ... --job-file "/path/to/job.txt"
+```
+
+Backend order is `wl-paste`, then `xclip -selection clipboard -o`, then
+`xsel --clipboard --output`. An empty clipboard is rejected.
+
+The web UI uses pasted clipboard text instead of invoking a system clipboard
+binary. Click **Paste from clipboard** when the browser grants permission, or
+focus the field and use `Ctrl+V`.
+
+### LinkedIn login wall
+
+URL mode never automates login or accesses your LinkedIn account. If extraction
+returns `login_required`, copy the complete posting text yourself and rerun with:
+
+```bash
+tailor-resume ... --job-file "/path/to/job.txt" --company "Company" --role "Role"
+```
+
+Clipboard mode is an equivalent fallback.
+
+In the web UI, return to the dashboard and select **Clipboard text** or **Text
+file**. The failed URL run remains visible with its safe diagnostic artifacts.
+
+### Expired or unavailable LinkedIn posting
+
+`expired`, `unavailable`, and `insufficient_content` stop before Codex analysis.
+Find an active posting or provide a complete saved description through
+`--job-file` or `--clipboard`. Search-card snippets are intentionally rejected.
+
+### Incorrect or suspicious LinkedIn redirect
+
+The requested URL, resolved URL, page job ID, scheme, and hostname are checked
+locally. Same-job LinkedIn canonicalization is accepted when the stable job ID
+matches. A different job ID, unrelated domain, missing verifiable identity, or
+embedded credentials stops the run. Confirm the URL in a trusted browser and
+use a copied job description if LinkedIn routing remains ambiguous.
+
+### Antigravity URL permission denied
+
+Allow Antigravity the narrow `read_url(linkedin.com)` permission. Do not enable
+`execute_url` or a dangerous permission bypass. A process that exits zero but
+reports `permission_denied` still fails closed.
+
+### Antigravity returns a planning or `WAITING` response
+
+Post-approval tailoring has no factual-discovery state. A legacy `WAITING`,
+generic readiness statement, or request for another task is classified as a
+tailoring-contract failure; provider prose is omitted from the public error.
+The UI never asks for missing experience or suggests changing the confirmed
+posting. **Retry Antigravity tailoring** is available only when the source
+résumé, confirmed job, requirement catalog, transport schema, resolved analysis,
+and explicit approval record still match their authenticated hashes. Otherwise,
+start a new run.
+
+### Antigravity returns an unsupported JSON response envelope
+
+Tailoring accepts only one complete documented structured-output candidate. A
+direct-root result, a supported JSON-wrapper field, or one typed terminal
+`stream-json` result is decoded once and validated strictly. Resume Tailor never
+extracts braces from prose, removes Markdown fences, joins fragments, or chooses
+among multiple candidates.
+
+The UI classifies this as **Antigravity returned JSON in an unsupported response
+format.** If the preserved bytes already contain one valid complete result and
+every source, requirement, schema, approval, response, and ancestry hash
+authenticates, **Reprocess preserved Antigravity response** creates a new
+provider-free run and pauses at the content-diff gate. Otherwise, offline salvage
+is unavailable; authenticated **Retry Antigravity tailoring** remains available
+without rerunning LinkedIn or Codex.
+
+### The UI does not open
+
+Run `tailor-resume-ui --no-browser`, read the printed localhost address, and
+open it manually. Confirm the chosen port is unused. The default health endpoint
+is `http://127.0.0.1:8765/health`. If the browser reports a stale session after a
+restart, reload the dashboard so the per-launch cookie is replaced.
+
+If Chrome is not found, install one of `google-chrome-stable`, `google-chrome`,
+or `chromium`, or continue with the safely reported system-browser fallback.
+Closing the Chrome window does not start another server; clicking the Resume
+Tailor icon again reconnects to the existing localhost instance.
+
+### A UI run appears busy
+
+Only one active run is supported. Finish the current approval gate or use
+**Cancel run**. The background worker stops its active subprocess group and
+retains useful diagnostics. Starting a second run while one is active returns a
+clear conflict instead of spawning concurrent model work.
+
+### The PDF is two pages
+
+The DOCX and PDF are preserved. Shorten the approved tailored wording within the
+reported content budgets, then rerun. The pipeline will not shrink body text,
+collapse margins, or hide overflow.
+
+### Template drift
+
+Use the inspected master at `template/master_resume.docx`, or intentionally
+update the semantic mapper and tests for a new design. The renderer never falls
+back to blind paragraph indexes.
+
+### LibreOffice fails headlessly
+
+Close stale LibreOffice processes, confirm `libreoffice --version`, ensure the
+output filesystem is writable, and retry. Each run already uses its own profile,
+which avoids normal profile-lock conflicts.
+
+### A local evidence check blocks a rewrite
+
+Read `content-diff.md`. The check never silently changes content. Add real
+evidence to the master only when true, or use wording made solely from existing
+facts and technologies.
+
+## Version compatibility
+
+Development and inspection verified these local interfaces:
+
+- Codex CLI `0.146.0`: `codex exec`, stdin prompt (`-`), `--cd`,
+  `--sandbox read-only`, `--ephemeral`, `--skip-git-repo-check`,
+  `--output-schema`, `--output-last-message`, and `--image`.
+- Antigravity CLI `1.1.8`: `--prompt` print mode with UTF-8 stdin, optional
+  `--mode=plan` for passive LinkedIn retrieval, `--sandbox`,
+  `--output-format json`, typed `stream-json` terminal results,
+  `--json-schema`, and `--print-timeout`.
+- LibreOffice `26.2.4.2`.
+- Poppler `26.07.0`.
+- FastAPI `0.119.1`, Starlette `0.48.0`, Uvicorn `0.52.0`, Jinja2 `3.1.6`,
+  python-multipart `0.0.32`, and HTTPX `0.28.1`.
+
+Antigravity 1.1.8 does not expose a `--cwd` option, so this project sets the
+subprocess working directory directly. At startup it records detected versions.
+If a newer CLI removes a verified flag or changes its JSON wrapper, the adapter
+fails closed with an actionable error; re-run the four help/version commands and
+update the corresponding adapter and tests.
+
+## Development and tests
+
+Create the environment yourself; no script does this automatically:
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python -e ".[dev]"
+```
+
+Run the required checks:
+
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall resume_tailor
+bash -n tailor-resume tailor-resume-ui install.sh uninstall.sh
+shellcheck tailor-resume tailor-resume-ui install.sh uninstall.sh
+```
+
+The current suite contains **195 synthetic/offline tests**. Tests prepend
+`tests/stubs` to `PATH` for Codex and Antigravity. They never make
+real model or network calls. URL tests simulate successful and redirected
+postings, multiple companies and AI titles, mismatches, login walls, expiry,
+missing content, permission denial, malformed output, unsafe URLs, webpage
+prompt injection, rejection, and confirmed continuation. Integration tests
+exercise `python-docx`, LibreOffice, and Poppler against the fixture copy,
+validate one-page output, and confirm the master hash is unchanged.
+
+UI tests use a stub pipeline and HTTPX ASGI transport. They cover
+startup/health, localhost configuration, all form modes, approval and rejection,
+completed and failed runs, permission denial, cancellation, double submission,
+uploads, HTML injection, CSRF/session rejection, path traversal, and artifact
+downloads. A separate harmless sleep-process test verifies shared subprocess
+cancellation. No test invokes a real model or network fetch.
+
+## Limitations and development disclosure
+
+Resume Tailor is a personal, local-first portfolio project rather than a hosted
+multi-user service. Its deterministic template mapper intentionally supports one
+inspected DOCX structure; significant template drift fails closed. Provider CLI
+formats and authentication behavior can change, model output can still be
+incorrect, LinkedIn may block passive retrieval, local schema validation cannot
+prove semantic equivalence, and human review remains mandatory. This tool does
+not submit applications or replace factual résumé maintenance.
+
+The project was designed and directed through AI-assisted development and prompt
+engineering. Codex served as implementation owner; Antigravity was used as a
+read-only visual designer/critic during the bounded UI redesign. Subsequent
+contract fixes were diagnosed, implemented, and tested locally with synthetic
+fixtures and stubbed providers. The human owner specified the architecture,
+safety boundaries, approval gates, publication scope, and acceptance criteria.
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
-
-Copyright (c) 2026 Logan Lapierre.
+MIT. See [LICENSE](LICENSE).

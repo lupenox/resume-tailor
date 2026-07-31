@@ -7,15 +7,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
+from .antigravity_transport import (
+    antigravity_process_failure,
+    run_antigravity_prompt,
+)
 from .schemas import parse_json_text, schema_path, validate_payload
 from .utilities import (
     InputError,
     ModelError,
     atomic_write_json,
     atomic_write_text,
-    concise_process_error,
     require_executable,
-    run_command,
 )
 
 
@@ -406,24 +408,16 @@ def invoke_linkedin_job_extraction(
     agy = executable or require_executable("agy")
     artifact_path = run_directory / "job-source.json"
     prompt = build_linkedin_extraction_prompt(requested_url.normalized)
-    args = [
-        agy,
-        "--prompt",
-        prompt,
-        "--mode=plan",
-        "--sandbox",
-        "--output-format",
-        "json",
-        "--json-schema",
-        str(schema_path("linkedin_job.schema.json")),
-        "--print-timeout",
-        antigravity_duration,
-    ]
     try:
-        result = run_command(
-            args,
+        result = run_antigravity_prompt(
+            executable=agy,
+            prompt=prompt,
+            prompt_label="Antigravity LinkedIn extraction prompt",
+            schema=schema_path("linkedin_job.schema.json"),
+            print_timeout=antigravity_duration,
             cwd=run_directory,
             timeout_seconds=timeout_seconds + 10,
+            agent_mode="plan",
         )
     except ModelError as exc:
         atomic_write_json(
@@ -478,7 +472,10 @@ def invoke_linkedin_job_extraction(
     )
     atomic_write_json(artifact_path, normalized_candidate)
     if result.returncode != 0:
-        raise ModelError(concise_process_error(result, "LinkedIn Antigravity extraction"))
+        raise antigravity_process_failure(
+            result,
+            label="LinkedIn Antigravity extraction",
+        )
     return normalized_candidate
 
 

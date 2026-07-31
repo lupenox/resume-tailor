@@ -6,10 +6,8 @@
   "required": [
     "role_summary",
     "fit_assessment",
-    "matched_requirements",
-    "evidence_map",
-    "supported_ats_keywords",
-    "missing_or_unsupported_requirements",
+    "supported_requirement_mappings",
+    "unsupported_requirement_ids",
     "recommended_edits",
     "immutable_facts",
     "forbidden_claims",
@@ -28,33 +26,26 @@
         "gaps": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
       }
     },
-    "matched_requirements": {
-      "type": "array",
-      "items": {"type": "string", "minLength": 1},
-      "uniqueItems": true
-    },
-    "evidence_map": {
+    "supported_requirement_mappings": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["requirement", "resume_evidence", "strength"],
+        "required": ["requirement_id", "evidence_source_ids", "strength"],
         "properties": {
-          "requirement": {"type": "string", "minLength": 1},
-          "resume_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "requirement_id": {"type": "string", "minLength": 1},
+          "evidence_source_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          },
           "strength": {"type": "string", "enum": ["strong", "partial", "weak"]}
         }
       }
     },
-    "supported_ats_keywords": {
+    "unsupported_requirement_ids": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
-      "uniqueItems": true
-    },
-    "missing_or_unsupported_requirements": {
-      "type": "array",
-      "items": {"type": "string", "minLength": 1},
-      "uniqueItems": true
+      "items": {"type": "string", "minLength": 1}
     },
     "recommended_edits": {
       "type": "array",
@@ -62,18 +53,22 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "resume_section",
-          "existing_claim",
-          "proposed_replacement",
+          "target_source_id",
+          "operation",
+          "proposed_text",
           "alignment_rationale",
-          "exact_supporting_evidence"
+          "evidence_source_ids"
         ],
         "properties": {
-          "resume_section": {"type": "string", "minLength": 1},
-          "existing_claim": {"type": "string", "minLength": 1},
-          "proposed_replacement": {"type": "string", "minLength": 1},
+          "target_source_id": {"type": "string", "minLength": 1},
+          "operation": {"type": "string", "enum": ["replace", "append"]},
+          "proposed_text": {"type": "string", "minLength": 1},
           "alignment_rationale": {"type": "string", "minLength": 1},
-          "exact_supporting_evidence": {"type": "string", "minLength": 1}
+          "evidence_source_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          }
         }
       }
     },
@@ -92,10 +87,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["content_id", "maximum_characters", "guidance"],
+        "required": ["target_source_id", "guidance"],
         "properties": {
-          "content_id": {"type": "string", "minLength": 1},
-          "maximum_characters": {"type": "integer", "minimum": 1},
+          "target_source_id": {"type": "string", "minLength": 1},
           "guidance": {"type": "string", "minLength": 1}
         }
       }

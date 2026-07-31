@@ -22,7 +22,7 @@ def _arguments(
         "--job-file",
         str(job_file),
         "--company",
-        "RG Talent",
+        "Example Talent",
         "--role",
         "Agentic AI Developer",
         "--output-dir",
@@ -67,12 +67,17 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
     run_directories = list(output_dir.iterdir())
     assert len(run_directories) == 1
     run = run_directories[0]
-    basename = "Sample-Candidate-RG-Talent-Agentic-AI-Developer"
+    basename = "Sample-Candidate-Example-Talent-Agentic-AI-Developer"
     expected = {
         "job-description.txt",
+        "job-requirements.json",
         "extracted-master-resume.json",
+        "codex-analysis-transport.schema.json",
         "codex-analysis.json",
+        "codex-analysis-resolved.json",
+        "codex-analysis-approval.json",
         "antigravity-response.json",
+        "antigravity-response-envelope.json",
         "tailored-content.json",
         "content-diff.md",
         f"{basename}.docx",
@@ -85,6 +90,33 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["status"] == "COMPLETE"
     assert metadata["source_resume"]["unchanged"] is True
+    assert metadata["analysis_inputs"]["version"] == 2
+    assert len(metadata["analysis_inputs"]["job_description_sha256"]) == 64
+    assert len(metadata["analysis_inputs"]["extracted_resume_sha256"]) == 64
+    assert len(metadata["analysis_inputs"]["job_requirements_sha256"]) == 64
+    schema_metadata = metadata["codex_analysis_transport_schema"]
+    assert schema_metadata["filename"] == "codex-analysis-transport.schema.json"
+    assert len(schema_metadata["sha256"]) == 64
+    assert schema_metadata["generated_from_source_and_requirement_catalogs"] is True
+    assert schema_metadata["job_requirement_id_count"] > 0
+    assert sha256_file(run / schema_metadata["filename"]) == schema_metadata["sha256"]
+    approval_metadata = metadata["codex_analysis_approval"]
+    assert approval_metadata["filename"] == "codex-analysis-approval.json"
+    assert approval_metadata["decision"] == "approved"
+    assert sha256_file(run / approval_metadata["filename"]) == approval_metadata[
+        "sha256"
+    ]
+    response_metadata = metadata["antigravity_response"]
+    assert response_metadata["execution_mode"] == "print"
+    assert response_metadata["output_format"] == "json"
+    assert response_metadata["response_envelope_type"] == (
+        "json-wrapper-structured_output"
+    )
+    assert response_metadata["validation_result"] == "PASS"
+    assert response_metadata["cli_version"] == "1.1.8-stub"
+    assert sha256_file(run / response_metadata["response"]["filename"]) == (
+        response_metadata["response"]["sha256"]
+    )
     assert "work" not in {path.name for path in run.iterdir()}
     assert sha256_file(master_resume) == before_hash
     used_schemas = [
@@ -92,7 +124,7 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
         for line in schema_log.read_text(encoding="utf-8").splitlines()
     ]
     assert used_schemas == [
-        "codex_analysis.openai.schema.json",
+        "codex-analysis-transport.schema.json",
         "final_qa.openai.schema.json",
     ]
 
@@ -112,9 +144,36 @@ def test_failure_preserves_useful_artifacts(
     assert (run / "job-description.txt").is_file()
     assert (run / "extracted-master-resume.json").is_file()
     assert (run / "codex-analysis.json").is_file()
+    assert (run / "codex-analysis-resolved.json").is_file()
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["status"] == "FAILED"
     assert metadata["source_resume"]["unchanged"] is True
+
+
+def test_unstructured_print_wrapper_is_classified_without_prose_extraction(
+    master_resume: Path,
+    job_file: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUB_AGY_MODE", "unstructured_print_wrapper")
+    output_dir = tmp_path / "output"
+
+    code = main(_arguments(master_resume, job_file, output_dir))
+
+    assert code == ExitCode.MODEL
+    run = next(output_dir.iterdir())
+    metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["failure_class"] == "antigravity-response-envelope"
+    assert metadata["error"]["type"] == "AntigravityResponseEnvelopeError"
+    response_metadata = metadata["antigravity_response"]
+    assert response_metadata["response_envelope_type"] == (
+        "json-wrapper-unstructured-response"
+    )
+    assert response_metadata["validation_result"] == "REJECTED"
+    assert not (run / "tailored-content.json").exists()
+    assert not list(run.glob("*.docx"))
 
 
 def test_human_analysis_refusal_stops_before_antigravity(
@@ -131,6 +190,38 @@ def test_human_analysis_refusal_stops_before_antigravity(
     run = next(output_dir.iterdir())
     assert (run / "codex-analysis.json").is_file()
     assert not (run / "antigravity-response.json").exists()
+    assert not (run / "codex-analysis-approval.json").exists()
+
+
+@pytest.mark.parametrize("failure_mode", ["source_id_failure", "empty_source_ids"])
+def test_source_evidence_failure_precedes_approval_and_antigravity(
+    failure_mode: str,
+    master_resume: Path,
+    job_file: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUB_CODEX_MODE", failure_mode)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _: pytest.fail("approval was requested before source validation"),
+    )
+    output_dir = tmp_path / "source-evidence-output"
+
+    code = main(_arguments(master_resume, job_file, output_dir, yes=False))
+
+    assert code == ExitCode.TRUTHFULNESS
+    run = next(output_dir.iterdir())
+    assert (run / "codex-analysis.json").is_file()
+    assert not (run / "codex-analysis-resolved.json").exists()
+    assert not (run / "codex-analysis-approval.json").exists()
+    assert not (run / "antigravity-response.json").exists()
+    assert not list(run.glob("*.docx"))
+    metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["stage"] == "codex-analysis"
+    assert metadata["failure_class"] == "source-evidence-analysis"
+    assert metadata["error"]["type"] == "SourceEvidenceError"
 
 
 def test_user_rejecting_linkedin_confirmation_stops_before_codex(

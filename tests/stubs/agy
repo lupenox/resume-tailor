@@ -2,31 +2,100 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import subprocess
 import sys
+import time
+from pathlib import Path
 
 
 if "--version" in sys.argv:
     print("1.1.8-stub")
     raise SystemExit(0)
 
+try:
+    prompt_index = sys.argv.index("--prompt")
+except ValueError:
+    print("missing --prompt print-mode flag", file=sys.stderr)
+    raise SystemExit(2)
+if (
+    prompt_index + 1 < len(sys.argv)
+    and not sys.argv[prompt_index + 1].startswith("-")
+):
+    print("prompt content must not be transported in argv", file=sys.stderr)
+    raise SystemExit(30)
+if any(len(argument.encode("utf-8")) > 4096 for argument in sys.argv):
+    print("large prompt-like argv item rejected", file=sys.stderr)
+    raise SystemExit(31)
+
+prompt_bytes = sys.stdin.buffer.read()
+try:
+    prompt = prompt_bytes.decode("utf-8")
+except UnicodeDecodeError:
+    print("stdin prompt was not valid UTF-8", file=sys.stderr)
+    raise SystemExit(32)
+if not prompt:
+    print("missing stdin prompt", file=sys.stderr)
+    raise SystemExit(33)
+
+prompt_hash = hashlib.sha256(prompt_bytes).hexdigest()
+transport_log = os.environ.get("STUB_AGY_TRANSPORT_LOG")
+if transport_log:
+    Path(transport_log).write_text(
+        json.dumps(
+            {
+                "argv_count": len(sys.argv),
+                "argv_total_bytes": sum(
+                    len(argument.encode("utf-8")) + 1 for argument in sys.argv
+                ),
+                "max_argv_item_bytes": max(
+                    len(argument.encode("utf-8")) for argument in sys.argv
+                ),
+                "payload_bytes": len(prompt_bytes),
+                "payload_sha256": prompt_hash,
+                "transport": "stdin",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+expected_bytes = os.environ.get("STUB_AGY_EXPECTED_STDIN_BYTES")
+expected_hash = os.environ.get("STUB_AGY_EXPECTED_STDIN_SHA256")
+if expected_bytes is not None and int(expected_bytes) != len(prompt_bytes):
+    print("stdin prompt length mismatch", file=sys.stderr)
+    raise SystemExit(34)
+if expected_hash is not None and expected_hash != prompt_hash:
+    print("stdin prompt hash mismatch", file=sys.stderr)
+    raise SystemExit(35)
+
+pid_log = os.environ.get("STUB_AGY_PID_LOG")
+if pid_log:
+    Path(pid_log).write_text(f"{os.getpid()}\n", encoding="ascii")
+
 mode = os.environ.get("STUB_AGY_MODE", "ready")
+if mode == "hang":
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    child_pid_log = os.environ.get("STUB_AGY_CHILD_PID_LOG")
+    if child_pid_log:
+        Path(child_pid_log).write_text(f"{child.pid}\n", encoding="ascii")
+    time.sleep(60)
 if mode == "process_error":
     print("stub Antigravity failure", file=sys.stderr)
     raise SystemExit(8)
 if mode == "bad_json":
     print("not-json")
     raise SystemExit(0)
-if mode == "waiting":
+if mode == "wrapper_waiting":
     print(json.dumps({"status": "WAITING", "message": "Stub is waiting."}))
     raise SystemExit(0)
-
-try:
-    prompt = sys.argv[sys.argv.index("--prompt") + 1]
-except (ValueError, IndexError):
-    print("missing --prompt", file=sys.stderr)
-    raise SystemExit(2)
 
 if "LINKEDIN_JOB_EXTRACTION_REQUEST" in prompt:
     if "--mode=plan" not in sys.argv or "--sandbox" not in sys.argv:
@@ -167,6 +236,9 @@ if "LINKEDIN_JOB_EXTRACTION_REQUEST" in prompt:
 
 begin = "BEGIN_TRUSTED_MASTER_RESUME_CONTENT\n"
 end = "\nEND_TRUSTED_MASTER_RESUME_CONTENT"
+if "--mode=plan" in sys.argv:
+    print("tailoring must not run in generic plan mode", file=sys.stderr)
+    raise SystemExit(36)
 try:
     content_text = prompt.split(begin, 1)[1].split(end, 1)[0]
     master_content = json.loads(content_text)
@@ -174,22 +246,84 @@ except (IndexError, json.JSONDecodeError) as exc:
     print(f"could not parse trusted master content: {exc}", file=sys.stderr)
     raise SystemExit(3)
 
-if mode == "error":
+if mode == "unstructured_print_wrapper":
+    print(
+        json.dumps(
+            {
+                "conversation_id": "00000000-0000-4000-8000-000000000000",
+                "duration_seconds": 1.25,
+                "num_turns": 2,
+                "response": (
+                    "Synthetic prose must not be scanned for "
+                    '{"status":"complete"} fragments.'
+                ),
+                "status": "SUCCESS",
+                "usage": {
+                    "cache_read_tokens": 10,
+                    "input_tokens": 20,
+                    "output_tokens": 5,
+                    "thinking_tokens": 2,
+                    "total_tokens": 25,
+                },
+            }
+        )
+    )
+    raise SystemExit(0)
+
+if mode == "waiting":
+    structured = {
+        "status": "WAITING",
+        "message": (
+            "Plan mode activated. Ready after synthetic requirements are provided."
+        ),
+        "questions_for_user": ["What synthetic task would you like to plan?"],
+        "tailored_resume": None,
+    }
+elif mode == "error":
     structured = {
         "status": "ERROR",
-        "message": "Stub could not tailor safely.",
+        "message": "Synthetic legacy technical failure.",
         "questions_for_user": [],
+        "tailored_resume": None,
+    }
+elif mode in {"cannot_apply", "invalid_edit"}:
+    structured = {
+        "status": "cannot_apply",
+        "message": "One synthetic approved edit could not be applied.",
+        "cannot_apply": {
+            "edit_id": "edit.999" if mode == "invalid_edit" else "edit.001",
+            "reason_code": "content_budget_conflict",
+            "reason": "Synthetic content-budget conflict.",
+        },
+        "technical_failure": None,
+        "tailored_resume": None,
+    }
+elif mode == "technical_failure":
+    structured = {
+        "status": "technical_failure",
+        "message": "Synthetic structured-output failure.",
+        "cannot_apply": None,
+        "technical_failure": {
+            "reason_code": "structured_output_failure",
+            "reason": "Synthetic structured-output failure.",
+        },
         "tailored_resume": None,
     }
 else:
     structured = {
-        "status": "READY",
-        "message": "Stubbed content is ready.",
-        "questions_for_user": [],
+        "status": "complete",
+        "message": "Stubbed approved edits are complete.",
+        "cannot_apply": None,
+        "technical_failure": None,
         "tailored_resume": master_content,
     }
 if mode == "string":
     structured_output = json.dumps(structured, ensure_ascii=False)
 else:
     structured_output = structured
-print(json.dumps({"structured_output": structured_output}, ensure_ascii=False))
+wrapper_status = "WAITING" if mode == "wrapper_waiting_complete" else None
+output = {"structured_output": structured_output}
+if wrapper_status is not None:
+    output["status"] = wrapper_status
+    output["message"] = "Incidental synthetic wrapper prose."
+print(json.dumps(output, ensure_ascii=False))

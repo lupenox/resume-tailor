@@ -1,84 +1,60 @@
-# Secrets and local configuration
-.env
-.env.*
-*.pem
-*.key
-*.p12
-*.pfx
-*.jks
-credentials/
-secrets/
-
-# Python environments, packages, and caches
-.venv/
-venv/
-env/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.tox/
-.nox/
 .coverage
-coverage.xml
 htmlcov/
+.venv/
+.env
+.env.*
+.codex/
+.agents/
 build/
 dist/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.backup
 
-# Real résumés and generated office artifacts
+# Local pipeline output if a developer points --output-dir into the repository.
+tailored-output/
+*-20??????-??????/
+uploads/
+runs/
+run-history/
+generated/
+artifacts/
+backups/
+
+# Real résumés and rendered outputs are never publication inputs.
 *.docx
 *.pdf
 !template/sample_resume.docx
-tailored-output/
-output/
-outputs/
-uploads/
-artifacts/
-runs/
-run-history/
-local-data/
-private/
+template/master_resume.docx
 
-# Job postings, analyses, and local run records
-job-description*.txt
-job_description*.txt
-job-posting*.txt
-linkedin-job*.json
-run-*.json
-analysis-output*.json
-final-qa*.json
+# Run-specific private artifacts.
+job-description.txt
+job-source.json
+job-requirements.json
+run-metadata.json
+codex-analysis.json
+codex-analysis-resolved.json
+codex-analysis-approval.json
+codex-analysis-transport.schema.json
+antigravity-response.json
+antigravity-response-envelope.json
+tailored-content.json
+content-diff.md
+preview.png
+final-qa.md
 
-# Logs, lock files, temporary files, and browser profiles
-*.log
-*.trace
-*.tmp
-*.swp
-*.swo
-.~lock.*#
-.ui-staging/
-chrome-profile*/
-playwright-report/
-test-results/
-
-# Installer and managed-installation backups
-*.backup-*
-backups/
-installer-backups/
-managed-installation/
-.resume-tailor.install.*/
-
-# Agent transcripts and private design-review material
-.agents/
-.antigravity/
-.codex/
-agent-transcripts/
-*transcript*
+# Design reviews and their third-party reference material stay local.
 design-references/
 
-# Editor and operating-system files
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
+# Office lock and temporary files.
+.~lock.*#
+*.tmp

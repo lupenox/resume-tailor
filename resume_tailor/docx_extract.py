@@ -30,6 +30,18 @@ SECTION_HEADINGS = (
 )
 EXPECTED_PROJECT_BULLETS = (3, 4, 3)
 
+_EDITABLE_SOURCE_IDS = {
+    "professional_summary",
+    "education.coursework",
+    "education.certifications",
+    "open_source.bullet",
+}
+_EDITABLE_SOURCE_PREFIXES = (
+    "skill_groups.",
+    "projects.",
+    "experience.bullets.",
+)
+
 
 @dataclass(frozen=True)
 class ProjectMap:
@@ -378,7 +390,8 @@ def validate_template(document: DocumentObject) -> TemplateMap:
     if any(not link["relationship_id"] or not link["target"] for link in hyperlinks):
         raise TemplateError("Template drift: a hyperlink relationship is broken.")
     if not any(
-        re.search(r"github\.com/[^/]+/[^/]+/pull/\d+", link["target"])
+        "github.com/" in str(link["target"])
+        and "/pull/" in str(link["target"])
         for link in hyperlinks
     ):
         raise TemplateError("Template drift: the open-source pull-request hyperlink is missing.")
@@ -502,6 +515,57 @@ def _content_ids(mapping: TemplateMap) -> dict[int, str]:
     return result
 
 
+def _is_editable_source_id(source_id: str) -> bool:
+    if source_id in _EDITABLE_SOURCE_IDS:
+        return True
+    if source_id.startswith("projects."):
+        return ".bullets." in source_id
+    return source_id.startswith(_EDITABLE_SOURCE_PREFIXES)
+
+
+def source_blocks_from_paragraphs(
+    paragraphs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the immutable, deterministic source catalog used by model stages."""
+    blocks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    section_context = "Header"
+    for paragraph in paragraphs:
+        source_id = str(paragraph.get("content_id", "")).strip()
+        if not source_id:
+            raise TemplateError("Extracted paragraph is missing its deterministic source ID.")
+        if source_id in seen:
+            raise TemplateError(f"Duplicate extracted source ID: {source_id!r}.")
+        seen.add(source_id)
+        exact_text = paragraph.get("text")
+        if not isinstance(exact_text, str):
+            raise TemplateError(f"Extracted source {source_id!r} has no exact text.")
+
+        if source_id.startswith("section."):
+            section_context = exact_text
+            block_kind = "section_heading"
+        elif source_id.startswith("header."):
+            block_kind = "header"
+        elif paragraph.get("is_list") is True:
+            block_kind = "list_item"
+        else:
+            block_kind = "paragraph"
+
+        context = "Header" if block_kind == "header" else section_context
+        evidence_allowed = block_kind not in {"header", "section_heading"}
+        blocks.append(
+            {
+                "source_id": source_id,
+                "section_context": context,
+                "block_kind": block_kind,
+                "exact_text": exact_text,
+                "evidence_allowed": evidence_allowed,
+                "editable": evidence_allowed and _is_editable_source_id(source_id),
+            }
+        )
+    return blocks
+
+
 def extract_resume(path: Path) -> tuple[dict[str, Any], TemplateMap]:
     try:
         document = Document(str(path))
@@ -558,6 +622,7 @@ def extract_resume(path: Path) -> tuple[dict[str, Any], TemplateMap]:
         "template_map": mapping.to_dict(),
         "content": logical_content(document, mapping),
         "paragraphs": paragraph_records,
+        "source_blocks": source_blocks_from_paragraphs(paragraph_records),
     }
     return extracted, mapping
 

@@ -1,0 +1,107 @@
+{
+  "role_summary": "Synthetic role with deliberately unsupported requirements.",
+  "fit_assessment": {
+    "overall": "The synthetic résumé supports Python but not the listed specialist requirements.",
+    "strengths": [
+      "Python"
+    ],
+    "gaps": [
+      "Seven synthetic requirements are absent from the résumé fixture."
+    ]
+  },
+  "matched_requirements": [
+    "Python"
+  ],
+  "evidence_map": [
+    {
+      "requirement": "Python",
+      "evidence_source_ids": [
+        "skill_groups.0"
+      ],
+      "strength": "strong"
+    },
+    {
+      "requirement": "RAG",
+      "evidence_source_ids": [
+        ""
+      ],
+      "strength": "weak"
+    },
+    {
+      "requirement": "Kubernetes",
+      "evidence_source_ids": [
+        ""
+      ],
+      "strength": "weak"
+    },
+    {
+      "requirement": "GraphQL",
+      "evidence_source_ids": [
+        ""
+      ],
+      "strength": "weak"
+    },
+    {
+      "requirement": "distributed production scale",
+      "evidence_source_ids": [
+        ""
+      ],
+      "strength": "weak"
+    },
+    {
+      "requirement": "IVR platforms",
+      "evidence_source_ids": [
+        ""
+      ],
+      "strength": "weak"
+    },
+    {
+      "requirement": "OpenTelemetry",
+      "evidence_source_ids": [
+        ""
+      ],
+      "strength": "weak"
+    },
+    {
+      "requirement": "vector databases",
+      "evidence_source_ids": [
+        ""
+      ],
+      "strength": "weak"
+    }
+  ],
+  "ats_keywords": [
+    {
+      "keyword": "RAG",
+      "evidence_source_ids": []
+    },
+    {
+      "keyword": "Kubernetes",
+      "evidence_source_ids": []
+    },
+    {
+      "keyword": "GraphQL",
+      "evidence_source_ids": []
+    },
+    {
+      "keyword": "rule-based link scoring",
+      "evidence_source_ids": []
+    }
+  ],
+  "missing_or_unsupported_requirements": [
+    "RAG",
+    "Kubernetes",
+    "GraphQL",
+    "distributed production scale",
+    "IVR platforms",
+    "OpenTelemetry",
+    "vector databases"
+  ],
+  "recommended_edits": [],
+  "immutable_facts": [],
+  "forbidden_claims": [
+    "Do not add any absent specialist requirement."
+  ],
+  "content_budget_guidance": [],
+  "questions_for_user": []
+}

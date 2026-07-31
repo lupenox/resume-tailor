@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the clearly synthetic DOCX fixture shipped with the public project."""
+"""Build a clearly synthetic DOCX fixture for local regression tests."""
 
 from __future__ import annotations
 
@@ -78,44 +78,36 @@ def _section(document: object, title: str) -> None:
     _add_bottom_rule(paragraph)
 
 
-def _plain(document: object, text: str, *, bold: bool = False) -> None:
+def _plain(document: object, text: str) -> None:
     paragraph = document.add_paragraph()
     _compact(paragraph)
-    run = paragraph.add_run(text)
-    _set_run_font(run, bold=bold)
+    _set_run_font(paragraph.add_run(text))
 
 
 def _labelled_bullet(document: object, label: str, text: str) -> None:
     paragraph = document.add_paragraph(style="List Bullet")
     _compact(paragraph)
-    label_run = paragraph.add_run(f"{label}: ")
-    _set_run_font(label_run, bold=True)
-    text_run = paragraph.add_run(text)
-    _set_run_font(text_run)
+    _set_run_font(paragraph.add_run(f"{label}: "), bold=True)
+    _set_run_font(paragraph.add_run(text))
 
 
 def _bullet(document: object, text: str) -> None:
     paragraph = document.add_paragraph(style="List Bullet")
     _compact(paragraph)
-    run = paragraph.add_run(text)
-    _set_run_font(run)
+    _set_run_font(paragraph.add_run(text))
 
 
 def _project_heading(document: object, name: str, technologies: str) -> None:
     paragraph = document.add_paragraph()
     _compact(paragraph)
-    name_run = paragraph.add_run(name)
-    _set_run_font(name_run, bold=True)
-    separator = paragraph.add_run(" | ")
-    _set_run_font(separator)
+    _set_run_font(paragraph.add_run(name), bold=True)
+    _set_run_font(paragraph.add_run(" | "))
     technology_run = paragraph.add_run(technologies)
     _set_run_font(technology_run)
     technology_run.italic = True
 
 
 def _strip_package_extras(output: Path) -> None:
-    """Remove generic thumbnail/custom XML parts not needed by this fixture."""
-
     excluded = {
         "customXml/item1.xml",
         "customXml/_rels/item1.xml.rels",
@@ -132,20 +124,13 @@ def _strip_package_extras(output: Path) -> None:
     try:
         with (
             zipfile.ZipFile(output, "r") as source,
-            zipfile.ZipFile(
-                temporary_path,
-                "w",
-                compression=zipfile.ZIP_DEFLATED,
-            ) as destination,
+            zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as destination,
         ):
             for info in source.infolist():
                 if info.filename in excluded:
                     continue
                 payload = source.read(info.filename)
-                if info.filename in {
-                    "_rels/.rels",
-                    "word/_rels/document.xml.rels",
-                }:
+                if info.filename in {"_rels/.rels", "word/_rels/document.xml.rels"}:
                     root = parse_xml(payload)
                     for relationship in list(root):
                         target = relationship.get("Target", "")
@@ -180,16 +165,15 @@ def build(output: Path) -> None:
 
     properties = document.core_properties
     properties.title = "Synthetic Resume Fixture"
-    properties.subject = "Public test fixture containing no real person or employment data"
-    properties.author = "Resume Tailor contributors"
-    properties.last_modified_by = "Resume Tailor contributors"
+    properties.subject = "Test fixture containing no real person or employment data"
+    properties.author = "Resume Tailor synthetic tests"
+    properties.last_modified_by = "Resume Tailor synthetic tests"
     properties.comments = "All names, organizations, links, and achievements are fictional."
 
     name = document.add_paragraph()
     _compact(name)
     name.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    name_run = name.add_run("SAMPLE CANDIDATE")
-    _set_run_font(name_run, size=14, bold=True)
+    _set_run_font(name.add_run("SAMPLE CANDIDATE"), size=14, bold=True)
 
     contact = document.add_paragraph()
     _compact(contact)
@@ -204,8 +188,7 @@ def build(output: Path) -> None:
     )
     for index, (text, target) in enumerate(links):
         if index:
-            separator = contact.add_run(" | ")
-            _set_run_font(separator)
+            _set_run_font(contact.add_run(" | "))
         _add_hyperlink(contact, text, target)
 
     _section(document, "OBJECTIVE / SUMMARY")
@@ -217,10 +200,8 @@ def build(output: Path) -> None:
     _section(document, "EDUCATION & CERTIFICATIONS")
     education = document.add_paragraph()
     _compact(education)
-    institution = education.add_run("Example Institute")
-    _set_run_font(institution, bold=True)
-    degree = education.add_run(" | Certificate in Software Systems")
-    _set_run_font(degree)
+    _set_run_font(education.add_run("Example Institute"), bold=True)
+    _set_run_font(education.add_run(" | Certificate in Software Systems"))
     _labelled_bullet(document, "Coursework", "Python, testing, and data validation")
     _labelled_bullet(document, "Certifications", "Synthetic credential for fixture testing")
 
@@ -253,10 +234,8 @@ def build(output: Path) -> None:
     _section(document, "EXPERIENCE")
     experience = document.add_paragraph()
     _compact(experience)
-    role = experience.add_run("Synthetic Software Engineer")
-    _set_run_font(role, bold=True)
-    employer = experience.add_run(" | Example Organization, Sample City ")
-    _set_run_font(employer)
+    _set_run_font(experience.add_run("Synthetic Software Engineer"), bold=True)
+    _set_run_font(experience.add_run(" | Example Organization, Sample City "))
     dates = experience.add_run("(2024–Present)")
     _set_run_font(dates)
     dates.italic = True

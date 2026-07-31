@@ -1,0 +1,11 @@
+{
+  "status": "SUCCESS",
+  "structured_output": {
+    "status": "WAITING",
+    "message": "Plan mode activated. Ready after synthetic requirements are provided.",
+    "questions_for_user": [
+      "What synthetic task would you like to plan?"
+    ],
+    "tailored_resume": null
+  }
+}

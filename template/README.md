@@ -1,20 +1,26 @@
-# Synthetic résumé fixture
+# Résumé template setup
 
-`sample_resume.docx` is generated from scratch by
-`tools/build_synthetic_resume.py`. Every name, organization, link, date,
-credential, and achievement in it is fictional.
-The package is created with the project’s MIT-licensed `python-docx`
-dependency; generic thumbnail and custom-XML parts are removed after generation.
+The public repository intentionally contains only `sample_resume.docx`, a fully
+synthetic fixture used by the test suite. It never includes the project owner's
+master résumé or any tailored output.
 
-The fixture preserves the structural constraints used by Resume Tailor:
-one page, 32 paragraphs, six hyperlinks, fixed section order, and stable project
-bullet counts. It contains no material copied from a real résumé.
+Before a local real installation, place your own compatible document at:
 
-Regenerate it after installing the Python dependencies:
-
-```bash
-.venv/bin/python tools/build_synthetic_resume.py
+```text
+template/master_resume.docx
 ```
 
-Do not replace this tracked fixture with a real résumé. Supply private documents
-at runtime and keep them outside the repository.
+The current mapper is intentionally strict. Start by running the synthetic test
+suite, then adapt the extractor/renderer and its tests if your document structure
+differs from the documented sample. Do not commit your personal master résumé;
+the repository `.gitignore` excludes it and all other DOCX/PDF files except the
+synthetic sample.
+
+For a disposable synthetic installation check only:
+
+```bash
+cp template/sample_resume.docx template/master_resume.docx
+./install.sh
+```
+
+Remove that copied synthetic master afterward if it is no longer needed.

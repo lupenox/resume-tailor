@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 
 class ExitCode(IntEnum):
@@ -42,6 +42,10 @@ class DependencyError(ResumeTailorError):
     exit_code = ExitCode.DEPENDENCY
 
 
+class AntigravityLaunchSizeError(DependencyError):
+    """Antigravity failed to exec because its argument vector was too large."""
+
+
 class CodexSchemaCompatibilityError(DependencyError):
     """A bundled Codex transport schema cannot be sent safely."""
 
@@ -54,6 +58,30 @@ class ModelError(ResumeTailorError):
     exit_code = ExitCode.MODEL
 
 
+class AntigravityTailoringContractError(ModelError):
+    """Antigravity did not satisfy the post-approval tailoring contract."""
+
+
+class AntigravityResponseEnvelopeError(ModelError):
+    """Antigravity returned no unique documented structured-output envelope."""
+
+    def __init__(self, message: str, *, envelope_type: str) -> None:
+        super().__init__(message)
+        self.envelope_type = envelope_type
+
+
+class AntigravityCannotApplyError(ModelError):
+    """Antigravity could not apply one authenticated approved edit."""
+
+
+class AntigravityTechnicalFailureError(ModelError):
+    """Antigravity reported a bounded technical tailoring failure."""
+
+
+class AntigravityTailoringPreflightError(InputError):
+    """Local authenticated tailoring inputs are incomplete or inconsistent."""
+
+
 class WaitingError(ResumeTailorError):
     exit_code = ExitCode.WAITING
 
@@ -64,6 +92,10 @@ class ApprovalError(ResumeTailorError):
 
 class TruthfulnessError(ResumeTailorError):
     exit_code = ExitCode.TRUTHFULNESS
+
+
+class SourceEvidenceError(TruthfulnessError):
+    """Codex returned invalid or inappropriate local source references."""
 
 
 class TemplateError(ResumeTailorError):
@@ -123,11 +155,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_bytes(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(text, encoding="utf-8")
+    temporary.write_bytes(value)
     temporary.replace(path)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -291,9 +327,13 @@ def run_command(
     timeout_seconds: int,
     input_text: str | None = None,
     env: Mapping[str, str] | None = None,
+    heartbeat_handler: Callable[[float, bool], None] | None = None,
+    heartbeat_interval_seconds: float = 15.0,
 ) -> CommandResult:
     """Run an argument array. This project intentionally never invokes a shell."""
     check_cancelled()
+    if heartbeat_interval_seconds <= 0:
+        raise InputError("Subprocess heartbeat interval must be positive.")
     try:
         process = subprocess.Popen(
             [str(arg) for arg in args],
@@ -302,6 +342,8 @@ def run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="strict",
             env=dict(env) if env is not None else None,
             shell=False,
             start_new_session=True,
@@ -309,7 +351,15 @@ def run_command(
     except OSError as exc:
         raise DependencyError(f"Could not run {Path(args[0]).name}: {exc}") from exc
 
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    next_heartbeat = started + heartbeat_interval_seconds
+    if heartbeat_handler is not None:
+        try:
+            heartbeat_handler(0.0, True)
+        except BaseException:
+            _stop_process(process)
+            raise
     pending_input = input_text
     while True:
         event = _CANCELLATION_EVENT.get()
@@ -323,16 +373,35 @@ def run_command(
         if remaining <= 0:
             _stop_process(process)
             raise ModelError(
-                f"Command timed out after {timeout_seconds}s: {Path(args[0]).name}"
+                f"Command timed out after {timeout_seconds}s: {Path(args[0]).name}. "
+                "The full subprocess group was stopped; retry with a larger bounded "
+                "--timeout only after confirming the local provider is responsive."
             )
+        now = time.monotonic()
+        if heartbeat_handler is not None and now >= next_heartbeat:
+            try:
+                heartbeat_handler(now - started, process.poll() is None)
+            except BaseException:
+                _stop_process(process)
+                raise
+            next_heartbeat = now + heartbeat_interval_seconds
         try:
+            poll_timeout = min(0.25, remaining)
+            if heartbeat_handler is not None:
+                poll_timeout = min(
+                    poll_timeout,
+                    max(0.001, next_heartbeat - time.monotonic()),
+                )
             stdout, stderr = process.communicate(
                 input=pending_input,
-                timeout=min(0.25, remaining),
+                timeout=poll_timeout,
             )
             break
         except subprocess.TimeoutExpired:
             pending_input = None
+
+    if heartbeat_handler is not None:
+        heartbeat_handler(time.monotonic() - started, False)
 
     return CommandResult(
         tuple(str(arg) for arg in args),

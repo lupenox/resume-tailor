@@ -3,14 +3,81 @@
   "title": "Antigravity tailored resume response",
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "message", "questions_for_user", "tailored_resume"],
+  "required": [
+    "status",
+    "message",
+    "cannot_apply",
+    "technical_failure",
+    "tailored_resume"
+  ],
   "properties": {
-    "status": {"type": "string", "enum": ["READY", "WAITING", "ERROR"]},
-    "message": {"type": "string"},
-    "questions_for_user": {
-      "type": "array",
-      "items": {"type": "string", "minLength": 1},
-      "uniqueItems": true
+    "status": {
+      "type": "string",
+      "enum": ["complete", "cannot_apply", "technical_failure"]
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "cannot_apply": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["edit_id", "reason_code", "reason"],
+          "properties": {
+            "edit_id": {
+              "type": "string",
+              "pattern": "^edit\\.[0-9]{3}$"
+            },
+            "reason_code": {
+              "type": "string",
+              "enum": [
+                "target_not_applicable",
+                "evidence_conflict",
+                "immutable_fact_conflict",
+                "content_budget_conflict",
+                "unsupported_claim_risk",
+                "other_bounded_constraint"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
+        }
+      ]
+    },
+    "technical_failure": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason_code", "reason"],
+          "properties": {
+            "reason_code": {
+              "type": "string",
+              "enum": [
+                "provider_unavailable",
+                "structured_output_failure",
+                "internal_tool_failure",
+                "output_constraint",
+                "other_technical_failure"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
+        }
+      ]
     },
     "tailored_resume": {
       "oneOf": [
@@ -21,17 +88,34 @@
   },
   "allOf": [
     {
-      "if": {"properties": {"status": {"const": "READY"}}},
+      "if": {"properties": {"status": {"const": "complete"}}},
       "then": {
         "properties": {
           "tailored_resume": {"$ref": "#/$defs/resume"},
-          "questions_for_user": {"maxItems": 0}
+          "cannot_apply": {"type": "null"},
+          "technical_failure": {"type": "null"}
         }
       }
     },
     {
-      "if": {"properties": {"status": {"enum": ["WAITING", "ERROR"]}}},
-      "then": {"properties": {"tailored_resume": {"type": "null"}}}
+      "if": {"properties": {"status": {"const": "cannot_apply"}}},
+      "then": {
+        "properties": {
+          "cannot_apply": {"type": "object"},
+          "technical_failure": {"type": "null"},
+          "tailored_resume": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "technical_failure"}}},
+      "then": {
+        "properties": {
+          "cannot_apply": {"type": "null"},
+          "technical_failure": {"type": "object"},
+          "tailored_resume": {"type": "null"}
+        }
+      }
     }
   ],
   "$defs": {

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import difflib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -40,6 +42,45 @@ _HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Prometheus/Grafana", re.compile(r"\bPrometheus\b|\bGrafana\b", re.I)),
 )
 
+_DASH_TRANSLATION = str.maketrans(
+    {
+        "‐": "-",
+        "‑": "-",
+        "‒": "-",
+        "–": "-",
+        "—": "-",
+        "―": "-",
+        "−": "-",
+    }
+)
+
+_ABSENT_EXPERIENCE_QUESTION_RE = re.compile(
+    r"(?:\b(?:do|did|have|can|could|would)\s+you\b.{0,160}"
+    r"\b(?:experience|skill|technology|tool|project|metric|certification|"
+    r"domain|worked|used|built|implemented|deployed|managed|led)\b)|"
+    r"(?:\b(?:please|can|could)\s+(?:you\s+)?(?:confirm|describe|provide|"
+    r"share|list)\b.{0,160}\b(?:experience|skill|technology|tool|project|"
+    r"metric|certification|domain)\b)|"
+    r"(?:\b(?:unlisted|not (?:shown|listed|included|present|represented)|"
+    r"absent from (?:the )?r[eé]sum[eé])\b)",
+    re.I,
+)
+_SOURCE_CONTRADICTION_QUESTION_RE = re.compile(
+    r"\b(?:conflict(?:ing)?|contradict(?:ion|ory)?|inconsisten(?:t|cy)|"
+    r"disagree|two different|which (?:date|value|version).{0,80}authoritative)\b",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class SourceEvidenceIssue:
+    code: str
+    location: str
+    detail: str
+
+    def describe(self) -> str:
+        return f"{self.location}: {self.detail} ({self.code})."
+
 
 @dataclass
 class EvidenceReport:
@@ -57,47 +98,591 @@ class EvidenceReport:
 def validate_analysis_evidence(
     analysis: dict[str, Any],
     extracted_resume: dict[str, Any],
+    job_requirements: dict[str, Any],
 ) -> list[str]:
-    """Fail closed when Codex labels absent text as supported source evidence."""
-    source_text = _resume_text(extracted_resume["content"])
-    normalized_source = normalized_text(source_text)
-    issues: list[str] = []
-    for keyword in analysis.get("supported_ats_keywords", []):
-        if normalized_text(keyword) not in normalized_source:
+    """Compatibility wrapper returning safe source-reference issue summaries."""
+    _, issues = resolve_analysis_evidence(
+        analysis,
+        extracted_resume,
+        job_requirements,
+    )
+    return [issue.describe() for issue in issues]
+
+
+def _source_reference(block: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_id": block["source_id"],
+        "section_context": block["section_context"],
+        "exact_text": block["exact_text"],
+    }
+
+
+def _source_catalog(
+    extracted_resume: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[SourceEvidenceIssue]]:
+    from .docx_extract import source_blocks_from_paragraphs
+
+    supplied = extracted_resume.get("source_blocks")
+    blocks = (
+        copy.deepcopy(supplied)
+        if isinstance(supplied, list)
+        else source_blocks_from_paragraphs(extracted_resume["paragraphs"])
+    )
+    index: dict[str, dict[str, Any]] = {}
+    issues: list[SourceEvidenceIssue] = []
+    for position, block in enumerate(blocks):
+        location = f"source_blocks[{position}]"
+        if not isinstance(block, dict):
             issues.append(
-                f"Codex marked ATS keyword {keyword!r} as supported, but it does "
-                "not occur in the master resume."
+                SourceEvidenceIssue(
+                    "invalid_source_object",
+                    location,
+                    "the local extraction contains a non-object source block",
+                )
             )
-    for index, edit in enumerate(analysis.get("recommended_edits", []), start=1):
-        evidence = edit["exact_supporting_evidence"]
-        existing = edit["existing_claim"]
-        if normalized_text(evidence) not in normalized_source:
+            continue
+        source_id = block.get("source_id")
+        if not isinstance(source_id, str) or not source_id.strip():
             issues.append(
-                f"Recommended edit {index} cites evidence not found verbatim in "
-                f"the master resume: {evidence!r}."
+                SourceEvidenceIssue(
+                    "missing_source_id",
+                    location,
+                    "the local extraction contains a source block without an ID",
+                )
             )
-        if normalized_text(existing) not in normalized_source:
+            continue
+        if source_id in index:
             issues.append(
-                f"Recommended edit {index} identifies existing text not found "
-                f"verbatim in the master resume: {existing!r}."
+                SourceEvidenceIssue(
+                    "duplicate_source_id",
+                    location,
+                    f"the local extraction repeats source ID {source_id!r}",
+                )
             )
-    valid_budget_ids = {
+            continue
+        if not isinstance(block.get("exact_text"), str):
+            issues.append(
+                SourceEvidenceIssue(
+                    "missing_source_text",
+                    location,
+                    f"local source ID {source_id!r} has no exact text",
+                )
+            )
+            continue
+        index[source_id] = block
+    return blocks, index, issues
+
+
+def _resolve_source_ids(
+    values: Any,
+    *,
+    location: str,
+    source_index: dict[str, dict[str, Any]],
+    issues: list[SourceEvidenceIssue],
+    required: bool,
+    evidence_only: bool,
+) -> list[dict[str, Any]]:
+    if not isinstance(values, list):
+        issues.append(
+            SourceEvidenceIssue(
+                "missing_source_ids",
+                location,
+                "Codex did not provide a source-ID array",
+            )
+        )
+        return []
+    if required and not values:
+        issues.append(
+            SourceEvidenceIssue(
+                "missing_source_ids",
+                location,
+                "at least one source ID is required",
+            )
+        )
+    seen: set[str] = set()
+    resolved: list[dict[str, Any]] = []
+    for position, value in enumerate(values):
+        item_location = f"{location}[{position}]"
+        if not isinstance(value, str) or not value.strip():
+            issues.append(
+                SourceEvidenceIssue(
+                    "missing_source_id",
+                    item_location,
+                    "Codex supplied an empty source ID",
+                )
+            )
+            continue
+        if value in seen:
+            issues.append(
+                SourceEvidenceIssue(
+                    "duplicate_source_id",
+                    item_location,
+                    "Codex repeated a source ID",
+                )
+            )
+            continue
+        seen.add(value)
+        block = source_index.get(value)
+        if block is None:
+            issues.append(
+                SourceEvidenceIssue(
+                    "unknown_source_id",
+                    item_location,
+                    "Codex referenced an unknown source ID",
+                )
+            )
+            continue
+        if evidence_only and block.get("evidence_allowed") is not True:
+            issues.append(
+                SourceEvidenceIssue(
+                    "inappropriate_evidence_source",
+                    item_location,
+                    "Codex referenced document context instead of claim evidence",
+                )
+            )
+            continue
+        resolved.append(block)
+    return resolved
+
+
+def _typographic_phrase(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value).translate(_DASH_TRANSLATION)
+    normalized = re.sub(r"\s*-\s*", "-", normalized.casefold())
+    return " ".join(normalized.split())
+
+
+def _requirement_support_status(
+    requirement: str,
+    cited_blocks: list[dict[str, Any]],
+) -> str:
+    """Derive claim support from cited local text without fuzzy matching."""
+    if requirement and any(
+        requirement in str(block["exact_text"]) for block in cited_blocks
+    ):
+        return "present_verbatim"
+
+    normalized_requirement = _typographic_phrase(requirement)
+    if normalized_requirement and any(
+        normalized_requirement in _typographic_phrase(str(block["exact_text"]))
+        for block in cited_blocks
+    ):
+        return "supported_by_source"
+    return "unsupported"
+
+
+def _present_verbatim(
+    requirement: str,
+    cited_blocks: list[dict[str, Any]],
+) -> bool:
+    """Conservatively match case, Unicode dashes, whitespace, and line breaks."""
+    normalized_requirement = _typographic_phrase(requirement)
+    return bool(normalized_requirement) and any(
+        normalized_requirement in _typographic_phrase(str(block["exact_text"]))
+        for block in cited_blocks
+    )
+
+
+def _keyword_status(
+    keyword: str,
+    *,
+    eligible_blocks: list[dict[str, Any]],
+    cited_blocks: list[dict[str, Any]],
+) -> str:
+    if any(keyword in str(block["exact_text"]) for block in eligible_blocks):
+        return "present_verbatim"
+    normalized_keyword = _typographic_phrase(keyword)
+    if normalized_keyword and any(
+        normalized_keyword in _typographic_phrase(str(block["exact_text"]))
+        for block in cited_blocks
+    ):
+        return "supported_by_source"
+    return "unsupported"
+
+
+def diagnose_legacy_analysis_evidence(
+    analysis: dict[str, Any],
+    extracted_resume: dict[str, Any],
+) -> list[SourceEvidenceIssue]:
+    """Replay the retired label-based ATS contract without accepting it live."""
+    blocks, source_index, issues = _source_catalog(extracted_resume)
+    eligible_blocks = [
+        block for block in blocks if block.get("evidence_allowed") is True
+    ]
+    for position, item in enumerate(analysis.get("ats_keywords", [])):
+        if not isinstance(item, dict):
+            continue
+        location = f"ats_keywords[{position}].evidence_source_ids"
+        cited = _resolve_source_ids(
+            item.get("evidence_source_ids"),
+            location=location,
+            source_index=source_index,
+            issues=issues,
+            required=False,
+            evidence_only=True,
+        )
+        keyword = str(item.get("keyword", ""))
+        status = _keyword_status(
+            keyword,
+            eligible_blocks=eligible_blocks,
+            cited_blocks=cited,
+        )
+        if status == "unsupported" and cited:
+            issues.append(
+                SourceEvidenceIssue(
+                    "unsupported_ats_keyword_has_evidence",
+                    location,
+                    "an unsupported ATS term was assigned unrelated source evidence",
+                )
+            )
+    return list(
+        {
+            (issue.code, issue.location, issue.detail): issue
+            for issue in issues
+        }.values()
+    )
+
+
+def resolve_analysis_evidence(
+    analysis: dict[str, Any],
+    extracted_resume: dict[str, Any],
+    job_requirements: dict[str, Any],
+) -> tuple[dict[str, Any], list[SourceEvidenceIssue]]:
+    """Resolve both ID catalogs locally; model-authored labels are never authority."""
+    from .job_requirements import job_requirement_index
+
+    _, source_index, issues = _source_catalog(extracted_resume)
+    requirement_index = job_requirement_index(job_requirements)
+    resolved = copy.deepcopy(analysis)
+    supported_by_id: dict[str, dict[str, Any]] = {}
+    resolved_mappings: list[dict[str, Any]] = []
+    for position, item in enumerate(
+        analysis.get("supported_requirement_mappings", [])
+    ):
+        if not isinstance(item, dict):
+            issues.append(
+                SourceEvidenceIssue(
+                    "invalid_requirement_mapping",
+                    f"supported_requirement_mappings[{position}]",
+                    "Codex returned a non-object requirement mapping",
+                )
+            )
+            continue
+        requirement_id = item.get("requirement_id")
+        id_location = (
+            f"supported_requirement_mappings[{position}].requirement_id"
+        )
+        requirement = (
+            requirement_index.get(requirement_id)
+            if isinstance(requirement_id, str)
+            else None
+        )
+        if requirement is None:
+            issues.append(
+                SourceEvidenceIssue(
+                    "unknown_requirement_id",
+                    id_location,
+                    "Codex referenced an unknown job requirement ID",
+                )
+            )
+        elif requirement_id in supported_by_id:
+            issues.append(
+                SourceEvidenceIssue(
+                    "duplicate_requirement_mapping",
+                    id_location,
+                    "Codex mapped the same job requirement more than once",
+                )
+            )
+
+        evidence_location = (
+            f"supported_requirement_mappings[{position}].evidence_source_ids"
+        )
+        cited = _resolve_source_ids(
+            item.get("evidence_source_ids"),
+            location=evidence_location,
+            source_index=source_index,
+            issues=issues,
+            required=True,
+            evidence_only=True,
+        )
+        local_item = copy.deepcopy(item)
+        local_item["resolved_evidence"] = [
+            _source_reference(block) for block in cited
+        ]
+        if requirement is not None:
+            status = (
+                "present_verbatim"
+                if _present_verbatim(requirement["exact_text"], cited)
+                else "supported_by_source"
+            )
+            local_item.update(
+                {
+                    "requirement": requirement["exact_text"],
+                    "category": requirement["category"],
+                    "support_status": status,
+                    "support_provenance": (
+                        "local_exact_phrase"
+                        if status == "present_verbatim"
+                        else "model_assessed_human_review_required"
+                    ),
+                }
+            )
+            if requirement_id not in supported_by_id:
+                supported_by_id[requirement_id] = local_item
+        resolved_mappings.append(local_item)
+
+    unsupported_ids: set[str] = set()
+    for position, requirement_id in enumerate(
+        analysis.get("unsupported_requirement_ids", [])
+    ):
+        location = f"unsupported_requirement_ids[{position}]"
+        if not isinstance(requirement_id, str) or requirement_id not in requirement_index:
+            issues.append(
+                SourceEvidenceIssue(
+                    "unknown_requirement_id",
+                    location,
+                    "Codex referenced an unknown unsupported job requirement ID",
+                )
+            )
+            continue
+        if requirement_id in unsupported_ids:
+            issues.append(
+                SourceEvidenceIssue(
+                    "duplicate_unsupported_requirement",
+                    location,
+                    "Codex repeated an unsupported job requirement ID",
+                )
+            )
+        unsupported_ids.add(requirement_id)
+        if requirement_id in supported_by_id:
+            issues.append(
+                SourceEvidenceIssue(
+                    "unsupported_requirement_has_evidence",
+                    location,
+                    "an unsupported requirement also has a supported evidence mapping",
+                )
+            )
+
+    classified_ids = set(supported_by_id) | unsupported_ids
+    for requirement_id in requirement_index:
+        if requirement_id not in classified_ids:
+            issues.append(
+                SourceEvidenceIssue(
+                    "missing_requirement_classification",
+                    f"job_requirements[{requirement_id}]",
+                    "Codex omitted this job requirement from both classifications",
+                )
+            )
+
+    requirement_assessment: list[dict[str, Any]] = []
+    keyword_assessment: list[dict[str, Any]] = []
+    for requirement_id, requirement in requirement_index.items():
+        mapping = supported_by_id.get(requirement_id)
+        if mapping is not None and requirement_id not in unsupported_ids:
+            assessment = {
+                "requirement_id": requirement_id,
+                "requirement": requirement["exact_text"],
+                "category": requirement["category"],
+                "status": mapping["support_status"],
+                "support_provenance": mapping["support_provenance"],
+                "strength": mapping.get("strength"),
+                "evidence_source_ids": list(mapping.get("evidence_source_ids", [])),
+                "resolved_evidence": list(mapping.get("resolved_evidence", [])),
+            }
+        else:
+            assessment = {
+                "requirement_id": requirement_id,
+                "requirement": requirement["exact_text"],
+                "category": requirement["category"],
+                "status": "unsupported",
+                "support_provenance": "local_unsupported_classification",
+                "strength": None,
+                "evidence_source_ids": [],
+                "resolved_evidence": [],
+            }
+        requirement_assessment.append(assessment)
+        if requirement["category"] in {"technology_and_skill", "ai_focus_area"}:
+            keyword_assessment.append(
+                {
+                    "requirement_id": requirement_id,
+                    "keyword": requirement["exact_text"],
+                    "status": assessment["status"],
+                    "support_provenance": assessment["support_provenance"],
+                    "evidence_source_ids": assessment["evidence_source_ids"],
+                    "resolved_evidence": assessment["resolved_evidence"],
+                }
+            )
+
+    resolved["supported_requirement_mappings"] = resolved_mappings
+    resolved["requirement_assessment"] = requirement_assessment
+    resolved["matched_requirements"] = [
+        item["requirement"]
+        for item in requirement_assessment
+        if item["status"] != "unsupported"
+    ]
+    resolved["evidence_map"] = [
+        {
+            "requirement_id": item["requirement_id"],
+            "requirement": item["requirement"],
+            "evidence_source_ids": item["evidence_source_ids"],
+            "strength": item["strength"],
+            "support_status": item["status"],
+            "support_provenance": item["support_provenance"],
+            "resolved_evidence": item["resolved_evidence"],
+        }
+        for item in requirement_assessment
+        if item["status"] != "unsupported"
+    ]
+    resolved["missing_or_unsupported_requirements"] = [
+        item["requirement"]
+        for item in requirement_assessment
+        if item["status"] == "unsupported"
+    ]
+    resolved["ats_keywords"] = [
+        {
+            "keyword": item["keyword"],
+            "evidence_source_ids": item["evidence_source_ids"],
+        }
+        for item in keyword_assessment
+    ]
+    resolved["ats_keyword_assessment"] = keyword_assessment
+    resolved["supported_ats_keywords"] = [
+        item["keyword"]
+        for item in keyword_assessment
+        if item["status"] in {"present_verbatim", "supported_by_source"}
+    ]
+    resolved["unsupported_ats_keywords"] = [
+        item["keyword"]
+        for item in keyword_assessment
+        if item["status"] == "unsupported"
+    ]
+
+    for position, question in enumerate(analysis.get("questions_for_user", [])):
+        if isinstance(question, str) and _ABSENT_EXPERIENCE_QUESTION_RE.search(
+            question
+        ) and not _SOURCE_CONTRADICTION_QUESTION_RE.search(question):
+            issues.append(
+                SourceEvidenceIssue(
+                    "forbidden_absent_experience_question",
+                    f"questions_for_user[{position}]",
+                    "Codex asked the user to supply experience absent from the résumé",
+                )
+            )
+
+    seen_targets: set[str] = set()
+    resolved_edits: list[dict[str, Any]] = []
+    for position, edit in enumerate(analysis.get("recommended_edits", [])):
+        target_location = f"recommended_edits[{position}].target_source_id"
+        target_id = edit.get("target_source_id")
+        target: dict[str, Any] | None = None
+        if not isinstance(target_id, str) or not target_id.strip():
+            issues.append(
+                SourceEvidenceIssue(
+                    "missing_target_source_id",
+                    target_location,
+                    "Codex omitted the edit target source ID",
+                )
+            )
+        elif target_id in seen_targets:
+            issues.append(
+                SourceEvidenceIssue(
+                    "duplicate_target_source_id",
+                    target_location,
+                    "Codex proposed conflicting edits for one source block",
+                )
+            )
+        else:
+            seen_targets.add(target_id)
+            target = source_index.get(target_id)
+            if target is None:
+                issues.append(
+                    SourceEvidenceIssue(
+                        "unknown_target_source_id",
+                        target_location,
+                        "Codex referenced an unknown edit target",
+                    )
+                )
+            elif target.get("editable") is not True:
+                issues.append(
+                    SourceEvidenceIssue(
+                        "inappropriate_target_source_id",
+                        target_location,
+                        "Codex referenced a non-editable résumé block",
+                    )
+                )
+
+        cited = _resolve_source_ids(
+            edit.get("evidence_source_ids"),
+            location=f"recommended_edits[{position}].evidence_source_ids",
+            source_index=source_index,
+            issues=issues,
+            required=True,
+            evidence_only=True,
+        )
+        local_edit = copy.deepcopy(edit)
+        local_edit["resolved_evidence"] = [_source_reference(block) for block in cited]
+        if target is not None:
+            local_edit["existing_text"] = target["exact_text"]
+            local_edit["resume_section"] = target["section_context"]
+        resolved_edits.append(local_edit)
+    resolved["recommended_edits"] = resolved_edits
+
+    budgets = {
         paragraph["content_id"]: paragraph["content_budget"]["maximum_characters"]
         for paragraph in extracted_resume["paragraphs"]
     }
-    for guidance in analysis.get("content_budget_guidance", []):
-        content_id = guidance["content_id"]
-        maximum = guidance["maximum_characters"]
-        if content_id not in valid_budget_ids:
+    seen_budget_targets: set[str] = set()
+    resolved_guidance: list[dict[str, Any]] = []
+    for position, guidance in enumerate(analysis.get("content_budget_guidance", [])):
+        target_id = guidance.get("target_source_id")
+        location = f"content_budget_guidance[{position}].target_source_id"
+        if not isinstance(target_id, str) or not target_id.strip():
             issues.append(
-                f"Codex supplied content guidance for unknown paragraph {content_id!r}."
+                SourceEvidenceIssue(
+                    "missing_target_source_id",
+                    location,
+                    "Codex omitted the budget target source ID",
+                )
             )
-        elif maximum > valid_budget_ids[content_id]:
+        elif target_id in seen_budget_targets:
             issues.append(
-                f"Codex expanded the content budget for {content_id!r} from "
-                f"{valid_budget_ids[content_id]} to {maximum} characters."
+                SourceEvidenceIssue(
+                    "duplicate_target_source_id",
+                    location,
+                    "Codex repeated budget guidance for one source block",
+                )
             )
-    return list(dict.fromkeys(issues))
+        else:
+            seen_budget_targets.add(target_id)
+            block = source_index.get(target_id)
+            if block is None:
+                issues.append(
+                    SourceEvidenceIssue(
+                        "unknown_target_source_id",
+                        location,
+                        "Codex referenced an unknown budget target",
+                    )
+                )
+            elif block.get("editable") is not True or target_id not in budgets:
+                issues.append(
+                    SourceEvidenceIssue(
+                        "inappropriate_target_source_id",
+                        location,
+                        "Codex referenced a block that cannot receive content guidance",
+                    )
+                )
+        local_guidance = copy.deepcopy(guidance)
+        if isinstance(target_id, str) and target_id in budgets:
+            local_guidance["maximum_characters"] = budgets[target_id]
+        resolved_guidance.append(local_guidance)
+    resolved["content_budget_guidance"] = resolved_guidance
+
+    unique_issues = list(
+        {
+            (issue.code, issue.location, issue.detail): issue
+            for issue in issues
+        }.values()
+    )
+    return resolved, unique_issues
 
 
 def _resume_text(content: dict[str, Any]) -> str:

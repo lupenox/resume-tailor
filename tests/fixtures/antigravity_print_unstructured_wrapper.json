@@ -1,0 +1,17 @@
+{
+  "conversation_id": "00000000-0000-4000-8000-000000000000",
+  "duration_seconds": 8.25,
+  "json_schema": {
+    "replace_in_test": true
+  },
+  "num_turns": 2,
+  "response": "The synthetic request was processed, but the final answer mixed prose and fragments.\n\nClarifications:\n- This is synthetic fixture text only.\n\n{\"status\":\"complete\",\"message\":\"fragment one\"}\n{\"status\":\"complete\",\"message\":\"fragment two\",\"tailored_resume\":null}\n{\"status\":\"complete\",\"message\":\"fragment three\",\"cannot_apply\":null}\n{\"status\":\"complete\",\"message\":\"fragment four\",\"technical_failure\":null}",
+  "status": "SUCCESS",
+  "usage": {
+    "cache_read_tokens": 100,
+    "input_tokens": 200,
+    "output_tokens": 50,
+    "thinking_tokens": 25,
+    "total_tokens": 250
+  }
+}

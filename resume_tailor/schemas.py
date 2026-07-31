@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,8 @@ from .utilities import (
     CodexSchemaCompatibilityError,
     DependencyError,
     ModelError,
+    atomic_write_json,
+    sha256_file,
 )
 
 
@@ -18,6 +21,12 @@ CODEX_TRANSPORT_SCHEMAS = {
     "codex_analysis.schema.json": "codex_analysis.openai.schema.json",
     "final_qa.schema.json": "final_qa.openai.schema.json",
 }
+CODEX_ANALYSIS_RUN_SCHEMA_NAME = "codex-analysis-transport.schema.json"
+
+_MAX_CODEX_SCHEMA_BYTES = 250_000
+_MAX_CODEX_SCHEMA_NODES = 10_000
+_MAX_CODEX_ENUM_VALUES = 2_048
+_MAX_CODEX_ENUM_STRING_BYTES = 512
 
 # OpenAI Structured Outputs supports a documented JSON Schema subset. These
 # canonical-only assertion keywords are deliberately enforced after receipt.
@@ -72,6 +81,27 @@ _CODEX_SUPPORTED_FORMATS = {
     "time",
     "uuid",
 }
+
+
+@dataclass(frozen=True)
+class CodexAnalysisTransportArtifact:
+    path: Path
+    sha256: str
+    size_bytes: int
+    evidence_source_id_count: int
+    editable_source_id_count: int
+    job_requirement_id_count: int
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "filename": self.path.name,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "evidence_source_id_count": self.evidence_source_id_count,
+            "editable_source_id_count": self.editable_source_id_count,
+            "job_requirement_id_count": self.job_requirement_id_count,
+            "generated_from_source_and_requirement_catalogs": True,
+        }
 
 
 def schema_path(name: str) -> Path:
@@ -257,6 +287,16 @@ def _audit_schema_node(
             path=path,
             message="schema nesting exceeds the supported depth of 10",
         )
+    counters["nodes"] += 1
+    if counters["nodes"] > _MAX_CODEX_SCHEMA_NODES:
+        raise _compatibility_error(
+            label=label,
+            path=path,
+            message=(
+                "schema complexity exceeds the local 10,000-node safety limit; "
+                "reduce the extracted source catalog before retrying"
+            ),
+        )
     for keyword in node:
         if keyword not in _CODEX_SUPPORTED_KEYWORDS:
             raise _compatibility_error(
@@ -292,6 +332,42 @@ def _audit_schema_node(
             path=(*path, "format"),
             message=f"unsupported string format {node['format']!r}",
         )
+
+    if "enum" in node:
+        values = node["enum"]
+        if not isinstance(values, list) or not values:
+            raise _compatibility_error(
+                label=label,
+                path=(*path, "enum"),
+                message="enum must contain at least one value",
+            )
+        tokens = [json.dumps(value, sort_keys=True) for value in values]
+        if len(tokens) != len(set(tokens)):
+            raise _compatibility_error(
+                label=label,
+                path=(*path, "enum"),
+                message="enum values must be unique",
+            )
+        counters["enum_values"] += len(values)
+        if counters["enum_values"] > _MAX_CODEX_ENUM_VALUES:
+            raise _compatibility_error(
+                label=label,
+                path=(*path, "enum"),
+                message=(
+                    "schema enums exceed the local 2,048-value safety limit; "
+                    "reduce the extracted source catalog before retrying"
+                ),
+            )
+        if any(
+            isinstance(value, str)
+            and len(value.encode("utf-8")) > _MAX_CODEX_ENUM_STRING_BYTES
+            for value in values
+        ):
+            raise _compatibility_error(
+                label=label,
+                path=(*path, "enum"),
+                message="an enum string exceeds the local 512-byte safety limit",
+            )
 
     if "object" in declared_types:
         properties = node.get("properties")
@@ -380,12 +456,26 @@ def audit_codex_transport_schema(
             path=(),
             message="the root must be an object and must not use anyOf",
         )
+    encoded_size = len(
+        json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+    if encoded_size > _MAX_CODEX_SCHEMA_BYTES:
+        raise _compatibility_error(
+            label=label,
+            path=(),
+            message=(
+                "schema exceeds the local 250,000-byte safety limit; reduce the "
+                "extracted source catalog before retrying"
+            ),
+        )
     _audit_schema_node(
         schema,
         label=label,
         path=(),
         depth=1,
-        counters={"properties": 0},
+        counters={"properties": 0, "nodes": 0, "enum_values": 0},
     )
 
 
@@ -406,6 +496,204 @@ def codex_transport_schema_path(canonical_name: str) -> Path:
             f"provider-safe derivation of {canonical_name}."
         )
     return schema_path(transport_name)
+
+
+def _analysis_source_id_sets(
+    extracted_resume: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    from .docx_extract import source_blocks_from_paragraphs
+
+    blocks = extracted_resume.get("source_blocks")
+    if not isinstance(blocks, list):
+        paragraphs = extracted_resume.get("paragraphs")
+        if not isinstance(paragraphs, list):
+            raise CodexSchemaCompatibilityError(
+                "Cannot generate the analysis schema without a local source catalog."
+            )
+        blocks = source_blocks_from_paragraphs(paragraphs)
+    evidence_ids: list[str] = []
+    editable_ids: list[str] = []
+    seen: set[str] = set()
+    for position, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            raise CodexSchemaCompatibilityError(
+                f"Source catalog entry {position} is not an object."
+            )
+        source_id = block.get("source_id")
+        if not isinstance(source_id, str) or not source_id:
+            raise CodexSchemaCompatibilityError(
+                f"Source catalog entry {position} has no deterministic source ID."
+            )
+        if source_id in seen:
+            raise CodexSchemaCompatibilityError(
+                "The source catalog contains duplicate source IDs."
+            )
+        seen.add(source_id)
+        if block.get("evidence_allowed") is True:
+            evidence_ids.append(source_id)
+        if block.get("editable") is True:
+            editable_ids.append(source_id)
+    if not evidence_ids:
+        raise CodexSchemaCompatibilityError(
+            "The source catalog has no evidence-eligible blocks."
+        )
+    if not editable_ids:
+        raise CodexSchemaCompatibilityError(
+            "The source catalog has no editable blocks."
+        )
+    if not set(editable_ids).issubset(evidence_ids):
+        raise CodexSchemaCompatibilityError(
+            "Editable source IDs must also be evidence eligible."
+        )
+    return evidence_ids, editable_ids
+
+
+def build_codex_analysis_transport_schema(
+    extracted_resume: dict[str, Any],
+    job_requirements: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], list[str], list[str]]:
+    """Create a provider-safe schema constrained to both immutable ID catalogs."""
+    from .job_requirements import validate_job_requirement_catalog
+
+    # Retain the checked-in transport as a compatibility sentinel, then derive a
+    # fresh run schema from the complete canonical contract.
+    codex_transport_schema_path("codex_analysis.schema.json")
+    transport = derive_codex_transport_schema(
+        load_schema("codex_analysis.schema.json"),
+        label="run-specific codex analysis schema",
+    )
+    evidence_ids, editable_ids = _analysis_source_id_sets(extracted_resume)
+    requirement_ids = [
+        item["requirement_id"]
+        for item in validate_job_requirement_catalog(job_requirements)
+    ]
+    if len(requirement_ids) > _MAX_CODEX_ENUM_VALUES:
+        raise CodexSchemaCompatibilityError(
+            "The job-requirement catalog exceeds the local Structured Outputs "
+            "enum limit; reduce the confirmed posting before retrying."
+        )
+    properties = transport["properties"]
+
+    evidence_arrays = (
+        properties["supported_requirement_mappings"]["items"]["properties"][
+            "evidence_source_ids"
+        ],
+        properties["recommended_edits"]["items"]["properties"][
+            "evidence_source_ids"
+        ],
+    )
+    for array_schema in evidence_arrays:
+        array_schema["minItems"] = 1
+        array_schema["items"]["enum"] = list(evidence_ids)
+
+    properties["supported_requirement_mappings"]["items"]["properties"][
+        "requirement_id"
+    ]["enum"] = list(requirement_ids)
+    properties["unsupported_requirement_ids"]["items"]["enum"] = list(
+        requirement_ids
+    )
+
+    for target_schema in (
+        properties["recommended_edits"]["items"]["properties"][
+            "target_source_id"
+        ],
+        properties["content_budget_guidance"]["items"]["properties"][
+            "target_source_id"
+        ],
+    ):
+        target_schema["enum"] = list(editable_ids)
+
+    _check_canonical_schema(transport, name="run-specific codex analysis schema")
+    audit_codex_transport_schema(
+        transport,
+        label="run-specific codex analysis schema",
+    )
+    return transport, evidence_ids, editable_ids, requirement_ids
+
+
+def prepare_codex_analysis_transport_schema(
+    extracted_resume: dict[str, Any],
+    job_requirements: dict[str, Any],
+    run_directory: Path,
+) -> CodexAnalysisTransportArtifact:
+    if not run_directory.is_dir():
+        raise CodexSchemaCompatibilityError(
+            "The run directory must exist before analysis schema generation."
+        )
+    transport, evidence_ids, editable_ids, requirement_ids = (
+        build_codex_analysis_transport_schema(
+            extracted_resume,
+            job_requirements,
+        )
+    )
+    path = run_directory / CODEX_ANALYSIS_RUN_SCHEMA_NAME
+    encoded = (
+        json.dumps(transport, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    size_bytes = len(encoded)
+    if size_bytes > _MAX_CODEX_SCHEMA_BYTES:
+        raise CodexSchemaCompatibilityError(
+            "The generated analysis schema exceeds the local 250,000-byte safety "
+            "limit; reduce the extracted source catalog before retrying."
+        )
+    atomic_write_json(path, transport)
+    return CodexAnalysisTransportArtifact(
+        path=path.resolve(),
+        sha256=sha256_file(path),
+        size_bytes=size_bytes,
+        evidence_source_id_count=len(evidence_ids),
+        editable_source_id_count=len(editable_ids),
+        job_requirement_id_count=len(requirement_ids),
+    )
+
+
+def validate_codex_analysis_transport_artifact(
+    artifact: CodexAnalysisTransportArtifact,
+    extracted_resume: dict[str, Any],
+    job_requirements: dict[str, Any],
+    run_directory: Path,
+) -> None:
+    if (
+        artifact.path.is_symlink()
+        or not artifact.path.is_file()
+        or artifact.path.resolve().parent != run_directory.resolve()
+        or artifact.path.name != CODEX_ANALYSIS_RUN_SCHEMA_NAME
+    ):
+        raise CodexSchemaCompatibilityError(
+            "The generated analysis schema is not a safe run artifact."
+        )
+    if sha256_file(artifact.path) != artifact.sha256:
+        raise CodexSchemaCompatibilityError(
+            "The generated analysis schema changed before Codex launch."
+        )
+    try:
+        actual = json.loads(artifact.path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CodexSchemaCompatibilityError(
+            "The generated analysis schema could not be revalidated."
+        ) from exc
+    expected, evidence_ids, editable_ids, requirement_ids = (
+        build_codex_analysis_transport_schema(
+            extracted_resume,
+            job_requirements,
+        )
+    )
+    if actual != expected:
+        raise CodexSchemaCompatibilityError(
+            "The generated analysis schema does not match the current source or "
+            "job-requirement catalog."
+        )
+    if (
+        artifact.evidence_source_id_count != len(evidence_ids)
+        or artifact.editable_source_id_count != len(editable_ids)
+        or artifact.job_requirement_id_count != len(requirement_ids)
+        or artifact.size_bytes != artifact.path.stat().st_size
+    ):
+        raise CodexSchemaCompatibilityError(
+            "The generated analysis schema metadata is inconsistent."
+        )
+    _check_canonical_schema(actual, name=artifact.path.name)
+    audit_codex_transport_schema(actual, label=artifact.path.name)
 
 
 def _resolve_local_reference(

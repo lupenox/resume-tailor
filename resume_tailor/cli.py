@@ -8,12 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .antigravity_writer import invoke_antigravity
+from .antigravity_writer import (
+    ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
+    invoke_antigravity,
+    load_antigravity_response_metadata,
+    preflight_tailoring_inputs,
+)
 from .clipboard import read_clipboard
 from .codex_analysis import invoke_codex_analysis, readable_analysis
 from .evidence import (
     build_content_diff,
-    validate_analysis_evidence,
+    resolve_analysis_evidence,
     validate_tailored_content,
 )
 from .linkedin_job import (
@@ -21,18 +26,44 @@ from .linkedin_job import (
     posting_confirmation_text,
     validate_linkedin_url,
 )
+from .job_requirements import build_job_requirement_catalog
 from .orchestration import PipelineHooks
 from .qa import invoke_final_qa
+from .retry import (
+    ANALYSIS_APPROVAL_FILENAME,
+    AntigravityReprocessContext,
+    AntigravityRetryContext,
+    RetryContext,
+    analysis_input_manifest,
+    load_antigravity_reprocess_inputs,
+    load_antigravity_retry_inputs,
+    load_retry_inputs,
+    record_codex_analysis_approval,
+    verify_tailoring_run_artifacts,
+)
+from .schemas import (
+    CodexAnalysisTransportArtifact,
+    prepare_codex_analysis_transport_schema,
+    validate_codex_analysis_transport_artifact,
+)
 from .utilities import (
     ApprovalError,
+    AntigravityCannotApplyError,
+    AntigravityLaunchSizeError,
+    AntigravityResponseEnvelopeError,
+    AntigravityTailoringContractError,
+    AntigravityTailoringPreflightError,
+    AntigravityTechnicalFailureError,
     CancellationError,
     ExitCode,
     InputError,
     IntegrityError,
     QAError,
     ResumeTailorError,
+    SourceEvidenceError,
     TruthfulnessError,
     WaitingError,
+    atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
     cancellable_commands,
@@ -160,13 +191,7 @@ def _tool_version(executable: str, arguments: list[str], *, cwd: Path) -> str:
     return output[0][:200] if result.returncode == 0 and output else "unavailable"
 
 
-def _dependency_versions(cwd: Path) -> dict[str, str]:
-    codex = require_executable("codex")
-    agy = require_executable("agy")
-    libreoffice = require_executable("libreoffice")
-    require_executable("pdfinfo")
-    require_executable("pdftotext")
-    require_executable("pdftoppm")
+def _runtime_dependency_versions() -> dict[str, str]:
     try:
         python_docx_version = importlib.metadata.version("python-docx")
         jsonschema_version = importlib.metadata.version("jsonschema")
@@ -182,9 +207,33 @@ def _dependency_versions(cwd: Path) -> dict[str, str]:
         "python": sys.version.split()[0],
         "python_docx": python_docx_version,
         "jsonschema": jsonschema_version,
+    }
+
+
+def _analysis_dependency_versions(cwd: Path) -> dict[str, str]:
+    codex = require_executable("codex")
+    return {
+        **_runtime_dependency_versions(),
         "codex": _tool_version(codex, ["--version"], cwd=cwd),
+    }
+
+
+def _tailoring_dependency_versions(cwd: Path) -> dict[str, str]:
+    agy = require_executable("agy")
+    libreoffice = require_executable("libreoffice")
+    require_executable("pdfinfo")
+    require_executable("pdftotext")
+    require_executable("pdftoppm")
+    return {
         "antigravity": _tool_version(agy, ["--version"], cwd=cwd),
         "libreoffice": _tool_version(libreoffice, ["--version"], cwd=cwd),
+    }
+
+
+def _dependency_versions(cwd: Path) -> dict[str, str]:
+    return {
+        **_analysis_dependency_versions(cwd),
+        **_tailoring_dependency_versions(cwd),
     }
 
 
@@ -218,6 +267,14 @@ def _update_metadata(
     atomic_write_json(path, metadata)
 
 
+def _elapsed_label(elapsed_seconds: float) -> str:
+    total = max(0, int(elapsed_seconds))
+    minutes, seconds = divmod(total, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
 def run_pipeline(
     args: argparse.Namespace,
     *,
@@ -232,8 +289,91 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     hooks.progress("validating_input", "Validating the résumé and job input.")
     resume_path = _validate_resume_path(args.resume)
     timeout_seconds, antigravity_duration = args.timeout
+    retry_context = getattr(args, "retry_context", None)
+    retry_inputs = None
+    antigravity_retry_context = getattr(
+        args,
+        "antigravity_retry_context",
+        None,
+    )
+    antigravity_reprocess_context = getattr(
+        args,
+        "antigravity_reprocess_context",
+        None,
+    )
+    antigravity_retry_inputs = None
+    antigravity_reprocess_inputs = None
+    recovery_modes = sum(
+        item is not None
+        for item in (
+            retry_context,
+            antigravity_retry_context,
+            antigravity_reprocess_context,
+        )
+    )
+    if recovery_modes > 1:
+        raise InputError("Only one internal recovery mode may be active.")
+    if retry_context is not None:
+        if not isinstance(retry_context, RetryContext):
+            raise InputError("Invalid internal source-evidence retry context.")
+        if args.job_url is not None or args.clipboard or args.job_file is not None:
+            raise InputError("A source-evidence retry cannot accept new job input.")
+        retry_inputs = load_retry_inputs(
+            retry_context,
+            current_resume=resume_path,
+        )
+    if antigravity_retry_context is not None:
+        if not isinstance(
+            antigravity_retry_context,
+            AntigravityRetryContext,
+        ):
+            raise InputError("Invalid internal Antigravity recovery context.")
+        if args.job_url is not None or args.clipboard or args.job_file is not None:
+            raise InputError(
+                "An Antigravity recovery cannot accept new job input."
+            )
+        antigravity_retry_inputs = load_antigravity_retry_inputs(
+            antigravity_retry_context,
+            current_resume=resume_path,
+        )
+    if antigravity_reprocess_context is not None:
+        if not isinstance(
+            antigravity_reprocess_context,
+            AntigravityReprocessContext,
+        ):
+            raise InputError("Invalid internal Antigravity reprocessing context.")
+        if args.job_url is not None or args.clipboard or args.job_file is not None:
+            raise InputError(
+                "Antigravity reprocessing cannot accept new job input."
+            )
+        antigravity_reprocess_inputs = load_antigravity_reprocess_inputs(
+            antigravity_reprocess_context,
+            current_resume=resume_path,
+        )
+        antigravity_retry_inputs = antigravity_reprocess_inputs.retry_inputs
     requested_linkedin_url = None
-    if args.job_url is not None:
+    fetched_job: dict[str, Any] | None = None
+    if antigravity_retry_inputs is not None:
+        company = _validate_label(
+            antigravity_retry_inputs.context.company,
+            "Stored company",
+        )
+        role = _validate_label(
+            antigravity_retry_inputs.context.role,
+            "Stored role",
+        )
+        job_description = antigravity_retry_inputs.job_description
+        job_source = (
+            "antigravity-response-reprocess"
+            if antigravity_reprocess_inputs is not None
+            else "antigravity-tailoring-retry"
+        )
+    elif retry_inputs is not None:
+        company = _validate_label(retry_inputs.context.company, "Stored company")
+        role = _validate_label(retry_inputs.context.role, "Stored role")
+        job_description = retry_inputs.job_description
+        job_source = "source-evidence-retry"
+    elif args.job_url is not None:
         requested_linkedin_url = validate_linkedin_url(args.job_url)
         company: str | None = None
         role: str | None = None
@@ -254,6 +394,22 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             job_source = "job-file"
 
     source_hash = sha256_file(resume_path)
+    if (
+        retry_inputs is not None
+        and source_hash != retry_inputs.context.source_resume_sha256
+    ):
+        raise IntegrityError(
+            "The source résumé changed after retry verification; start a new run."
+        )
+    if (
+        antigravity_retry_inputs is not None
+        and source_hash
+        != antigravity_retry_inputs.context.source_resume_sha256
+    ):
+        raise IntegrityError(
+            "The source résumé changed after Antigravity recovery verification; "
+            "start a new run."
+        )
     output_dir = args.output_dir.expanduser()
     if requested_linkedin_url is not None:
         run_directory = create_unique_run_dir(
@@ -284,6 +440,28 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         "tools": {},
         "artifacts": [],
     }
+    if retry_inputs is not None:
+        metadata["retry_of"] = retry_inputs.context.source_directory.name
+        metadata["retry_kind"] = "codex-source-evidence-analysis"
+        metadata["legacy_retry_inputs_verified"] = (
+            retry_inputs.context.legacy_verified
+        )
+    if antigravity_retry_inputs is not None:
+        metadata["retry_of"] = (
+            antigravity_retry_inputs.context.source_directory.name
+        )
+        metadata["retry_kind"] = (
+            "antigravity-response-reprocess"
+            if antigravity_reprocess_inputs is not None
+            else "antigravity-tailoring"
+        )
+        metadata["approved_analysis_reused"] = True
+    if antigravity_reprocess_inputs is not None:
+        metadata["provider_calls_reused"] = {
+            "linkedin": False,
+            "codex_analysis": False,
+            "antigravity_tailoring": False,
+        }
     _update_metadata(metadata, metadata_path, run_directory=run_directory)
     hooks.progress(
         "validating_input",
@@ -294,16 +472,37 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     caught_error: ResumeTailorError | None = None
     try:
         if job_description is not None:
-            atomic_write_text(
-                run_directory / "job-description.txt",
-                job_description.rstrip() + "\n",
-            )
+            if antigravity_retry_inputs is not None:
+                atomic_write_bytes(
+                    run_directory / "job-description.txt",
+                    antigravity_retry_inputs.artifact_bytes[
+                        "job-description.txt"
+                    ],
+                )
+                job_source_bytes = antigravity_retry_inputs.artifact_bytes.get(
+                    "job-source.json"
+                )
+                if job_source_bytes is not None:
+                    atomic_write_bytes(
+                        run_directory / "job-source.json",
+                        job_source_bytes,
+                    )
+            else:
+                atomic_write_text(
+                    run_directory / "job-description.txt",
+                    job_description.rstrip() + "\n",
+                )
         metadata["stage"] = "dependency-check"
         hooks.progress(
             "validating_input",
             "Checking local pipeline dependencies and verified CLI adapters.",
         )
-        metadata["tools"] = _dependency_versions(run_directory)
+        if antigravity_retry_inputs is not None:
+            metadata["tools"] = _tailoring_dependency_versions(run_directory)
+        elif retry_inputs is not None:
+            metadata["tools"] = _analysis_dependency_versions(run_directory)
+        else:
+            metadata["tools"] = _dependency_versions(run_directory)
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
         if requested_linkedin_url is not None:
@@ -392,7 +591,56 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             )
 
         assert company is not None and role is not None and job_description is not None
-        from .docx_extract import extract_resume
+        if antigravity_retry_inputs is not None:
+            job_requirements = antigravity_retry_inputs.job_requirements
+        elif retry_inputs is not None:
+            job_requirements = retry_inputs.job_requirements
+        else:
+            job_requirements = build_job_requirement_catalog(
+                job_description,
+                structured_job=(
+                    fetched_job
+                    if fetched_job is not None and job_source == "linkedin-url"
+                    else None
+                ),
+            )
+        if antigravity_retry_inputs is not None:
+            atomic_write_bytes(
+                run_directory / "job-requirements.json",
+                antigravity_retry_inputs.artifact_bytes[
+                    "job-requirements.json"
+                ],
+            )
+        else:
+            atomic_write_json(
+                run_directory / "job-requirements.json",
+                job_requirements,
+            )
+        if (
+            retry_inputs is not None
+            and sha256_file(run_directory / "job-requirements.json")
+            != retry_inputs.context.job_requirements_sha256
+        ):
+            raise IntegrityError(
+                "The authenticated job-requirement catalog changed during retry setup; "
+                "start a new run."
+            )
+        if (
+            antigravity_retry_inputs is not None
+            and sha256_file(run_directory / "job-requirements.json")
+            != antigravity_retry_inputs.context.job_requirements_sha256
+        ):
+            raise IntegrityError(
+                "The authenticated job-requirement catalog changed during "
+                "Antigravity recovery setup; start a new run."
+            )
+        metadata["job_requirement_catalog"] = {
+            "filename": "job-requirements.json",
+            "sha256": sha256_file(run_directory / "job-requirements.json"),
+            "requirement_count": len(job_requirements["requirements"]),
+            "source_kind": job_requirements["source_kind"],
+        }
+        from .docx_extract import extract_resume, source_blocks_from_paragraphs
 
         metadata["stage"] = "extracting-master"
         hooks.progress(
@@ -403,75 +651,364 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             ),
             "Structurally validating and extracting the master résumé.",
         )
-        extracted, _ = extract_resume(resume_path)
-        atomic_write_json(
-            run_directory / "extracted-master-resume.json",
-            extracted,
+        if antigravity_retry_inputs is not None:
+            extracted = antigravity_retry_inputs.extracted_resume
+            extracted_source = extracted.get("source")
+            if (
+                not isinstance(extracted_source, dict)
+                or extracted_source.get("sha256") != source_hash
+            ):
+                raise IntegrityError(
+                    "The authenticated recovery extraction no longer matches the "
+                    "source résumé."
+                )
+        elif retry_inputs is None:
+            extracted, _ = extract_resume(resume_path)
+        else:
+            extracted = retry_inputs.extracted_resume
+            extracted_source = extracted.get("source")
+            if (
+                not isinstance(extracted_source, dict)
+                or extracted_source.get("sha256") != source_hash
+            ):
+                raise IntegrityError(
+                    "The preserved extraction no longer matches the source résumé."
+                )
+            if not isinstance(extracted.get("source_blocks"), list):
+                extracted["source_blocks"] = source_blocks_from_paragraphs(
+                    extracted["paragraphs"]
+                )
+        if antigravity_retry_inputs is not None:
+            atomic_write_bytes(
+                run_directory / "extracted-master-resume.json",
+                antigravity_retry_inputs.artifact_bytes[
+                    "extracted-master-resume.json"
+                ],
+            )
+        else:
+            atomic_write_json(
+                run_directory / "extracted-master-resume.json",
+                extracted,
+            )
+        metadata["analysis_inputs"] = analysis_input_manifest(
+            run_directory,
+            source_resume_sha256=source_hash,
         )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
-        metadata["stage"] = "codex-analysis"
-        hooks.progress(
-            "codex_analysis",
-            "Codex is performing read-only résumé-to-job evidence analysis.",
-        )
-        _update_metadata(metadata, metadata_path, run_directory=run_directory)
-        analysis = invoke_codex_analysis(
-            extracted_resume=extracted,
-            job_description=job_description,
-            company=company,
-            role=role,
-            run_directory=run_directory,
-            timeout_seconds=timeout_seconds,
-        )
-        analysis_issues = validate_analysis_evidence(analysis, extracted)
-        if analysis_issues:
-            raise TruthfulnessError(
-                "Codex analysis failed local source-evidence validation:\n"
-                + "\n".join(f"- {issue}" for issue in analysis_issues)
+        if antigravity_retry_inputs is not None:
+            metadata["stage"] = "antigravity-recovery-verification"
+            hooks.progress(
+                "antigravity_tailoring",
+                "Verifying and reusing the previously approved Codex analysis. "
+                "LinkedIn and Codex are not being invoked.",
             )
-        if hooks.approval_handler is None:
-            print(readable_analysis(analysis))
-        if analysis["questions_for_user"]:
-            questions = "\n".join(
-                f"- {question}" for question in analysis["questions_for_user"]
+            transport_bytes = antigravity_retry_inputs.artifact_bytes[
+                "codex-analysis-transport.schema.json"
+            ]
+            transport_path = (
+                run_directory / "codex-analysis-transport.schema.json"
             )
-            raise WaitingError(
-                "Codex has unanswered factual questions. The pipeline stopped "
-                f"instead of guessing:\n{questions}"
+            atomic_write_bytes(transport_path, transport_bytes)
+            source_blocks = extracted.get("source_blocks", [])
+            transport_artifact = CodexAnalysisTransportArtifact(
+                path=transport_path.resolve(),
+                sha256=antigravity_retry_inputs.context.transport_schema_sha256,
+                size_bytes=len(transport_bytes),
+                evidence_source_id_count=sum(
+                    1
+                    for block in source_blocks
+                    if isinstance(block, dict)
+                    and block.get("evidence_allowed") is True
+                ),
+                editable_source_id_count=sum(
+                    1
+                    for block in source_blocks
+                    if isinstance(block, dict)
+                    and block.get("editable") is True
+                ),
+                job_requirement_id_count=len(
+                    job_requirements["requirements"]
+                ),
             )
-        hooks.progress(
-            "reviewing_changes",
-            "Codex analysis passed local evidence checks and awaits approval.",
-        )
-        analysis_approval = hooks.approve(
-            kind="codex_analysis",
-            title="Codex analysis",
-            payload=analysis,
-            assume_yes=args.yes,
-        )
-        if analysis_approval.action != "approve":
-            raise ApprovalError(
-                "Codex analysis was not approved; artifacts were preserved."
+            validate_codex_analysis_transport_artifact(
+                transport_artifact,
+                extracted,
+                job_requirements,
+                run_directory,
             )
+            metadata["codex_analysis_transport_schema"] = (
+                transport_artifact.metadata()
+            )
+            analysis_bytes = antigravity_retry_inputs.artifact_bytes[
+                "codex-analysis-resolved.json"
+            ]
+            atomic_write_bytes(
+                run_directory / "codex-analysis-resolved.json",
+                analysis_bytes,
+            )
+            approval_bytes = antigravity_retry_inputs.artifact_bytes[
+                ANALYSIS_APPROVAL_FILENAME
+            ]
+            atomic_write_bytes(
+                run_directory / ANALYSIS_APPROVAL_FILENAME,
+                approval_bytes,
+            )
+            if (
+                sha256_file(run_directory / "codex-analysis-resolved.json")
+                != antigravity_retry_inputs.context.resolved_analysis_sha256
+                or sha256_file(run_directory / ANALYSIS_APPROVAL_FILENAME)
+                != antigravity_retry_inputs.context.approval_record_sha256
+            ):
+                raise IntegrityError(
+                    "Authenticated analysis recovery artifacts changed while "
+                    "creating the isolated run."
+                )
+            metadata["codex_analysis_approval"] = {
+                "filename": ANALYSIS_APPROVAL_FILENAME,
+                "sha256": (
+                    antigravity_retry_inputs.context.approval_record_sha256
+                ),
+                "version": 1,
+                "decision": "approved",
+            }
+            metadata["recovery_inputs"] = {
+                "source_resume_sha256": source_hash,
+                "extracted_resume_sha256": (
+                    antigravity_retry_inputs.context.extracted_resume_sha256
+                ),
+                "job_description_sha256": (
+                    antigravity_retry_inputs.context.job_description_sha256
+                ),
+                "job_requirements_sha256": (
+                    antigravity_retry_inputs.context.job_requirements_sha256
+                ),
+                "transport_schema_sha256": (
+                    antigravity_retry_inputs.context.transport_schema_sha256
+                ),
+                "resolved_analysis_sha256": (
+                    antigravity_retry_inputs.context.resolved_analysis_sha256
+                ),
+                "approval_record_sha256": (
+                    antigravity_retry_inputs.context.approval_record_sha256
+                ),
+            }
+            if antigravity_reprocess_inputs is not None:
+                atomic_write_bytes(
+                    run_directory / "antigravity-response.json",
+                    antigravity_reprocess_inputs.response_bytes,
+                )
+                atomic_write_json(
+                    run_directory / ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
+                    antigravity_reprocess_inputs.response_metadata,
+                )
+                if (
+                    sha256_file(run_directory / "antigravity-response.json")
+                    != antigravity_reprocess_inputs.context.response_sha256
+                ):
+                    raise IntegrityError(
+                        "The preserved Antigravity response changed while creating "
+                        "the isolated reprocessing run."
+                    )
+                metadata["reprocess_inputs"] = {
+                    "response_sha256": (
+                        antigravity_reprocess_inputs.context.response_sha256
+                    ),
+                    "tailoring_schema_sha256": (
+                        antigravity_reprocess_inputs.context.tailoring_schema_sha256
+                    ),
+                    "response_envelope_type": (
+                        antigravity_reprocess_inputs.context.envelope_type
+                    ),
+                    "ancestry_run": (
+                        antigravity_reprocess_inputs.context.ancestry_run
+                    ),
+                    "ancestry_metadata_sha256": (
+                        antigravity_reprocess_inputs.context.ancestry_metadata_sha256
+                    ),
+                }
+                metadata["antigravity_response"] = dict(
+                    antigravity_reprocess_inputs.response_metadata
+                )
+            analysis = antigravity_retry_inputs.approved_analysis
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+        else:
+            metadata["stage"] = "codex-analysis-schema-preflight"
+            hooks.progress(
+                "codex_analysis",
+                "Generating and validating the source-bound Codex output schema.",
+            )
+            transport_artifact = prepare_codex_analysis_transport_schema(
+                extracted,
+                job_requirements,
+                run_directory,
+            )
+            metadata["codex_analysis_transport_schema"] = (
+                transport_artifact.metadata()
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
-        metadata["stage"] = "antigravity-tailoring"
+            metadata["stage"] = "codex-analysis"
+            hooks.progress(
+                "codex_analysis",
+                "Codex analysis started. Strong reasoning may take several minutes; "
+                "no unreliable ETA is shown.",
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            raw_analysis = invoke_codex_analysis(
+                extracted_resume=extracted,
+                job_description=job_description,
+                job_requirements=job_requirements,
+                company=company,
+                role=role,
+                run_directory=run_directory,
+                timeout_seconds=timeout_seconds,
+                transport_artifact=transport_artifact,
+                progress_handler=lambda elapsed, alive: hooks.progress(
+                    "codex_analysis",
+                    (
+                        "Codex analysis is still running"
+                        if alive
+                        else (
+                            "No Codex process detected; the process exited and local "
+                            "structured-output validation is continuing"
+                        )
+                    )
+                    + f" — elapsed {_elapsed_label(elapsed)}.",
+                    elapsed_seconds=max(0, int(elapsed)),
+                    provider_process_alive=alive,
+                ),
+            )
+            analysis, analysis_issues = resolve_analysis_evidence(
+                raw_analysis,
+                extracted,
+                job_requirements,
+            )
+            if analysis_issues:
+                raise SourceEvidenceError(
+                    "Codex analysis failed local source-evidence validation:\n"
+                    + "\n".join(
+                        f"- {issue.describe()}" for issue in analysis_issues
+                    )
+                )
+            atomic_write_json(
+                run_directory / "codex-analysis-resolved.json",
+                analysis,
+            )
+            if hooks.approval_handler is None:
+                print(readable_analysis(analysis))
+            if analysis["questions_for_user"]:
+                questions = "\n".join(
+                    f"- {question}" for question in analysis["questions_for_user"]
+                )
+                raise WaitingError(
+                    "Codex has unanswered factual questions. The pipeline stopped "
+                    f"instead of guessing:\n{questions}"
+                )
+            hooks.progress(
+                "reviewing_changes",
+                "Codex analysis passed local evidence checks and awaits approval.",
+            )
+            analysis_approval = hooks.approve(
+                kind="codex_analysis",
+                title="Codex analysis",
+                payload=analysis,
+                assume_yes=args.yes,
+            )
+            if analysis_approval.action != "approve":
+                raise ApprovalError(
+                    "Codex analysis was not approved; artifacts were preserved."
+                )
+            metadata["codex_analysis_approval"] = (
+                record_codex_analysis_approval(
+                    run_directory,
+                    source_resume_sha256=source_hash,
+                    company=company,
+                    role=role,
+                    approval_mode=(
+                        "assume_yes" if args.yes else "interactive"
+                    ),
+                )
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+
+            if retry_inputs is not None:
+                metadata["stage"] = "tailoring-dependency-check"
+                hooks.progress(
+                    "antigravity_tailoring",
+                    "Checking downstream tools after the renewed analysis approval.",
+                )
+                metadata["tools"].update(
+                    _tailoring_dependency_versions(run_directory)
+                )
+                _update_metadata(
+                    metadata,
+                    metadata_path,
+                    run_directory=run_directory,
+                )
+
+        metadata["stage"] = "antigravity-tailoring-preflight"
         hooks.progress(
             "antigravity_tailoring",
-            "Antigravity is producing schema-constrained résumé content.",
+            "Authenticating the approved tailoring inputs before Antigravity.",
         )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
-        tailored_content = invoke_antigravity(
-            master_content=extracted["content"],
-            extracted_resume=extracted,
-            job_description=job_description,
-            approved_analysis=analysis,
-            company=company,
-            role=role,
-            run_directory=run_directory,
-            timeout_seconds=timeout_seconds,
-            antigravity_duration=antigravity_duration,
-        )
+        try:
+            preflight_tailoring_inputs(
+                master_content=extracted["content"],
+                extracted_resume=extracted,
+                job_description=job_description,
+                job_requirements=job_requirements,
+                approved_analysis=analysis,
+                company=company,
+                role=role,
+            )
+            metadata["antigravity_tailoring_preflight"] = (
+                verify_tailoring_run_artifacts(
+                    run_directory,
+                    source_resume_sha256=source_hash,
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    approved_analysis=analysis,
+                    company=company,
+                    role=role,
+                )
+            )
+        except AntigravityTailoringPreflightError:
+            raise
+        except InputError as exc:
+            raise AntigravityTailoringPreflightError(str(exc)) from exc
+        _update_metadata(metadata, metadata_path, run_directory=run_directory)
+
+        if antigravity_reprocess_inputs is not None:
+            metadata["stage"] = "antigravity-response-reprocessing"
+            hooks.progress(
+                "antigravity_tailoring",
+                "Reprocessing the authenticated preserved Antigravity response "
+                "entirely offline. No provider is being invoked.",
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            tailored_content = antigravity_reprocess_inputs.tailored_content
+        else:
+            metadata["stage"] = "antigravity-tailoring"
+            hooks.progress(
+                "antigravity_tailoring",
+                "Antigravity is applying the approved schema-constrained edits.",
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            tailored_content = invoke_antigravity(
+                master_content=extracted["content"],
+                extracted_resume=extracted,
+                job_description=job_description,
+                job_requirements=job_requirements,
+                approved_analysis=analysis,
+                company=company,
+                role=role,
+                run_directory=run_directory,
+                timeout_seconds=timeout_seconds,
+                antigravity_duration=antigravity_duration,
+            )
         atomic_write_json(
             run_directory / "tailored-content.json",
             tailored_content,
@@ -630,6 +1167,20 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     except ResumeTailorError as exc:
         caught_error = exc
         metadata["status"] = "FAILED"
+        if isinstance(exc, SourceEvidenceError):
+            metadata["failure_class"] = "source-evidence-analysis"
+        if isinstance(exc, AntigravityLaunchSizeError):
+            metadata["failure_class"] = "antigravity-launch-size"
+        if isinstance(exc, AntigravityResponseEnvelopeError):
+            metadata["failure_class"] = "antigravity-response-envelope"
+        if isinstance(exc, AntigravityTailoringContractError):
+            metadata["failure_class"] = "antigravity-tailoring-contract"
+        if isinstance(exc, AntigravityCannotApplyError):
+            metadata["failure_class"] = "antigravity-cannot-apply"
+        if isinstance(exc, AntigravityTechnicalFailureError):
+            metadata["failure_class"] = "antigravity-technical-failure"
+        if isinstance(exc, AntigravityTailoringPreflightError):
+            metadata["failure_class"] = "antigravity-tailoring-preflight"
         metadata["error"] = {
             "type": type(exc).__name__,
             "message": str(exc),
@@ -648,6 +1199,16 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     finally:
         if work_directory.exists() and not args.keep_workdir:
             shutil.rmtree(work_directory)
+        response_metadata = load_antigravity_response_metadata(run_directory)
+        if response_metadata is not None:
+            response_metadata.setdefault(
+                "cli_version",
+                metadata.get("tools", {}).get(
+                    "antigravity",
+                    "unavailable",
+                ),
+            )
+            metadata["antigravity_response"] = response_metadata
         actual_hash = sha256_file(resume_path) if resume_path.is_file() else None
         unchanged = actual_hash == source_hash
         metadata["source_resume"]["sha256_after"] = actual_hash
