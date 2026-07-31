@@ -62,6 +62,54 @@ def test_successful_linkedin_extraction(
 
 
 @pytest.mark.parametrize(
+    "mode",
+    [
+        "print_response_string",
+        "print_response_object",
+        "nested_response_structured_output",
+    ],
+)
+def test_antigravity_118_documented_linkedin_response_envelopes(
+    mode: str,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUB_LINKEDIN_MODE", mode)
+
+    payload = _invoke(tmp_path=tmp_path, stubs_on_path=stubs_on_path)
+
+    assert payload["fetch_status"] == "success"
+    assert payload["requested_url"] == JOB_URL
+    assert payload["linkedin_job_id"] == "4123456789"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "print_response_prose",
+        "print_response_fenced",
+        "ambiguous_response",
+        "schema_mismatch",
+    ],
+)
+def test_linkedin_response_envelope_rejects_unsafe_or_ambiguous_candidates(
+    mode: str,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUB_LINKEDIN_MODE", mode)
+
+    with pytest.raises(ModelError, match="unsupported response format|ambiguous"):
+        _invoke(tmp_path=tmp_path, stubs_on_path=stubs_on_path)
+
+    payload = json.loads((tmp_path / "job-source.json").read_text(encoding="utf-8"))
+    assert payload["fetch_status"] == "extraction_failed"
+    assert payload["requested_url"] == JOB_URL
+
+
+@pytest.mark.parametrize(
     ("company", "title"),
     [
         ("Northwind Research", "LLM Engineer"),
