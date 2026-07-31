@@ -18,11 +18,13 @@ The web UI is optional. `tailor-resume` remains the complete terminal interface;
 
 ## Pipeline architecture
 
-1. Read a job posting from the Linux clipboard or a UTF-8 text file, or ask
-   Antigravity to read and strictly extract one public LinkedIn job URL.
+1. Read a job posting from the Linux clipboard or a UTF-8 text file, or retrieve
+   one public LinkedIn job-detail URL through Apify (preferred when configured)
+   or the explicit Antigravity fallback.
 2. For URL mode, validate HTTPS/hostname/path/redirect/job-ID consistency, save
-   `job-source.json`, consume one typed terminal `stream-json` result, display
-   the derived posting identity, and require approval.
+   canonical `job-source.json`, display the locally derived posting identity,
+   and require approval. Apify output is allowlist-mapped and schema-validated
+   by Python; it is never sent to Antigravity for reparsing.
 3. Validate and structurally extract the master DOCX with `python-docx`.
 4. Send the extracted resume and untrusted posting to Codex in an ephemeral,
    read-only session with a strict analysis schema.
@@ -327,8 +329,45 @@ LinkedIn URL mode derives the company and title from the fetched posting, so
 tailor-resume \
   --resume "/absolute/path/master_resume.docx" \
   --job-url "https://www.linkedin.com/jobs/view/example-ai-role-1234567890/" \
+  --linkedin-provider auto \
   --output-dir "$HOME/Documents/Resumes/Tailored"
 ```
+
+`--linkedin-provider auto` chooses Apify when a local Apify token is configured
+and otherwise chooses Antigravity. `apify` and `antigravity` are available as
+explicit values. Once a provider starts, Resume Tailor never silently calls the
+other provider after a failure; this avoids duplicate disclosure, cost, and
+ambiguous provenance.
+
+Apify URL mode uses the community Actor
+[`piotrv1001/linkedin-job-details-scraper`](https://apify.com/piotrv1001/linkedin-job-details-scraper),
+which accepts an exact job-detail URL in its required `searchUrls` array.
+Resume Tailor sends only the normalized URL, retrieves at most five dataset
+items, selects exactly one matching job ID, strips HTML locally, and validates
+the existing canonical LinkedIn schema. Actor output is not treated as trusted
+instructions and is not interpreted by another model.
+
+For desktop-launcher use, store the token in the fixed private configuration
+file rather than another repository's `.env`:
+
+```bash
+mkdir -p "$HOME/.config/resume-tailor"
+chmod 700 "$HOME/.config/resume-tailor"
+install -m 600 /dev/null "$HOME/.config/resume-tailor/apify-token"
+${EDITOR:-nano} "$HOME/.config/resume-tailor/apify-token"
+```
+
+Paste only the token, save, and close the editor. Resume Tailor rejects
+symlinks, non-user-owned token files, files with group/other access, whitespace
+inside tokens, and files over 4 KiB. `APIFY_API_TOKEN` is an equivalent
+environment-only configuration for terminal launches. The application never
+copies or reads the Job Source Agent `.env`, never places the token in a URL,
+and never writes it to run metadata or diagnostics.
+
+The default Actor can be changed explicitly with
+`RESUME_TAILOR_APIFY_ACTOR=owner/actor-name`. Community Actor interfaces can
+change, so every response still fails closed against local URL, job-ID, size,
+shape, and canonical-schema checks.
 
 Only public `https://linkedin.com/jobs/view/...` and
 `https://www.linkedin.com/jobs/view/...` URLs are accepted initially. Tracking
@@ -352,6 +391,7 @@ Complete interface:
 tailor-resume --resume PATH
               ((--clipboard | --job-file PATH) --company NAME --role NAME
                | --job-url HTTPS_LINKEDIN_JOB_URL)
+              [--linkedin-provider {auto,apify,antigravity}]
               [--output-dir PATH]
               [--yes]
               [--keep-workdir]
@@ -410,6 +450,7 @@ new mode-0700 directory with sanitized company/role names and a timestamp:
 ```text
 rg-talent-agentic-ai-developer-YYYYMMDD-HHMMSS/
 ├── job-source.json               # URL mode only
+├── apify-job-response.json       # Apify URL mode, content-free provenance
 ├── job-description.txt
 ├── job-requirements.json
 ├── extracted-master-resume.json
@@ -445,10 +486,12 @@ technologies/skills, AI focus areas, and extraction warnings.
 - The master resume is the only factual authority.
 - Job descriptions are untrusted prompt-injection input and are placed inside
   unique, explicit data-only boundaries in both model prompts.
-- LinkedIn pages are also untrusted. URL acquisition uses sandboxed Antigravity
-  plan mode, a strict schema, and instructions limited to passive `read_url`.
-  Page text cannot authorize file access, commands, browser interaction, Apply
-  actions, authentication, resume edits, or pipeline changes.
+- LinkedIn pages and provider output are also untrusted. Apify output is mapped
+  through a fixed local allowlist and canonical schema without a model parsing
+  pass. The Antigravity fallback uses sandboxed plan mode, a strict schema, and
+  instructions limited to passive `read_url`. Neither path can authorize file
+  access, commands, Apply actions, authentication, resume edits, or pipeline
+  changes.
 - URL mode accepts only HTTPS LinkedIn job paths without credentials. Requested,
   final, and extracted job IDs are compared locally; a different posting or
   external redirect is rejected before Codex sees any description.
@@ -460,9 +503,11 @@ technologies/skills, AI focus areas, and extraction warnings.
 - RAG, GraphQL, observability, distributed production scale, IVR platforms, or
   any other absent skill cannot be introduced.
 - Models cannot add sections, projects, skill groups, or bullets.
-- No model edits files. LinkedIn retrieval uses Antigravity `--mode=plan`;
-  post-approval tailoring uses sandboxed print mode without generic plan or
-  edit-acceptance mode. Codex runs with `--sandbox read-only` and `--ephemeral`.
+- No model edits files. Apify retrieval uses HTTPS with bearer-header
+  authentication and cancellable run polling. Antigravity fallback retrieval
+  uses `--mode=plan`; post-approval tailoring uses sandboxed print mode without
+  generic plan or edit-acceptance mode. Codex runs with `--sandbox read-only`
+  and `--ephemeral`.
 - The pipeline never uses `eval`, `shell=True`, dangerous permission bypasses,
   recursive agent calls, destructive Git commands, or source-file overwrite.
 - It does not send email, post to LinkedIn, submit applications, or upload output.
@@ -475,11 +520,12 @@ adjust the structured request or master rather than bypassing the check.
 
 ## Privacy disclosure
 
-When a real pipeline runs, resume content and the job description are sent
-through the authenticated Codex and Antigravity services. In URL mode,
-Antigravity also receives and passively reads the supplied public LinkedIn URL.
-The final PNG is sent to Codex for visual QA. Review those services' data
-controls before use.
+When a real pipeline runs, résumé content and the job description are sent
+through the configured analysis and tailoring services. In Apify URL mode,
+Apify receives the supplied public LinkedIn URL and retrieves the posting;
+Antigravity is not used to parse that posting. In Antigravity URL mode,
+Antigravity passively reads the supplied public LinkedIn URL. The final PNG is
+sent to Codex for visual QA. Review those services' data controls before use.
 
 Generated artifacts otherwise remain on the local filesystem unless you
 explicitly upload or share them. No keys or environment variables are logged.
@@ -590,6 +636,29 @@ Clipboard mode is an equivalent fallback.
 
 In the web UI, return to the dashboard and select **Clipboard text** or **Text
 file**. The failed URL run remains visible with its safe diagnostic artifacts.
+
+### Apify is not configured
+
+Choose **Apify job details** only after configuring `APIFY_API_TOKEN` or the
+private `~/.config/resume-tailor/apify-token` file described above.
+**Automatic** uses Apify when either configuration is present and otherwise
+selects Antigravity before the run begins. It does not fall through to
+Antigravity after an Apify run starts or fails.
+
+Apify diagnostics are content-free: actor/run/build/dataset identifiers,
+selected field names and types, byte counts, hashes, and validation status are
+recorded in `apify-job-response.json`; the provider response body and token are
+omitted. `job-source.json` remains the canonical, human-approved posting
+artifact.
+
+### Apify Actor output changed
+
+An Actor can be updated independently because it is community-maintained.
+Missing title/company/description, multiple results, a mismatched job ID,
+unexpected object shape, unsafe control text, oversized content, or a failed
+Actor run stops before Codex. Explicitly choose Antigravity, pasted text, or a
+UTF-8 job file while reviewing the Actor change; Resume Tailor never performs
+automatic paid-provider failover.
 
 ### Expired or unavailable LinkedIn posting
 
@@ -704,6 +773,10 @@ Development and inspection verified these local interfaces:
   `--output-format json` for tailoring, `--output-format stream-json` with an
   `event=result` terminal envelope for LinkedIn retrieval,
   `--json-schema`, and `--print-timeout`.
+- Apify API v2: bearer-header authentication, asynchronous Actor runs,
+  run-status polling, best-effort run abort, and default-dataset item retrieval.
+  The default community Actor contract uses
+  `piotrv1001/linkedin-job-details-scraper` with one `searchUrls` item.
 - LibreOffice `26.2.4.2`.
 - Poppler `26.07.0`.
 - FastAPI `0.119.1`, Starlette `0.48.0`, Uvicorn `0.52.0`, Jinja2 `3.1.6`,

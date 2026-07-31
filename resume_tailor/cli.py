@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .apify_job import invoke_apify_job_extraction, resolve_linkedin_provider
 from .antigravity_writer import (
     ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
     invoke_antigravity,
@@ -47,6 +48,8 @@ from .schemas import (
     validate_codex_analysis_transport_artifact,
 )
 from .utilities import (
+    ApifyConfigurationError,
+    ApifyProviderError,
     ApprovalError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
@@ -106,7 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--job-file", type=Path, help="UTF-8 job-description file")
     source.add_argument(
         "--job-url",
-        help="public HTTPS LinkedIn /jobs/view/ URL to extract with Antigravity",
+        help="public HTTPS LinkedIn /jobs/view/ URL to retrieve and validate",
+    )
+    parser.add_argument(
+        "--linkedin-provider",
+        choices=("auto", "apify", "antigravity"),
+        default="auto",
+        help=(
+            "URL retrieval provider: auto prefers Apify when APIFY_API_TOKEN is "
+            "configured, otherwise Antigravity (default: auto)"
+        ),
     )
     parser.add_argument(
         "--company",
@@ -154,6 +166,8 @@ def _validate_mode_arguments(
                 "derived from the fetched posting"
             )
         return
+    if args.linkedin_provider != "auto":
+        parser.error("--linkedin-provider is only valid with --job-url")
     if args.company is None or args.role is None:
         parser.error(
             "--company and --role are required with --clipboard or --job-file"
@@ -353,6 +367,8 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         )
         antigravity_retry_inputs = antigravity_reprocess_inputs.retry_inputs
     requested_linkedin_url = None
+    linkedin_provider_requested = getattr(args, "linkedin_provider", "auto")
+    linkedin_provider_resolved: str | None = None
     fetched_job: dict[str, Any] | None = None
     if antigravity_retry_inputs is not None:
         company = _validate_label(
@@ -376,6 +392,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         job_source = "source-evidence-retry"
     elif args.job_url is not None:
         requested_linkedin_url = validate_linkedin_url(args.job_url)
+        linkedin_provider_resolved = resolve_linkedin_provider(
+            linkedin_provider_requested
+        )
         company: str | None = None
         role: str | None = None
         job_description: str | None = None
@@ -508,22 +527,47 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
 
         if requested_linkedin_url is not None:
             metadata["stage"] = "linkedin-job-extraction"
+            assert linkedin_provider_resolved is not None
+            provider_label = (
+                "Apify"
+                if linkedin_provider_resolved == "apify"
+                else "Antigravity"
+            )
             hooks.progress(
                 "fetching_job",
-                "Antigravity is passively extracting the public LinkedIn posting.",
+                f"{provider_label} is retrieving the public LinkedIn posting.",
             )
+            metadata["linkedin_retrieval"] = {
+                "requested_provider": linkedin_provider_requested,
+                "resolved_provider": linkedin_provider_resolved,
+                "automatic_fallback": False,
+            }
             metadata["linkedin_job"] = {
                 "requested_url": requested_linkedin_url.normalized,
                 "final_resolved_url": None,
                 "linkedin_job_id": requested_linkedin_url.job_id,
             }
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            fetched_job = invoke_linkedin_job_extraction(
-                requested_url=requested_linkedin_url,
-                run_directory=run_directory,
-                timeout_seconds=timeout_seconds,
-                antigravity_duration=antigravity_duration,
-            )
+            if linkedin_provider_resolved == "apify":
+                fetched_job = invoke_apify_job_extraction(
+                    requested_url=requested_linkedin_url,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    progress_handler=lambda elapsed, status: hooks.progress(
+                        "fetching_job",
+                        (
+                            "Apify job-detail retrieval is still running "
+                            f"({_elapsed_label(elapsed)}; status {status})."
+                        ),
+                    ),
+                )
+            else:
+                fetched_job = invoke_linkedin_job_extraction(
+                    requested_url=requested_linkedin_url,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    antigravity_duration=antigravity_duration,
+                )
             job_description = fetched_job["normalized_job_description"]
             atomic_write_text(
                 run_directory / "job-description.txt",
@@ -1170,6 +1214,10 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         metadata["status"] = "FAILED"
         if isinstance(exc, SourceEvidenceError):
             metadata["failure_class"] = "source-evidence-analysis"
+        if isinstance(exc, ApifyConfigurationError):
+            metadata["failure_class"] = "apify-configuration"
+        if isinstance(exc, ApifyProviderError):
+            metadata["failure_class"] = "apify-retrieval"
         if isinstance(exc, AntigravityLaunchSizeError):
             metadata["failure_class"] = "antigravity-launch-size"
         if isinstance(exc, LinkedInResponseEnvelopeError):

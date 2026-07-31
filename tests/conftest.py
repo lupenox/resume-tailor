@@ -61,6 +61,8 @@ def stubs_on_path(monkeypatch: pytest.MonkeyPatch, repository_root: Path) -> Pat
         "STUB_LINKEDIN_FINAL_URL",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("APIFY_API_TOKEN", raising=False)
+    monkeypatch.delenv("RESUME_TAILOR_APIFY_ACTOR", raising=False)
     return stubs
 
 

@@ -431,6 +431,20 @@
                 <strong>Use another job input</strong>
                 <span>Start a new run with a UTF-8 job file or pasted description. Retry URL retrieval only after the provider-format problem is corrected.</span>
               </div>
+            {% elif run.failure_kind in ["apify_configuration", "apify_retrieval"] %}
+              <div class="alert alert-warning">
+                {% if run.failure_kind == "apify_configuration" %}
+                  <strong>Apify configuration required</strong>
+                  <span>Configure APIFY_API_TOKEN in the local launcher environment. The token is never stored in run artifacts or shown in the UI.</span>
+                {% else %}
+                  <strong>Apify job-detail retrieval failed</strong>
+                  <span>Apify did not return exactly one locally verifiable, schema-valid record for this job URL.</span>
+                {% endif %}
+              </div>
+              <div class="alert alert-info">
+                <strong>Choose a bounded fallback</strong>
+                <span>Start a new run and explicitly choose Antigravity, pasted text, or a UTF-8 job file. Resume Tailor does not silently call a second provider.</span>
+              </div>
             {% elif run.failure_kind in ["antigravity_launch_size", "antigravity_response_envelope", "antigravity_tailoring_contract", "antigravity_cannot_apply", "antigravity_technical_failure"] %}
               <div class="alert alert-warning">
                 {% if run.failure_kind == "antigravity_launch_size" %}

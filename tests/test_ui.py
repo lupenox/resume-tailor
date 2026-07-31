@@ -21,6 +21,8 @@ from resume_tailor.schemas import load_schema
 from resume_tailor.ui import COOKIE_NAME, DEFAULT_HOST, create_app
 from resume_tailor.ui_cli import build_parser as build_ui_parser
 from resume_tailor.utilities import (
+    ApifyConfigurationError,
+    ApifyProviderError,
     CancellationError,
     CodexSchemaCompatibilityError,
     AntigravityLaunchSizeError,
@@ -713,6 +715,35 @@ def test_successful_job_confirmation_and_continuation(
     asyncio.run(scenario())
 
 
+def test_url_mode_preserves_explicit_apify_provider(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = StubbedUIPipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(
+                client,
+                token,
+                extra={"linkedin_provider": "apify"},
+            )
+            await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
+            assert pipeline.namespaces[0].linkedin_provider == "apify"
+            page = await client.get("/")
+            assert "Automatic — Apify when configured" in page.text
+            assert "Apify job details" in page.text
+            assert "Antigravity fallback" in page.text
+
+    asyncio.run(scenario())
+
+
 def test_rejected_job_confirmation_stops_before_codex(
     master_resume: Path,
     tmp_path: Path,
@@ -861,6 +892,65 @@ def test_failed_fetch_and_permission_denial(
             page = await client.get(f"/runs/{run_id}")
             assert "pipeline stopped safely" in page.text
             assert "text file or pasted description" in page.text
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            ApifyConfigurationError("APIFY_API_TOKEN is missing."),
+            "Apify configuration required",
+        ),
+        (
+            ApifyProviderError("Provider response content was omitted."),
+            "Apify job-detail retrieval failed",
+        ),
+    ],
+)
+def test_apify_failures_are_stage_specific_and_sanitized(
+    error: Exception,
+    expected: str,
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    def failing_pipeline(
+        args: argparse.Namespace,
+        *,
+        hooks: PipelineHooks,
+    ) -> Path:
+        run_directory = args.output_dir / "apify-failure"
+        run_directory.mkdir(mode=0o700)
+        hooks.progress(
+            "fetching_job",
+            "Retrieving the posting with Apify.",
+            run_directory=str(run_directory),
+        )
+        raise error
+
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=failing_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(
+                client,
+                token,
+                extra={"linkedin_provider": "apify"},
+            )
+            failed = await _wait(app, run_id, "FAILED")
+            assert "synthetic-secret-token" not in failed["message"]
+            assert "PRIVATE POSTING" not in failed["message"]
+            page = await client.get(f"/runs/{run_id}")
+            assert expected in page.text
+            assert "does not silently call a second provider" in page.text
+            assert "synthetic-secret-token" not in page.text
+            assert "PRIVATE POSTING" not in page.text
 
     asyncio.run(scenario())
 
