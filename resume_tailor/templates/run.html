@@ -422,6 +422,15 @@
                   <span>{{ run.retry_reason }}</span>
                 </div>
               {% endif %}
+            {% elif run.failure_kind == "linkedin_response_envelope" %}
+              <div class="alert alert-warning">
+                <strong>LinkedIn response-format failure</strong>
+                <span>Antigravity did not return one documented, schema-valid LinkedIn result. No résumé analysis or tailoring was started.</span>
+              </div>
+              <div class="alert alert-info">
+                <strong>Use another job input</strong>
+                <span>Start a new run with a UTF-8 job file or pasted description. Retry URL retrieval only after the provider-format problem is corrected.</span>
+              </div>
             {% elif run.failure_kind in ["antigravity_launch_size", "antigravity_response_envelope", "antigravity_tailoring_contract", "antigravity_cannot_apply", "antigravity_technical_failure"] %}
               <div class="alert alert-warning">
                 {% if run.failure_kind == "antigravity_launch_size" %}

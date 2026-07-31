@@ -1,12 +1,25 @@
 # Antigravity response-envelope contract
 
-## Incident
+## Incidents
 
 Antigravity CLI 1.1.8 completed a sandboxed print-mode process and returned its
 documented JSON wrapper, but the wrapper had no `structured_output` field. Its
 `response` value contained prose followed by several separate JSON-like objects.
 None was a complete value accepted by the tailoring schema. This was a response
 envelope/structured-output failure, not missing résumé or job information.
+
+LinkedIn retrieval later exposed a separate protocol mismatch. The adapter asked
+for ordinary JSON and expected a single legacy wrapper shape, while the current
+CLI documents NDJSON `stream-json` events whose terminal record is:
+
+```json
+{"event":"result","result":{"structured_output":{},"response":"{}"}}
+```
+
+The documented terminal envelope can contain the same schema result twice:
+once as `structured_output` and once as a complete JSON string in `response`.
+Those byte-independent but canonically identical copies are one result, not an
+ambiguity.
 
 The preserved diagnostic was inspected and replayed read-only. This document and
 the regression fixtures contain only synthetic structure; they do not contain a
@@ -22,13 +35,17 @@ accepts only one unambiguous whole-document candidate:
 - the current stage's schema object at the JSON root;
 - one documented JSON-wrapper field whose object or complete JSON string is the
   candidate;
-- one terminal `result` event in Antigravity 1.1.8 `stream-json`, with the
-  documented closed-vocabulary `step_type` discriminator.
+- one current terminal `{"event":"result","result":{...}}` event in
+  Antigravity 1.1.8 `stream-json`;
+- one legacy terminal `step_type=result` event for backward compatibility.
 
 A string candidate is decoded exactly once as one JSON document. Local code does
-not scan prose for braces, strip Markdown fences, join fragments, or choose among
-multiple candidates. Missing, malformed, ambiguous, schema-mismatched, or
-schema-invalid output is rejected before content validation or rendering.
+not scan prose for braces, strip Markdown fences, join fragments, or choose
+among conflicting candidates. Multiple documented fields are accepted only
+when their complete decoded JSON values are canonically identical; the
+authoritative `structured_output` field is then preferred. Missing, malformed,
+conflicting, schema-mismatched, or schema-invalid output is rejected before
+content validation or rendering.
 
 Every accepted candidate is validated against its stage's canonical schema.
 Tailoring is then validated against the local approved-edit and
@@ -38,6 +55,16 @@ minimum substantive-description rules. Run metadata records the CLI version,
 mode, output format, envelope type, schema hash, response-artifact hash, and
 validation result where applicable. Logs and exceptions contain no provider
 response text.
+
+LinkedIn URL retrieval deliberately requests `stream-json` so it can identify
+one typed terminal event without scraping provider prose. A content-free
+`linkedin-response-envelope.json` diagnostic records only sizes, hashes,
+field names/types, event types, schema-match state, and validation status.
+It never retains the posting or provider response. Retrieval envelope failures
+remain stage-2 failures and never offer post-approval tailoring recovery.
+
+The protocol shapes above follow Antigravity's official headless CLI reference:
+<https://antigravity.google/docs/cli/headless>.
 
 ## Recovery
 

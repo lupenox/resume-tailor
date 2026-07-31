@@ -24,6 +24,7 @@ from resume_tailor.utilities import (
     CancellationError,
     CodexSchemaCompatibilityError,
     AntigravityLaunchSizeError,
+    ExitCode,
     InputError,
     atomic_write_json,
     sha256_file,
@@ -1179,6 +1180,59 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
         for path in source_run.iterdir()
         if path.is_file()
     }
+
+
+def test_linkedin_envelope_failure_shows_retrieval_only_recovery(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_directory = tmp_path / "output"
+    monkeypatch.setenv("STUB_LINKEDIN_MODE", "print_response_prose")
+    monkeypatch.setattr(
+        cli_module,
+        "_dependency_versions",
+        lambda _cwd: {
+            "resume_tailor": "0.1.0",
+            "codex": "stub",
+            "antigravity": "stub",
+        },
+    )
+    code = cli_module.main(
+        [
+            "--resume",
+            str(master_resume),
+            "--job-url",
+            JOB_URL,
+            "--output-dir",
+            str(output_directory),
+            "--timeout",
+            "30s",
+        ]
+    )
+    assert code == ExitCode.MODEL
+    source_run = next(output_directory.iterdir())
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            await _session(client)
+            page = await client.get(f"/runs/history-{source_run.name}")
+            assert page.status_code == 200
+            assert "LinkedIn response-format failure" in page.text
+            assert "Use another job input" in page.text
+            assert "No résumé analysis or tailoring was started" in page.text
+            assert "linkedin-response-envelope.json" in page.text
+            assert "Retry Antigravity tailoring" not in page.text
+            assert "Reprocess preserved Antigravity response" not in page.text
+            assert "Offline reprocessing unavailable" not in page.text
+            assert "New run required" not in page.text
+
+    asyncio.run(scenario())
 
 
 def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(

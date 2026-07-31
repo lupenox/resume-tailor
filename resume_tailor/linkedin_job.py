@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -7,18 +9,25 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-from .antigravity_response import locate_json_candidate
+from .antigravity_response import (
+    AntigravityResponseCandidate,
+    locate_json_candidate,
+    parse_stream_json_envelope,
+)
 from .antigravity_transport import (
+    antigravity_parse_diagnostic,
     antigravity_process_failure,
     run_antigravity_prompt,
 )
-from .schemas import load_schema, parse_json_text, schema_path, validate_payload
+from .schemas import load_schema, schema_path, validate_payload
 from .utilities import (
     InputError,
+    LinkedInResponseEnvelopeError,
     ModelError,
     atomic_write_json,
     atomic_write_text,
     require_executable,
+    sha256_file,
 )
 
 
@@ -38,6 +47,7 @@ _JOB_PATH_RE = re.compile(r"^/jobs/view/[^/]+/?$")
 _JOB_ID_RE = re.compile(r"(?:^|-)([0-9]{5,20})$")
 _MINIMUM_DESCRIPTION_CHARACTERS = 200
 _MINIMUM_DESCRIPTION_WORDS = 30
+LINKEDIN_RESPONSE_METADATA_FILENAME = "linkedin-response-envelope.json"
 _LINKEDIN_FIELDS = frozenset(
     {
         "fetch_status",
@@ -197,12 +207,115 @@ EXTRACTION RULES
 """
 
 
-def _structured_candidate(payload: Any) -> Any:
+def _structured_candidate(payload: Any) -> AntigravityResponseCandidate:
     return locate_json_candidate(
         payload,
         required_fields=_LINKEDIN_FIELDS,
         expected_schema=load_schema("linkedin_job.schema.json"),
-    ).payload
+    )
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _content_free_response_metadata(
+    *,
+    result: Any,
+    events: list[dict[str, Any]],
+    envelope: dict[str, Any] | None,
+    envelope_type: str,
+    validation_result: str,
+) -> dict[str, Any]:
+    stdout = result.stdout.encode("utf-8")
+    response = envelope.get("response") if envelope is not None else None
+    response_bytes = (
+        response.encode("utf-8") if isinstance(response, str) else b""
+    )
+    parsed_response: Any = None
+    response_is_exact_json = False
+    if isinstance(response, str):
+        try:
+            parsed_response = json.loads(response)
+        except json.JSONDecodeError:
+            pass
+        else:
+            response_is_exact_json = True
+    embedded_schema = (
+        envelope.get("json_schema") if envelope is not None else None
+    )
+    expected_schema = load_schema("linkedin_job.schema.json")
+    return {
+        "version": 1,
+        "provider": "antigravity",
+        "execution_mode": "print",
+        "agent_mode": "plan",
+        "output_format": "stream-json",
+        "returncode": result.returncode,
+        "response_envelope_type": envelope_type,
+        "validation_result": validation_result,
+        "event_count": len(events),
+        "event_types": [
+            str(event.get("event") or event.get("step_type") or "unknown")
+            for event in events
+        ],
+        "terminal_keys": sorted(envelope) if envelope is not None else [],
+        "terminal_status": (
+            str(envelope.get("status"))
+            if envelope is not None and envelope.get("status") is not None
+            else None
+        ),
+        "terminal_field_types": (
+            {
+                field: type(envelope[field]).__name__
+                for field in (
+                    "structured_output",
+                    "response",
+                    "result",
+                    "json_schema",
+                    "error",
+                )
+                if field in envelope
+            }
+            if envelope is not None
+            else {}
+        ),
+        "embedded_schema_present": embedded_schema is not None,
+        "embedded_schema_matches": (
+            isinstance(embedded_schema, dict)
+            and _canonical_json(embedded_schema) == _canonical_json(expected_schema)
+        ),
+        "stdout_bytes": len(stdout),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "response_bytes": len(response_bytes),
+        "response_sha256": (
+            hashlib.sha256(response_bytes).hexdigest()
+            if response_bytes
+            else None
+        ),
+        "response_is_exact_json": response_is_exact_json,
+        "response_json_type": (
+            type(parsed_response).__name__ if response_is_exact_json else None
+        ),
+        "schema_sha256": sha256_file(schema_path("linkedin_job.schema.json")),
+        "provider_output_omitted": True,
+    }
+
+
+def _linkedin_envelope_error(
+    *,
+    envelope_type: str,
+) -> LinkedInResponseEnvelopeError:
+    return LinkedInResponseEnvelopeError(
+        "Antigravity LinkedIn retrieval did not return one documented "
+        "structured-output result.",
+        envelope_type=envelope_type,
+    )
 
 
 def _diagnostic_payload(requested_url: str, warning: str) -> dict[str, Any]:
@@ -410,6 +523,7 @@ def invoke_linkedin_job_extraction(
 ) -> dict[str, Any]:
     agy = executable or require_executable("agy")
     artifact_path = run_directory / "job-source.json"
+    response_metadata_path = run_directory / LINKEDIN_RESPONSE_METADATA_FILENAME
     prompt = build_linkedin_extraction_prompt(requested_url.normalized)
     try:
         result = run_antigravity_prompt(
@@ -421,6 +535,7 @@ def invoke_linkedin_job_extraction(
             cwd=run_directory,
             timeout_seconds=timeout_seconds + 10,
             agent_mode="plan",
+            output_format="stream-json",
         )
     except ModelError as exc:
         atomic_write_json(
@@ -429,23 +544,94 @@ def invoke_linkedin_job_extraction(
         )
         raise
 
+    events: list[dict[str, Any]] = []
+    raw_payload: dict[str, Any] | None = None
+    stream_type = "stream-json-unparsed"
     try:
-        raw_payload = parse_json_text(result.stdout, label="LinkedIn Antigravity")
+        events, raw_payload, stream_type = parse_stream_json_envelope(result.stdout)
+    except ModelError as exc:
+        diagnostic = antigravity_parse_diagnostic(result)
+        diagnostic.update(
+            {
+                "provider": "antigravity",
+                "agent_mode": "plan",
+                "output_format": "stream-json",
+                "response_envelope_type": getattr(
+                    exc,
+                    "envelope_type",
+                    "stream-json-parse-failure",
+                ),
+                "validation_result": "REJECTED",
+            }
+        )
+        atomic_write_json(response_metadata_path, diagnostic)
+        atomic_write_json(
+            artifact_path,
+            _diagnostic_payload(requested_url.normalized, str(exc)),
+        )
+        raise _linkedin_envelope_error(
+            envelope_type=str(diagnostic["response_envelope_type"]),
+        ) from exc
+
+    try:
         try:
-            candidate = _structured_candidate(raw_payload)
-        except ModelError:
-            candidate = _soft_permission_payload(
+            located = _structured_candidate(raw_payload)
+            candidate = located.payload
+            envelope_type = f"{stream_type}:{located.envelope_type}"
+        except ModelError as exc:
+            soft_candidate = _soft_permission_payload(
                 raw_payload,
                 requested_url=requested_url.normalized,
             )
-            if candidate is None:
-                raise
+            if soft_candidate is None:
+                metadata = _content_free_response_metadata(
+                    result=result,
+                    events=events,
+                    envelope=raw_payload,
+                    envelope_type=(
+                        f"{stream_type}:"
+                        f"{getattr(exc, 'envelope_type', 'unsupported')}"
+                    ),
+                    validation_result="REJECTED",
+                )
+                atomic_write_json(response_metadata_path, metadata)
+                raise _linkedin_envelope_error(
+                    envelope_type=str(metadata["response_envelope_type"]),
+                ) from exc
+            candidate = soft_candidate
+            envelope_type = f"{stream_type}:soft-permission"
         validate_payload(
             candidate,
             "linkedin_job.schema.json",
             label="LinkedIn extraction",
         )
+        atomic_write_json(
+            response_metadata_path,
+            _content_free_response_metadata(
+                result=result,
+                events=events,
+                envelope=raw_payload,
+                envelope_type=envelope_type,
+                validation_result="PASS",
+            ),
+        )
     except ModelError as exc:
+        if not response_metadata_path.is_file():
+            rejected_envelope_type = (
+                envelope_type
+                if "envelope_type" in locals()
+                else f"{stream_type}:schema-invalid"
+            )
+            atomic_write_json(
+                response_metadata_path,
+                _content_free_response_metadata(
+                    result=result,
+                    events=events,
+                    envelope=raw_payload,
+                    envelope_type=rejected_envelope_type,
+                    validation_result="REJECTED",
+                ),
+            )
         atomic_write_json(
             artifact_path,
             _diagnostic_payload(requested_url.normalized, str(exc)),

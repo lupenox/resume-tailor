@@ -11,7 +11,7 @@ from resume_tailor.linkedin_job import (
     posting_confirmation_text,
     validate_linkedin_url,
 )
-from resume_tailor.utilities import InputError, ModelError
+from resume_tailor.utilities import InputError, LinkedInResponseEnvelopeError, ModelError
 
 
 JOB_URL = "https://www.linkedin.com/jobs/view/general-ai-role-4123456789/"
@@ -48,6 +48,16 @@ def test_successful_linkedin_extraction(
     assert payload["technologies_and_skills"]
     saved = json.loads((tmp_path / "job-source.json").read_text(encoding="utf-8"))
     assert saved == payload
+    envelope = json.loads(
+        (tmp_path / "linkedin-response-envelope.json").read_text(encoding="utf-8")
+    )
+    assert envelope["output_format"] == "stream-json"
+    assert envelope["event_types"] == ["init", "step_update", "result"]
+    assert envelope["validation_result"] == "PASS"
+    assert envelope["provider_output_omitted"] is True
+    assert envelope["response_envelope_type"].endswith(
+        ":json-wrapper-structured_output"
+    )
     confirmation = posting_confirmation_text(payload)
     for expected in (
         payload["company"],
@@ -101,12 +111,23 @@ def test_linkedin_response_envelope_rejects_unsafe_or_ambiguous_candidates(
 ) -> None:
     monkeypatch.setenv("STUB_LINKEDIN_MODE", mode)
 
-    with pytest.raises(ModelError, match="unsupported response format|ambiguous"):
+    with pytest.raises(
+        LinkedInResponseEnvelopeError,
+        match="did not return one documented",
+    ):
         _invoke(tmp_path=tmp_path, stubs_on_path=stubs_on_path)
 
     payload = json.loads((tmp_path / "job-source.json").read_text(encoding="utf-8"))
     assert payload["fetch_status"] == "extraction_failed"
     assert payload["requested_url"] == JOB_URL
+    envelope = json.loads(
+        (tmp_path / "linkedin-response-envelope.json").read_text(encoding="utf-8")
+    )
+    assert envelope["validation_result"] == "REJECTED"
+    assert envelope["provider_output_omitted"] is True
+    serialized = json.dumps(envelope, sort_keys=True)
+    assert "Extraction complete" not in serialized
+    assert "Example AI Systems" not in serialized
 
 
 @pytest.mark.parametrize(
@@ -212,11 +233,19 @@ def test_malformed_json_creates_safe_diagnostic_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("STUB_LINKEDIN_MODE", "malformed_json")
-    with pytest.raises(ModelError, match="valid JSON"):
+    with pytest.raises(
+        LinkedInResponseEnvelopeError,
+        match="did not return one documented",
+    ):
         _invoke(tmp_path=tmp_path, stubs_on_path=stubs_on_path)
     payload = json.loads((tmp_path / "job-source.json").read_text(encoding="utf-8"))
     assert payload["fetch_status"] == "extraction_failed"
     assert payload["requested_url"] == JOB_URL
+    diagnostic = json.loads(
+        (tmp_path / "linkedin-response-envelope.json").read_text(encoding="utf-8")
+    )
+    assert diagnostic["validation_result"] == "REJECTED"
+    assert diagnostic["provider_output_omitted"] is True
 
 
 @pytest.mark.parametrize(
