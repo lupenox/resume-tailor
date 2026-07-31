@@ -40,6 +40,37 @@ if not prompt:
     print("missing stdin prompt", file=sys.stderr)
     raise SystemExit(33)
 
+try:
+    output_format = sys.argv[sys.argv.index("--output-format") + 1]
+except (ValueError, IndexError):
+    print("missing --output-format value", file=sys.stderr)
+    raise SystemExit(37)
+
+
+def emit_linkedin_output(payload: dict[str, object]) -> None:
+    if output_format == "stream-json":
+        print(
+            json.dumps(
+                {
+                    "event": "init",
+                    "init": {"conversation_id": "00000000-0000-4000-8000-000000000000"},
+                }
+            )
+        )
+        print(
+            json.dumps(
+                {"event": "step_update", "step_update": {"status": "running"}}
+            )
+        )
+        print(
+            json.dumps(
+                {"event": "result", "result": payload},
+                ensure_ascii=False,
+            )
+        )
+        return
+    print(json.dumps(payload, ensure_ascii=False))
+
 prompt_hash = hashlib.sha256(prompt_bytes).hexdigest()
 transport_log = os.environ.get("STUB_AGY_TRANSPORT_LOG")
 if transport_log:
@@ -109,16 +140,14 @@ if "LINKEDIN_JOB_EXTRACTION_REQUEST" in prompt:
         print("not-json")
         raise SystemExit(0)
     if linkedin_mode == "soft_permission_denied":
-        print(
-            json.dumps(
-                {
-                    "status": "WAITING",
-                    "message": (
-                        "Tool permission approval is required for "
-                        "read_url(linkedin.com); permission denied."
-                    ),
-                }
-            )
+        emit_linkedin_output(
+            {
+                "status": "WAITING",
+                "message": (
+                    "Tool permission approval is required for "
+                    "read_url(linkedin.com); permission denied."
+                ),
+            }
         )
         raise SystemExit(0)
     if linkedin_mode == "process_error":
@@ -296,10 +325,12 @@ if "LINKEDIN_JOB_EXTRACTION_REQUEST" in prompt:
                 "status": "SUCCESS",
             }
         elif linkedin_mode == "ambiguous_response":
+            conflicting = dict(structured)
+            conflicting["company"] = "Conflicting Synthetic Company"
             output = {
                 "json_schema": embedded_schema,
                 "structured_output": structured,
-                "response": json.dumps(structured, ensure_ascii=False),
+                "response": json.dumps(conflicting, ensure_ascii=False),
                 "status": "SUCCESS",
             }
         else:
@@ -308,9 +339,28 @@ if "LINKEDIN_JOB_EXTRACTION_REQUEST" in prompt:
                 "response": json.dumps(structured, ensure_ascii=False),
                 "status": "SUCCESS",
             }
-        print(json.dumps(output, ensure_ascii=False))
+        emit_linkedin_output(output)
         raise SystemExit(0)
-    print(json.dumps({"structured_output": structured}, ensure_ascii=False))
+    schema_index = sys.argv.index("--json-schema")
+    expected_schema = json.loads(
+        Path(sys.argv[schema_index + 1]).read_text(encoding="utf-8")
+    )
+    emit_linkedin_output(
+        {
+            "conversation_id": "00000000-0000-4000-8000-000000000000",
+            "duration_seconds": 1.25,
+            "json_schema": expected_schema,
+            "num_turns": 2,
+            "response": json.dumps(structured, ensure_ascii=False),
+            "status": "SUCCESS",
+            "structured_output": structured,
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 5,
+                "total_tokens": 25,
+            },
+        }
+    )
     raise SystemExit(0)
 
 begin = "BEGIN_TRUSTED_MASTER_RESUME_CONTENT\n"
