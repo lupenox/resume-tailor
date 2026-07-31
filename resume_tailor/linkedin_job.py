@@ -7,11 +7,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
+from .antigravity_response import locate_json_candidate
 from .antigravity_transport import (
     antigravity_process_failure,
     run_antigravity_prompt,
 )
-from .schemas import parse_json_text, schema_path, validate_payload
+from .schemas import load_schema, parse_json_text, schema_path, validate_payload
 from .utilities import (
     InputError,
     ModelError,
@@ -37,6 +38,27 @@ _JOB_PATH_RE = re.compile(r"^/jobs/view/[^/]+/?$")
 _JOB_ID_RE = re.compile(r"(?:^|-)([0-9]{5,20})$")
 _MINIMUM_DESCRIPTION_CHARACTERS = 200
 _MINIMUM_DESCRIPTION_WORDS = 30
+_LINKEDIN_FIELDS = frozenset(
+    {
+        "fetch_status",
+        "requested_url",
+        "final_resolved_url",
+        "linkedin_job_id",
+        "job_title",
+        "company",
+        "location",
+        "workplace_type",
+        "employment_type",
+        "salary",
+        "normalized_job_description",
+        "responsibilities",
+        "required_qualifications",
+        "preferred_qualifications",
+        "technologies_and_skills",
+        "ai_focus_areas",
+        "warnings",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -176,30 +198,11 @@ EXTRACTION RULES
 
 
 def _structured_candidate(payload: Any) -> Any:
-    if isinstance(payload, dict):
-        if "structured_output" in payload:
-            candidate = payload["structured_output"]
-            if isinstance(candidate, str):
-                return parse_json_text(
-                    candidate,
-                    label="LinkedIn extraction structured_output",
-                )
-            return candidate
-        response = payload.get("response")
-        if isinstance(response, dict) and "structured_output" in response:
-            candidate = response["structured_output"]
-            if isinstance(candidate, str):
-                return parse_json_text(
-                    candidate,
-                    label="LinkedIn extraction structured_output",
-                )
-            return candidate
-        if "fetch_status" in payload:
-            return payload
-        result = payload.get("result")
-        if isinstance(result, str):
-            return parse_json_text(result, label="LinkedIn extraction result")
-    raise ModelError("Antigravity JSON did not contain LinkedIn structured_output.")
+    return locate_json_candidate(
+        payload,
+        required_fields=_LINKEDIN_FIELDS,
+        expected_schema=load_schema("linkedin_job.schema.json"),
+    ).payload
 
 
 def _diagnostic_payload(requested_url: str, warning: str) -> dict[str, Any]:
