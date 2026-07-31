@@ -16,6 +16,7 @@ _TAILORING_FIELDS = frozenset(
         "tailored_resume",
     }
 )
+_STRUCTURED_FIELDS = ("structured_output", "result", "response")
 
 
 @dataclass(frozen=True)
@@ -57,9 +58,10 @@ def _parse_exact_object(value: Any, *, field: str) -> dict[str, Any]:
     return parsed
 
 
-def locate_json_tailoring_candidate(
+def locate_json_candidate(
     payload: Any,
     *,
+    required_fields: frozenset[str],
     expected_schema: dict[str, Any] | None = None,
 ) -> AntigravityResponseCandidate:
     """Locate one whole-document candidate in Antigravity JSON output.
@@ -81,7 +83,7 @@ def locate_json_tailoring_candidate(
             raise _envelope_error("json-wrapper-schema-mismatch")
 
     candidates: list[AntigravityResponseCandidate] = []
-    if _TAILORING_FIELDS <= payload.keys():
+    if required_fields <= payload.keys():
         candidates.append(
             AntigravityResponseCandidate(
                 payload=payload,
@@ -89,12 +91,32 @@ def locate_json_tailoring_candidate(
             )
         )
 
-    for field in ("structured_output", "result", "response"):
+    for field in _STRUCTURED_FIELDS:
         if field not in payload:
             continue
         value = payload[field]
         if field == "response" and not isinstance(value, (dict, str)):
             continue
+        envelope_type = f"json-wrapper-{field}"
+        if (
+            field == "response"
+            and isinstance(value, dict)
+            and not required_fields <= value.keys()
+        ):
+            nested_fields = [
+                nested
+                for nested in ("structured_output", "result")
+                if nested in value
+            ]
+            if len(nested_fields) > 1:
+                raise _envelope_error(
+                    "json-wrapper-response-multiple-structured-candidates",
+                    "Antigravity returned multiple ambiguous structured-output candidates.",
+                )
+            if len(nested_fields) == 1:
+                nested = nested_fields[0]
+                value = value[nested]
+                envelope_type = f"json-wrapper-response-{nested}"
         try:
             candidate = _parse_exact_object(value, field=field)
         except AntigravityResponseEnvelopeError:
@@ -107,7 +129,7 @@ def locate_json_tailoring_candidate(
         candidates.append(
             AntigravityResponseCandidate(
                 payload=candidate,
-                envelope_type=f"json-wrapper-{field}",
+                envelope_type=envelope_type,
             )
         )
 
@@ -119,6 +141,18 @@ def locate_json_tailoring_candidate(
             "Antigravity returned multiple ambiguous structured-output candidates.",
         )
     return candidates[0]
+
+
+def locate_json_tailoring_candidate(
+    payload: Any,
+    *,
+    expected_schema: dict[str, Any] | None = None,
+) -> AntigravityResponseCandidate:
+    return locate_json_candidate(
+        payload,
+        required_fields=_TAILORING_FIELDS,
+        expected_schema=expected_schema,
+    )
 
 
 def parse_json_output(
