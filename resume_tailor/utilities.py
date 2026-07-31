@@ -70,6 +70,10 @@ class AntigravityResponseEnvelopeError(ModelError):
         self.envelope_type = envelope_type
 
 
+class LinkedInResponseEnvelopeError(AntigravityResponseEnvelopeError):
+    """LinkedIn retrieval returned no documented structured-output envelope."""
+
+
 class AntigravityCannotApplyError(ModelError):
     """Antigravity could not apply one authenticated approved edit."""
 
