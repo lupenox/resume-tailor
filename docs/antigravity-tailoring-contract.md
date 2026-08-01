@@ -48,7 +48,7 @@ because an outer legacy wrapper contains incidental status text.
 
 Eligible recovery creates a new isolated run, reuses the confirmed job,
 requirement catalog, extraction, resolved analysis, transport schema, and
-explicit approval record, and invokes neither Codex retrieval nor Codex
+explicit approval record, and invokes neither Apify retrieval nor Codex
 analysis. The original failed run remains unchanged. Recovery stops at the normal validated
 content-diff approval gate; it is never automatic. Any missing record, changed
 hash, invalid source reference, or unauthenticated input requires a new run.

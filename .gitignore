@@ -7,6 +7,10 @@ htmlcov/
 .venv/
 .env
 .env.*
+!.env.example
+apify-token
+.apify-token
+*.token
 .codex/
 .agents/
 build/

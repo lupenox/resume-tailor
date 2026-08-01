@@ -49,7 +49,7 @@ failures. Before a new run is created, local code verifies:
 - the Codex approval record and every hash it binds.
 
 Eligible recovery creates a separate run, copies only authenticated local
-artifacts, reuses the approved analysis, invokes neither Codex retrieval nor
+artifacts, reuses the approved analysis, invokes neither Apify retrieval nor
 Codex analysis, and pauses at the normal validated-content-diff approval gate.
 The source run remains unchanged. A missing approval record or any hash mismatch
 requires a new run.

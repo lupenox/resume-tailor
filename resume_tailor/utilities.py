@@ -58,40 +58,121 @@ class ModelError(ResumeTailorError):
     exit_code = ExitCode.MODEL
 
 
-_CODEX_LINKEDIN_FAILURE_MESSAGES = {
-    "login_required": (
-        "LinkedIn requires sign-in before the exact public posting can be read."
+class OllamaConnectionError(ModelError):
+    """The localhost-only Ollama API could not complete a bounded request."""
+
+
+class OllamaTailoringContractError(ModelError):
+    """Qwen did not satisfy the post-approval tailoring contract."""
+
+
+class OllamaCannotApplyError(ModelError):
+    """Qwen could not apply one authenticated approved edit."""
+
+
+class OllamaTechnicalFailureError(ModelError):
+    """Qwen reported a bounded technical tailoring failure."""
+
+
+class OllamaRevisionContractError(ModelError):
+    """Qwen violated the bounded one-shot revision contract."""
+
+
+class OllamaRevisionCannotApplyError(ModelError):
+    """Qwen could not apply one authenticated QA correction."""
+
+
+class OllamaRevisionTechnicalFailureError(ModelError):
+    """Qwen reported a bounded revision execution failure."""
+
+
+_APIFY_CONFIGURATION_MESSAGES = {
+    "missing_token": (
+        "LinkedIn URL retrieval requires APIFY_API_TOKEN. Preserve the complete "
+        "token, including its apify_api_ prefix, in local configuration."
     ),
-    "expired": "The exact LinkedIn posting appears to be expired.",
-    "unavailable": "The exact LinkedIn posting is unavailable.",
-    "insufficient_content": (
-        "Codex could not retrieve a complete, substantive LinkedIn job description."
+    "missing_actor_id": (
+        "LinkedIn URL retrieval requires APIFY_ACTOR_ID set to the Actor ID or "
+        "username/actor-name used in Apify."
     ),
-    "url_mismatch": (
-        "Codex returned a URL that does not authenticate as the exact requested "
-        "LinkedIn posting."
+    "invalid_token": (
+        "APIFY_API_TOKEN is malformed. Store the complete token exactly as issued, "
+        "including its apify_api_ prefix and without surrounding whitespace."
     ),
-    "job_id_mismatch": (
-        "Codex returned a LinkedIn job ID that does not match the locally extracted "
-        "requested job ID."
-    ),
-    "search_unavailable": "Codex live web search was unavailable for this retrieval.",
-    "provider_failure": "Codex LinkedIn retrieval stopped with a provider failure.",
-    "malformed_output": (
-        "Codex LinkedIn retrieval did not return one complete schema-valid JSON result."
+    "invalid_actor_id": (
+        "APIFY_ACTOR_ID must be an Apify Actor ID or username/actor-name value."
     ),
 }
 
 
-class CodexLinkedInRetrievalError(ModelError):
-    """A bounded, content-free failure from the Codex LinkedIn retrieval stage."""
+class ApifyConfigurationError(InputError):
+    """Apify retrieval configuration is absent or locally invalid."""
 
     def __init__(self, classification: str) -> None:
-        if classification not in _CODEX_LINKEDIN_FAILURE_MESSAGES:
+        if classification not in _APIFY_CONFIGURATION_MESSAGES:
+            classification = "invalid_actor_id"
+        self.classification = classification
+        super().__init__(_APIFY_CONFIGURATION_MESSAGES[classification])
+
+
+_APIFY_RETRIEVAL_MESSAGES = {
+    "authentication_failure": (
+        "Apify rejected authentication. Verify APIFY_API_TOKEN and its full "
+        "apify_api_ prefix."
+    ),
+    "actor_not_found": (
+        "The configured Apify Actor was not found. Verify APIFY_ACTOR_ID and "
+        "account access."
+    ),
+    "actor_timeout": "The Apify Actor did not finish before the bounded timeout.",
+    "actor_failure": "The Apify Actor run stopped without succeeding.",
+    "empty_dataset": "The Apify Actor completed but returned an empty dataset.",
+    "no_matching_result": (
+        "Apify returned no unique result matching the requested LinkedIn job URL "
+        "or job ID."
+    ),
+    "malformed_output": (
+        "The Apify result could not be normalized into the canonical job-posting "
+        "contract."
+    ),
+    "insufficient_content": (
+        "The Apify result did not contain a meaningful job title and complete "
+        "job description."
+    ),
+    "network_error": "Resume Tailor could not complete the bounded Apify HTTPS request.",
+    "rate_limited": (
+        "Apify rate-limited this retrieval. Wait for the provider limit to reset "
+        "before retrying."
+    ),
+    "provider_failure": "Apify LinkedIn retrieval stopped with a provider failure.",
+}
+
+
+class ApifyLinkedInRetrievalError(ModelError):
+    """A structured, token-free failure from Apify LinkedIn retrieval."""
+
+    def __init__(
+        self,
+        classification: str,
+        *,
+        http_status: int | None = None,
+        provider_message: str | None = None,
+        run_id: str | None = None,
+        run_status: str | None = None,
+        dataset_id: str | None = None,
+        item_count: int | None = None,
+    ) -> None:
+        if classification not in _APIFY_RETRIEVAL_MESSAGES:
             classification = "provider_failure"
         self.classification = classification
+        self.http_status = http_status
+        self.provider_message = provider_message
+        self.run_id = run_id
+        self.run_status = run_status
+        self.dataset_id = dataset_id
+        self.item_count = item_count
         super().__init__(
-            _CODEX_LINKEDIN_FAILURE_MESSAGES[classification]
+            _APIFY_RETRIEVAL_MESSAGES[classification]
             + " Use pasted text, --job-file, or --clipboard as a bounded fallback."
         )
 
@@ -132,7 +213,11 @@ class RevisionValidationError(ModelError):
     """A revision crossed a local authorization or integrity boundary."""
 
 
-class AntigravityTailoringPreflightError(InputError):
+class TailoringPreflightError(InputError):
+    """Local authenticated writer inputs are incomplete or inconsistent."""
+
+
+class AntigravityTailoringPreflightError(TailoringPreflightError):
     """Local authenticated tailoring inputs are incomplete or inconsistent."""
 
 

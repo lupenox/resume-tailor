@@ -97,8 +97,8 @@
                 value="{{ form_values.get('job_url', '') }}" autocomplete="off">
             </div>
             <p class="field-help">
-              Codex uses live search for this exact public posting in a fresh,
-              read-only session. No login, Apply interaction, or account access.
+              Apify sends this exact public URL to the configured retrieval Actor.
+              Resume Tailor does not sign in, click Apply, or access an account.
             </p>
           </div>
 
@@ -138,9 +138,10 @@
           <span class="shield-icon" aria-hidden="true">✓</span>
           <p>
             The master file is never overwritten. URL retrieval sends only the public
-            URL and job ID to Codex; no résumé content is included. After you approve
-            the posting, Codex analyzes, Antigravity writes, and a fresh Codex session
-            independently reviews the completed résumé.
+            URL to Apify; no résumé content is included. After you approve the
+            normalized posting, Codex analyzes, local Qwen writes, deterministic Python
+            validates and formats, and a fresh Codex session independently reviews
+            the completed résumé.
           </p>
         </div>
 
@@ -162,7 +163,7 @@
         <ul class="feature-list">
           <li>
             <span class="feature-icon" aria-hidden="true">1</span>
-            <div><strong>Confirm the posting</strong><small>Codex retrieves it first, but résumé extraction and analysis wait for your approval.</small></div>
+            <div><strong>Confirm the posting</strong><small>Apify retrieves it first, but résumé extraction and analysis wait for your approval.</small></div>
           </li>
           <li>
             <span class="feature-icon" aria-hidden="true">2</span>

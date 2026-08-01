@@ -21,8 +21,9 @@ from resume_tailor.schemas import load_schema
 from resume_tailor.ui import COOKIE_NAME, DEFAULT_HOST, create_app
 from resume_tailor.ui_cli import build_parser as build_ui_parser
 from resume_tailor.utilities import (
+    ApifyConfigurationError,
+    ApifyLinkedInRetrievalError,
     CancellationError,
-    CodexLinkedInRetrievalError,
     CodexSchemaCompatibilityError,
     AntigravityLaunchSizeError,
     ExitCode,
@@ -48,6 +49,10 @@ def _posting(*, injection: bool = False) -> dict[str, Any]:
         "workplace_type": "hybrid",
         "employment_type": "Full-time",
         "salary": None,
+        "seniority_level": None,
+        "date_posted": None,
+        "applicant_count": None,
+        "retrieval_source": "apify",
         "normalized_job_description": (
             "Build safe Python AI orchestration systems and evaluate language "
             "model behavior with a collaborative engineering team. "
@@ -678,6 +683,8 @@ def test_file_and_clipboard_text_input_modes(
             run_id = await _start(client, token, mode=mode, files=files)
             await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
             assert pipeline.namespaces[0].job_url is None
+            assert pipeline.namespaces[0].writer_provider == "ollama"
+            assert pipeline.namespaces[0].ollama_model == "resume-tailor-qwen"
             assert pipeline.job_texts
             assert "Python" in pipeline.job_texts[0]
 
@@ -714,7 +721,7 @@ def test_successful_job_confirmation_and_continuation(
     asyncio.run(scenario())
 
 
-def test_url_mode_has_codex_only_retrieval_surface(
+def test_url_mode_has_apify_only_retrieval_surface(
     master_resume: Path,
     tmp_path: Path,
 ) -> None:
@@ -732,10 +739,10 @@ def test_url_mode_has_codex_only_retrieval_surface(
             await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
             assert not hasattr(pipeline.namespaces[0], "linkedin_provider")
             page = await client.get("/")
-            assert "Codex uses live search for this exact public posting" in page.text
+            assert "Apify sends this exact public URL" in page.text
             assert "Retrieval provider" not in page.text
             assert "linkedin_provider" not in page.text
-            assert "Apify" not in page.text
+            assert "Codex uses live search" not in page.text
 
     asyncio.run(scenario())
 
@@ -866,8 +873,8 @@ def test_successful_completed_run_results(
 @pytest.mark.parametrize(
     "failure",
     [
-        "The LinkedIn posting requires login. Retry with --job-file.",
-        "Codex live search was unavailable for the exact LinkedIn posting.",
+        "Apify authentication failed. Retry with --job-file.",
+        "The configured Apify Actor was unavailable.",
     ],
 )
 def test_failed_retrieval_messages_are_safe(
@@ -896,18 +903,22 @@ def test_failed_retrieval_messages_are_safe(
 @pytest.mark.parametrize(
     ("classification", "expected"),
     [
-        ("login_required", "LinkedIn sign-in required"),
-        ("expired", "LinkedIn posting expired"),
-        ("unavailable", "LinkedIn posting unavailable"),
+        ("missing_token", "Apify token configuration required"),
+        ("missing_actor_id", "Apify Actor configuration required"),
+        ("authentication_failure", "Apify authentication failed"),
+        ("actor_not_found", "Apify Actor not found"),
+        ("actor_timeout", "Apify Actor timed out"),
+        ("actor_failure", "Apify Actor run failed"),
+        ("empty_dataset", "Empty Apify dataset"),
+        ("no_matching_result", "LinkedIn result mismatch"),
         ("insufficient_content", "Incomplete LinkedIn content"),
-        ("url_mismatch", "LinkedIn identity mismatch"),
-        ("job_id_mismatch", "LinkedIn identity mismatch"),
-        ("search_unavailable", "Codex live search unavailable"),
-        ("provider_failure", "Codex retrieval provider failure"),
-        ("malformed_output", "Codex retrieval format failure"),
+        ("network_error", "Apify network failure"),
+        ("rate_limited", "Apify rate limit reached"),
+        ("provider_failure", "Apify retrieval provider failure"),
+        ("malformed_output", "Apify result format failure"),
     ],
 )
-def test_codex_retrieval_failures_are_classified_and_sanitized(
+def test_apify_retrieval_failures_are_classified_and_sanitized(
     classification: str,
     expected: str,
     master_resume: Path,
@@ -918,14 +929,21 @@ def test_codex_retrieval_failures_are_classified_and_sanitized(
         *,
         hooks: PipelineHooks,
     ) -> Path:
-        run_directory = args.output_dir / "codex-retrieval-failure"
+        run_directory = args.output_dir / "apify-retrieval-failure"
         run_directory.mkdir(mode=0o700)
         hooks.progress(
             "fetching_job",
-            "Retrieving the posting with Codex.",
+            "Retrieving the posting with Apify.",
             run_directory=str(run_directory),
         )
-        raise CodexLinkedInRetrievalError(classification)
+        if classification in {
+            "missing_token",
+            "missing_actor_id",
+            "invalid_token",
+            "invalid_actor_id",
+        }:
+            raise ApifyConfigurationError(classification)
+        raise ApifyLinkedInRetrievalError(classification)
 
     app = create_app(
         output_directory=tmp_path / "output",
@@ -1090,9 +1108,9 @@ def test_antigravity_launch_failure_guidance_and_authenticated_recovery(
     )
     monkeypatch.setattr(
         cli_module,
-        "invoke_codex_linkedin_retrieval",
+        "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail(
-            "Codex retrieval ran during Antigravity recovery"
+            "Apify retrieval ran during Antigravity recovery"
         ),
     )
     app = create_app(
@@ -1195,9 +1213,9 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
     )
     monkeypatch.setattr(
         cli_module,
-        "invoke_codex_linkedin_retrieval",
+        "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail(
-            "Codex retrieval ran during Antigravity recovery"
+            "Apify retrieval ran during Antigravity recovery"
         ),
     )
     app = create_app(
@@ -1268,13 +1286,28 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
     }
 
 
-def test_codex_retrieval_format_failure_shows_safe_input_fallback(
+def test_apify_result_format_failure_shows_safe_input_fallback(
     master_resume: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output_directory = tmp_path / "output"
-    monkeypatch.setenv("STUB_CODEX_LINKEDIN_MODE", "prose")
+
+    def fail(**kwargs: object) -> dict[str, object]:
+        run_directory = kwargs["run_directory"]
+        assert isinstance(run_directory, Path)
+        atomic_write_json(
+            run_directory / "apify-linkedin-retrieval-diagnostic.json",
+            {
+                "provider": "apify",
+                "classification": "malformed_output",
+                "provider_output_omitted": True,
+                "api_token_omitted": True,
+            },
+        )
+        raise ApifyLinkedInRetrievalError("malformed_output")
+
+    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", fail)
     monkeypatch.setattr(
         cli_module,
         "_analysis_dependency_versions",
@@ -1308,10 +1341,10 @@ def test_codex_retrieval_format_failure_shows_safe_input_fallback(
             await _session(client)
             page = await client.get(f"/runs/history-{source_run.name}")
             assert page.status_code == 200
-            assert "Codex retrieval format failure" in page.text
+            assert "Apify result format failure" in page.text
             assert "Use another job input" in page.text
             assert "No résumé content was sent for analysis or tailoring" in page.text
-            assert "codex-linkedin-retrieval-diagnostic.json" in page.text
+            assert "apify-linkedin-retrieval-diagnostic.json" in page.text
             assert "Retry Antigravity tailoring" not in page.text
             assert "Reprocess preserved Antigravity response" not in page.text
             assert "Offline reprocessing unavailable" not in page.text
@@ -1344,7 +1377,7 @@ def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(
     )
     monkeypatch.setattr(
         cli_module,
-        "invoke_codex_linkedin_retrieval",
+        "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail("LinkedIn ran during offline reprocessing"),
     )
     monkeypatch.setattr(
@@ -1395,7 +1428,7 @@ def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(
             )
             assert metadata["retry_kind"] == "antigravity-response-reprocess"
             assert metadata["provider_calls_reused"] == {
-                "codex_linkedin_retrieval": False,
+                "apify_linkedin_retrieval": False,
                 "codex_analysis": False,
                 "antigravity_tailoring": False,
             }

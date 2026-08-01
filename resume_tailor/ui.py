@@ -38,6 +38,7 @@ from .orchestration import (
     ApprovalResponse,
     PipelineHooks,
 )
+from .ollama_writer import DEFAULT_OLLAMA_MODEL
 from .retry import (
     antigravity_retry_failure_kind,
     build_antigravity_reprocess_context,
@@ -45,6 +46,8 @@ from .retry import (
     build_retry_context,
 )
 from .utilities import (
+    ApifyConfigurationError,
+    ApifyLinkedInRetrievalError,
     ApprovalError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
@@ -53,12 +56,19 @@ from .utilities import (
     AntigravityTailoringPreflightError,
     AntigravityTechnicalFailureError,
     CancellationError,
-    CodexLinkedInRetrievalError,
     CodexSchemaCompatibilityError,
     InputError,
     ModelError,
+    OllamaCannotApplyError,
+    OllamaConnectionError,
+    OllamaRevisionCannotApplyError,
+    OllamaRevisionContractError,
+    OllamaRevisionTechnicalFailureError,
+    OllamaTailoringContractError,
+    OllamaTechnicalFailureError,
     ResumeTailorError,
     SourceEvidenceError,
+    TailoringPreflightError,
     atomic_write_text,
     parse_duration,
     utc_now_iso,
@@ -74,11 +84,11 @@ COOKIE_NAME = "resume_tailor_session"
 
 WORKFLOW_STAGES: tuple[tuple[str, str], ...] = (
     ("validating_input", "Validating input"),
-    ("fetching_job", "Codex job retrieval"),
+    ("fetching_job", "Apify job retrieval"),
     ("confirming_posting", "Confirming posting"),
     ("codex_analysis", "Codex analysis"),
     ("reviewing_changes", "Reviewing proposed changes"),
-    ("antigravity_tailoring", "Antigravity tailoring"),
+    ("antigravity_tailoring", "Qwen résumé writing"),
     ("evidence_validation", "Evidence validation"),
     ("rendering", "Rendering DOCX/PDF"),
     ("final_qa", "Initial Codex QA"),
@@ -89,7 +99,7 @@ _STAGE_INDEX = {name: index for index, (name, _) in enumerate(WORKFLOW_STAGES)}
 _TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
 _DOWNLOAD_EXACT = {
     "job-source.json",
-    "codex-linkedin-retrieval-diagnostic.json",
+    "apify-linkedin-retrieval-diagnostic.json",
     "job-description.txt",
     "job-requirements.json",
     "extracted-master-resume.json",
@@ -101,6 +111,12 @@ _DOWNLOAD_EXACT = {
     "antigravity-response-envelope.json",
     "antigravity-revision-response.json",
     "antigravity-revision-response-envelope.json",
+    "ollama-response.json",
+    "ollama-response-envelope.json",
+    "ollama-tailoring-transport.schema.json",
+    "ollama-revision-response.json",
+    "ollama-revision-response-envelope.json",
+    "ollama-revision-transport.schema.json",
     "revision-request.json",
     "tailored-content.json",
     "tailored-content.initial.json",
@@ -390,7 +406,10 @@ class RunManager:
                 record.status = "FAILED"
                 record.error = _sanitized_technical_details(exc)
                 record.failure_kind = _failure_kind_for_error(exc, record.stage)
-                if isinstance(exc, CodexLinkedInRetrievalError):
+                if isinstance(
+                    exc,
+                    (ApifyConfigurationError, ApifyLinkedInRetrievalError),
+                ):
                     record.retrieval_classification = exc.classification
                 record.message = _safe_error_message(exc)
                 record.approval = None
@@ -844,15 +863,16 @@ class RunManager:
                 "argument vector before provider startup. Prompt content is omitted."
             )
             message = _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
-        elif failure_kind == "codex_linkedin_retrieval":
+        elif failure_kind == "apify_linkedin_retrieval":
             technical = (
-                "Codex LinkedIn retrieval was rejected with the bounded local "
+                "Apify LinkedIn retrieval was rejected with the bounded local "
                 f"classification {retrieval_classification or 'provider_failure'}. "
-                "Provider prose and posting content are omitted."
+                "The API token, authorization header, raw Actor result, and posting "
+                "content are omitted."
             )
-            message = _CODEX_LINKEDIN_UI_MESSAGES.get(
+            message = _APIFY_LINKEDIN_UI_MESSAGES.get(
                 retrieval_classification or "provider_failure",
-                _CODEX_LINKEDIN_UI_MESSAGES["provider_failure"],
+                _APIFY_LINKEDIN_UI_MESSAGES["provider_failure"],
             )
         elif failure_kind == "antigravity_response_envelope":
             technical = (
@@ -880,6 +900,36 @@ class RunManager:
                 "Provider prose is omitted."
             )
             message = _ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE
+        elif failure_kind == "ollama_preflight":
+            technical = (
+                "Local authentication of the approved inputs failed before any "
+                "Qwen or Ollama request. Résumé and job content are omitted."
+            )
+            message = _OLLAMA_PREFLIGHT_UI_MESSAGE
+        elif failure_kind == "ollama_connection":
+            technical = (
+                "The fixed localhost Ollama endpoint or configured model did not "
+                "complete the bounded request. Prompt and provider content are omitted."
+            )
+            message = _OLLAMA_CONNECTION_UI_MESSAGE
+        elif failure_kind == "ollama_contract":
+            technical = (
+                "The Qwen response failed strict JSON, canonical schema, edit-ID, "
+                "or revision validation. Provider content is omitted."
+            )
+            message = _OLLAMA_CONTRACT_UI_MESSAGE
+        elif failure_kind == "ollama_cannot_apply":
+            technical = (
+                "Qwen returned a bounded cannot_apply result for one authenticated "
+                "edit or QA issue. Provider prose is omitted."
+            )
+            message = _OLLAMA_CANNOT_APPLY_UI_MESSAGE
+        elif failure_kind == "ollama_technical_failure":
+            technical = (
+                "Qwen returned a structured technical_failure result. Provider "
+                "prose is omitted."
+            )
+            message = _OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE
         else:
             technical = (
                 _sanitized_technical_details(RuntimeError(error_message))
@@ -952,6 +1002,8 @@ class RunManager:
             keep_workdir=False,
             timeout=self.settings.timeout,
             retry_context=context,
+            writer_provider="ollama",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         try:
             return self.start(
@@ -991,6 +1043,8 @@ class RunManager:
             keep_workdir=False,
             timeout=self.settings.timeout,
             antigravity_retry_context=context,
+            writer_provider="antigravity",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         try:
             return self.start(
@@ -1030,6 +1084,8 @@ class RunManager:
             keep_workdir=False,
             timeout=self.settings.timeout,
             antigravity_reprocess_context=context,
+            writer_provider="antigravity",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         try:
             return self.start(
@@ -1178,25 +1234,45 @@ _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE = (
 _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE = (
     "Antigravity returned JSON in an unsupported response format."
 )
-_CODEX_LINKEDIN_UI_MESSAGES = {
-    "login_required": (
-        "LinkedIn requires sign-in, and Resume Tailor will not access an account."
+_APIFY_LINKEDIN_UI_MESSAGES = {
+    "missing_token": (
+        "Apify is not configured. Set APIFY_API_TOKEN to the complete token, "
+        "including its apify_api_ prefix."
     ),
-    "expired": "The exact LinkedIn posting appears to be expired.",
-    "unavailable": "The exact LinkedIn posting is unavailable.",
+    "missing_actor_id": (
+        "Apify is not configured. Set APIFY_ACTOR_ID to the Actor ID or "
+        "username/actor-name used for LinkedIn job retrieval."
+    ),
+    "invalid_token": (
+        "APIFY_API_TOKEN is malformed. Preserve the complete token exactly as issued."
+    ),
+    "invalid_actor_id": (
+        "APIFY_ACTOR_ID is malformed. Use an Actor ID or username/actor-name."
+    ),
+    "authentication_failure": (
+        "Apify rejected authentication. Verify the locally configured API token."
+    ),
+    "actor_not_found": (
+        "Apify could not find the configured Actor. Verify APIFY_ACTOR_ID and access."
+    ),
+    "actor_timeout": "The Apify Actor exceeded the bounded retrieval timeout.",
+    "actor_failure": "The Apify Actor run stopped before retrieval succeeded.",
+    "empty_dataset": "The Apify Actor completed but returned no dataset items.",
+    "no_matching_result": (
+        "No unique Apify result matched the requested LinkedIn URL or job ID."
+    ),
     "insufficient_content": (
-        "Codex could not retrieve the complete substantive job description."
+        "The Apify result lacked a meaningful title or complete job description."
     ),
-    "url_mismatch": (
-        "The retrieved URL did not authenticate as the exact requested posting."
+    "network_error": (
+        "Resume Tailor could not complete the bounded Apify HTTPS request."
     ),
-    "job_id_mismatch": (
-        "The retrieved LinkedIn job ID did not match the locally extracted ID."
+    "rate_limited": (
+        "Apify rate-limited this retrieval. Wait for the provider limit to reset."
     ),
-    "search_unavailable": "Codex live web search was unavailable for this retrieval.",
-    "provider_failure": "Codex LinkedIn retrieval stopped with a provider failure.",
+    "provider_failure": "Apify LinkedIn retrieval stopped with a provider failure.",
     "malformed_output": (
-        "Codex did not return one complete schema-valid LinkedIn job result."
+        "The Apify result failed the local canonical job-posting contract."
     ),
 }
 _ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE = (
@@ -1212,6 +1288,26 @@ _ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE = (
     "Antigravity reported a bounded technical tailoring failure. The authenticated "
     "inputs and approved plan were preserved."
 )
+_OLLAMA_CONNECTION_UI_MESSAGE = (
+    "Resume Tailor could not reach the local Ollama service or load the configured "
+    "Qwen model at 127.0.0.1:11434. No remote fallback was attempted."
+)
+_OLLAMA_CONTRACT_UI_MESSAGE = (
+    "Qwen returned content that did not satisfy the local structured-output and "
+    "evidence contract. The response and sanitized validation envelope were preserved."
+)
+_OLLAMA_CANNOT_APPLY_UI_MESSAGE = (
+    "Qwen could not safely apply one authenticated approved edit. No unsupported "
+    "claim was substituted."
+)
+_OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE = (
+    "Qwen reported a bounded local writing failure. Authenticated inputs and "
+    "diagnostics were preserved."
+)
+_OLLAMA_PREFLIGHT_UI_MESSAGE = (
+    "The authenticated tailoring inputs failed local completeness preflight. "
+    "No Qwen or Ollama request was launched."
+)
 
 
 def _failure_kind_for_error(
@@ -1220,8 +1316,8 @@ def _failure_kind_for_error(
 ) -> str:
     if isinstance(error, SourceEvidenceError):
         return "source_evidence"
-    if isinstance(error, CodexLinkedInRetrievalError):
-        return "codex_linkedin_retrieval"
+    if isinstance(error, (ApifyConfigurationError, ApifyLinkedInRetrievalError)):
+        return "apify_linkedin_retrieval"
     if isinstance(error, AntigravityLaunchSizeError) or (
         stage == "antigravity_tailoring"
         and "Argument list too long" in str(error)
@@ -1237,6 +1333,16 @@ def _failure_kind_for_error(
         return "antigravity_technical_failure"
     if isinstance(error, AntigravityTailoringPreflightError):
         return "antigravity_tailoring_preflight"
+    if isinstance(error, TailoringPreflightError):
+        return "ollama_preflight"
+    if isinstance(error, OllamaConnectionError):
+        return "ollama_connection"
+    if isinstance(error, (OllamaTailoringContractError, OllamaRevisionContractError)):
+        return "ollama_contract"
+    if isinstance(error, (OllamaCannotApplyError, OllamaRevisionCannotApplyError)):
+        return "ollama_cannot_apply"
+    if isinstance(error, (OllamaTechnicalFailureError, OllamaRevisionTechnicalFailureError)):
+        return "ollama_technical_failure"
     if isinstance(error, CodexSchemaCompatibilityError):
         return "schema"
     if stage in {"fetching_job", "confirming_posting"}:
@@ -1254,10 +1360,12 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
     error_message = error.get("message") if isinstance(error, Mapping) else None
     stage = str(metadata.get("stage", ""))
     if (
-        metadata.get("failure_class") == "codex-linkedin-retrieval"
-        or error_type == "CodexLinkedInRetrievalError"
+        metadata.get("failure_class")
+        in {"apify-configuration", "apify-linkedin-retrieval"}
+        or error_type
+        in {"ApifyConfigurationError", "ApifyLinkedInRetrievalError"}
     ):
-        return "codex_linkedin_retrieval"
+        return "apify_linkedin_retrieval"
     antigravity_failure = antigravity_retry_failure_kind(dict(metadata))
     if antigravity_failure == "launch_size":
         return "antigravity_launch_size"
@@ -1272,6 +1380,17 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         return "antigravity_cannot_apply"
     if antigravity_failure == "technical_failure":
         return "antigravity_technical_failure"
+    ollama_failure = str(metadata.get("failure_class", ""))
+    if ollama_failure == "ollama-connection":
+        return "ollama_connection"
+    if ollama_failure == "ollama-tailoring-preflight":
+        return "ollama_preflight"
+    if ollama_failure in {"ollama-tailoring-contract", "ollama-revision-contract"}:
+        return "ollama_contract"
+    if ollama_failure in {"ollama-cannot-apply", "ollama-revision-cannot-apply"}:
+        return "ollama_cannot_apply"
+    if ollama_failure in {"ollama-technical-failure", "ollama-revision-technical-failure"}:
+        return "ollama_technical_failure"
     if (
         stage == "codex-analysis"
         and error_type in {"SourceEvidenceError", "TruthfulnessError"}
@@ -1281,7 +1400,7 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         )
     ):
         return "source_evidence"
-    if stage in {"codex-linkedin-retrieval", "linkedin-posting-confirmation"}:
+    if stage in {"apify-linkedin-retrieval", "linkedin-posting-confirmation"}:
         return "retrieval"
     return None
 
@@ -1290,7 +1409,7 @@ def _retrieval_classification_from_metadata(
     metadata: Mapping[str, Any],
 ) -> str | None:
     value = metadata.get("retrieval_classification")
-    if isinstance(value, str) and value in _CODEX_LINKEDIN_UI_MESSAGES:
+    if isinstance(value, str) and value in _APIFY_LINKEDIN_UI_MESSAGES:
         return value
     return None
 
@@ -1299,7 +1418,7 @@ def _ui_stage_from_metadata(stage: str) -> str:
     return {
         "initializing": "validating_input",
         "dependency-check": "validating_input",
-        "codex-linkedin-retrieval": "fetching_job",
+        "apify-linkedin-retrieval": "fetching_job",
         "linkedin-posting-confirmation": "confirming_posting",
         "extracting-master": "codex_analysis",
         "codex-analysis-schema-preflight": "codex_analysis",
@@ -1309,12 +1428,15 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "antigravity-tailoring-preflight": "antigravity_tailoring",
         "antigravity-tailoring": "antigravity_tailoring",
         "antigravity-response-reprocessing": "antigravity_tailoring",
+        "ollama-tailoring-preflight": "antigravity_tailoring",
+        "ollama-tailoring": "antigravity_tailoring",
         "local-evidence-check": "evidence_validation",
         "docx-render": "rendering",
         "pdf-export-validation": "rendering",
         "final-codex-qa": "final_qa",
         "revision-authorization": "revision_phase",
         "antigravity-revision-1": "revision_phase",
+        "ollama-revision-1": "revision_phase",
         "revision-1-local-evidence-check": "revision_phase",
         "revision-1-content-approval": "revision_phase",
         "revision-1-docx-render": "revision_phase",
@@ -1326,8 +1448,8 @@ def _ui_stage_from_metadata(stage: str) -> str:
 def _safe_error_message(error: ResumeTailorError) -> str:
     if isinstance(error, SourceEvidenceError):
         return _SOURCE_EVIDENCE_UI_MESSAGE
-    if isinstance(error, CodexLinkedInRetrievalError):
-        return _CODEX_LINKEDIN_UI_MESSAGES[error.classification]
+    if isinstance(error, (ApifyConfigurationError, ApifyLinkedInRetrievalError)):
+        return _APIFY_LINKEDIN_UI_MESSAGES[error.classification]
     if isinstance(error, AntigravityLaunchSizeError) or (
         "Argument list too long" in str(error)
         and "agy" in str(error)
@@ -1344,8 +1466,18 @@ def _safe_error_message(error: ResumeTailorError) -> str:
     if isinstance(error, AntigravityTailoringPreflightError):
         return (
             "The authenticated tailoring inputs failed local completeness "
-            "preflight. No Antigravity request was launched."
+            "preflight. No résumé-writer request was launched."
         )
+    if isinstance(error, TailoringPreflightError):
+        return _OLLAMA_PREFLIGHT_UI_MESSAGE
+    if isinstance(error, OllamaConnectionError):
+        return _OLLAMA_CONNECTION_UI_MESSAGE
+    if isinstance(error, (OllamaTailoringContractError, OllamaRevisionContractError)):
+        return _OLLAMA_CONTRACT_UI_MESSAGE
+    if isinstance(error, (OllamaCannotApplyError, OllamaRevisionCannotApplyError)):
+        return _OLLAMA_CANNOT_APPLY_UI_MESSAGE
+    if isinstance(error, (OllamaTechnicalFailureError, OllamaRevisionTechnicalFailureError)):
+        return _OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE
     if isinstance(error, CodexSchemaCompatibilityError):
         return "Codex could not start because its output schema was incompatible."
     if isinstance(error, ModelError):
@@ -1354,6 +1486,8 @@ def _safe_error_message(error: ResumeTailorError) -> str:
             if "codex" in str(error).casefold()
             else "Antigravity"
             if "antigravity" in str(error).casefold()
+            else "Qwen"
+            if "qwen" in str(error).casefold() or "ollama" in str(error).casefold()
             else "The model stage"
         )
         return (
@@ -1384,7 +1518,7 @@ _TECHNICAL_BLOCK = re.compile(
     flags=re.DOTALL,
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY)_[A-Z0-9_]*(?:KEY|TOKEN)"
+    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY|APIFY)_[A-Z0-9_]*(?:KEY|TOKEN)"
     r"\s*=\s*[^\s]+"
 )
 
@@ -1594,6 +1728,8 @@ async def _prepare_namespace(
             yes=False,
             keep_workdir=False,
             timeout=manager.settings.timeout,
+            writer_provider="ollama",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         return namespace, staging, source_mode, company, role
     except Exception:

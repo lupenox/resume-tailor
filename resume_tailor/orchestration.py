@@ -69,14 +69,15 @@ class PipelineHooks:
         self,
         *,
         payload: Mapping[str, Any],
+        provider_name: str = "Antigravity",
     ) -> ApprovalResponse:
         """Request the one optional extra provider call; --yes never bypasses it."""
         check_cancelled()
-        title = "One optional Antigravity revision"
+        title = f"One optional {provider_name} revision"
         if self.approval_handler is None:
             try:
                 answer = input(
-                    "\nCodex found material issues. Exactly one Antigravity "
+                    f"\nCodex found material issues. Exactly one {provider_name} "
                     "revision is available. Type 'revise' to authorize that "
                     "provider call, or press Enter to stop and keep artifacts: "
                 ).strip()

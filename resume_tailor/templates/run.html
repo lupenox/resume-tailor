@@ -54,7 +54,7 @@
                 <div>
                   <p class="eyebrow">Approval required</p>
                   <h2>Is this the intended posting?</h2>
-                  <p>Codex retrieved this without résumé input. Résumé extraction and analysis have not started.</p>
+                  <p>Apify retrieved this without résumé input. Résumé extraction and analysis have not started.</p>
                 </div>
               </div>
               <div class="posting-summary">
@@ -134,7 +134,7 @@
                 <div>
                   <p class="eyebrow">Approval required</p>
                   <h2>Review evidence-backed recommendations</h2>
-                  <p>Antigravity will not tailor content until you approve this analysis.</p>
+                  <p>Local Qwen will not tailor content until you approve this analysis.</p>
                 </div>
               </div>
               <div class="analysis-overview">
@@ -313,13 +313,14 @@
 
           {% elif run.approval.kind == "qa_revision" %}
             {% set qa = run.approval.payload.qa_result %}
+            {% set writer_name = run.approval.payload.writer_name or "Qwen" %}
             <section class="card gate-card">
               <div class="gate-heading">
                 <span class="gate-icon" aria-hidden="true">04</span>
                 <div>
                   <p class="eyebrow">Optional revision decision</p>
                   <h2>Codex found material issues</h2>
-                  <p>Antigravity authored the résumé; Codex independently reviewed it. You may authorize exactly one Antigravity revision, or stop and keep every initial artifact.</p>
+                  <p>{{ writer_name }} authored the résumé; Codex independently reviewed it. You may authorize exactly one {{ writer_name }} revision, or stop and keep every initial artifact.</p>
                 </div>
               </div>
               <div class="alert alert-warning">
@@ -341,7 +342,7 @@
                 <form action="/runs/{{ run.run_id }}/approval" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="action" value="revise_once">
-                  <button class="primary-button" type="submit">Ask Antigravity to revise once <span>→</span></button>
+                  <button class="primary-button" type="submit">Ask {{ writer_name }} to revise once <span>→</span></button>
                 </form>
                 <form action="/runs/{{ run.run_id }}/approval" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -503,32 +504,47 @@
                   <span>{{ run.retry_reason }}</span>
                 </div>
               {% endif %}
-            {% elif run.failure_kind == "codex_linkedin_retrieval" %}
+            {% elif run.failure_kind == "apify_linkedin_retrieval" %}
               <div class="alert alert-warning">
-                {% if run.retrieval_classification == "login_required" %}
-                  <strong>LinkedIn sign-in required</strong>
-                  <span>Codex could not access the exact posting publicly. Resume Tailor will not sign in or use a LinkedIn account.</span>
-                {% elif run.retrieval_classification == "expired" %}
-                  <strong>LinkedIn posting expired</strong>
-                  <span>The exact requested posting appears to have expired.</span>
-                {% elif run.retrieval_classification == "unavailable" %}
-                  <strong>LinkedIn posting unavailable</strong>
-                  <span>The exact requested posting was not publicly available.</span>
+                {% if run.retrieval_classification in ["missing_token", "invalid_token"] %}
+                  <strong>Apify token configuration required</strong>
+                  <span>Set APIFY_API_TOKEN to the complete token exactly as issued, including its apify_api_ prefix.</span>
+                {% elif run.retrieval_classification in ["missing_actor_id", "invalid_actor_id"] %}
+                  <strong>Apify Actor configuration required</strong>
+                  <span>Set APIFY_ACTOR_ID to the Actor ID or username/actor-name used for LinkedIn retrieval.</span>
+                {% elif run.retrieval_classification == "authentication_failure" %}
+                  <strong>Apify authentication failed</strong>
+                  <span>Verify the local API token. No credential value is stored in this run.</span>
+                {% elif run.retrieval_classification == "actor_not_found" %}
+                  <strong>Apify Actor not found</strong>
+                  <span>Verify APIFY_ACTOR_ID and that the configured account can run it.</span>
+                {% elif run.retrieval_classification == "actor_timeout" %}
+                  <strong>Apify Actor timed out</strong>
+                  <span>The run did not finish inside Resume Tailor’s bounded timeout.</span>
+                {% elif run.retrieval_classification == "actor_failure" %}
+                  <strong>Apify Actor run failed</strong>
+                  <span>The Actor stopped before producing a successful dataset.</span>
+                {% elif run.retrieval_classification == "empty_dataset" %}
+                  <strong>Empty Apify dataset</strong>
+                  <span>The Actor completed but returned no job records.</span>
+                {% elif run.retrieval_classification == "no_matching_result" %}
+                  <strong>LinkedIn result mismatch</strong>
+                  <span>No unique Actor result matched the locally validated URL or job ID.</span>
                 {% elif run.retrieval_classification == "insufficient_content" %}
                   <strong>Incomplete LinkedIn content</strong>
-                  <span>Codex could not retrieve the complete substantive description; snippets are rejected.</span>
-                {% elif run.retrieval_classification in ["url_mismatch", "job_id_mismatch"] %}
-                  <strong>LinkedIn identity mismatch</strong>
-                  <span>The returned URL or job ID did not match the locally authenticated requested posting.</span>
-                {% elif run.retrieval_classification == "search_unavailable" %}
-                  <strong>Codex live search unavailable</strong>
-                  <span>The retrieval session could not use live web search.</span>
+                  <span>The selected record lacked a meaningful title or complete substantive description.</span>
+                {% elif run.retrieval_classification == "network_error" %}
+                  <strong>Apify network failure</strong>
+                  <span>The bounded HTTPS request could not be completed.</span>
+                {% elif run.retrieval_classification == "rate_limited" %}
+                  <strong>Apify rate limit reached</strong>
+                  <span>Wait for the provider limit to reset before retrying.</span>
                 {% elif run.retrieval_classification == "malformed_output" %}
-                  <strong>Codex retrieval format failure</strong>
-                  <span>Codex did not return exactly one complete schema-valid job result.</span>
+                  <strong>Apify result format failure</strong>
+                  <span>The selected record did not satisfy the local canonical job-posting contract.</span>
                 {% else %}
-                  <strong>Codex retrieval provider failure</strong>
-                  <span>Codex stopped before the exact posting could be verified.</span>
+                  <strong>Apify retrieval provider failure</strong>
+                  <span>Apify stopped before the exact posting could be verified.</span>
                 {% endif %}
                 <span>No résumé content was sent for analysis or tailoring.</span>
               </div>
@@ -573,13 +589,33 @@
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <button class="primary-button" type="submit">Retry Antigravity tailoring <span>→</span></button>
                 </form>
-                <p class="field-help">{{ run.antigravity_retry_reason }} The recovery creates a new isolated run, skips Codex retrieval and analysis, and stops at the normal validated-content-diff approval gate.</p>
+                <p class="field-help">{{ run.antigravity_retry_reason }} The recovery creates a new isolated run, skips Apify retrieval and Codex analysis, and stops at the normal validated-content-diff approval gate.</p>
               {% elif run.antigravity_retry_reason %}
                 <div class="alert alert-info">
                   <strong>New run required</strong>
                   <span>{{ run.antigravity_retry_reason }}</span>
                 </div>
               {% endif %}
+            {% elif run.failure_kind in ["ollama_preflight", "ollama_connection", "ollama_contract", "ollama_cannot_apply", "ollama_technical_failure"] %}
+              <div class="alert alert-warning">
+                {% if run.failure_kind == "ollama_preflight" %}
+                  <strong>Local writer preflight failure</strong>
+                  <span>The authenticated inputs failed before any Qwen or Ollama request was launched.</span>
+                {% elif run.failure_kind == "ollama_connection" %}
+                  <strong>Local Qwen connection failure</strong>
+                  <span>Resume Tailor could not reach Ollama or load the configured model at 127.0.0.1:11434.</span>
+                {% elif run.failure_kind == "ollama_contract" %}
+                  <strong>Qwen structured-output failure</strong>
+                  <span>The local response failed schema or evidence validation, so no résumé was rendered.</span>
+                {% elif run.failure_kind == "ollama_cannot_apply" %}
+                  <strong>Approved edit could not be applied</strong>
+                  <span>Qwen reported a bounded conflict instead of inventing a replacement claim.</span>
+                {% else %}
+                  <strong>Qwen technical failure</strong>
+                  <span>The local writer stopped safely and preserved sanitized diagnostics.</span>
+                {% endif %}
+                <span>No remote writer fallback was attempted. Confirm Ollama and resume-tailor-qwen are running, then start a new run.</span>
+              </div>
             {% elif run.failure_kind == "retrieval" %}
               <div class="alert alert-info">
                 <strong>LinkedIn retrieval fallback</strong>

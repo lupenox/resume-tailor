@@ -2,65 +2,73 @@
 
 `resume-tailor` is a local Linux CLI and polished localhost web application that
 creates a truthful, job-tailored resume from a structured master DOCX. Both
-interfaces share one Python pipeline: OpenAI Codex CLI retrieves public
-LinkedIn postings and performs evidence analysis, Google Antigravity CLI
+interfaces share one Python pipeline: Apify retrieves public LinkedIn postings,
+OpenAI Codex CLI performs evidence analysis, and local Qwen through Ollama
 produces the complete schema-constrained tailored résumé content,
-deterministic local code preserves DOCX formatting, LibreOffice and Poppler
-validate a one-page PDF, and Codex performs a final read-only visual/content
-review.
+deterministic local code validates and renders a Headless-style DOCX,
+LibreOffice and Poppler validate a one-page PDF, and Codex performs a final
+read-only visual/content review.
 
 The application never asks either model to edit the document. Models return
-structured content; Python validates it and inserts approved text into a copy of
-the master. The source DOCX is hashed before and after every run and is never an
-output target.
+structured content; Python validates it and either renders the deterministic
+Headless-style document or, for the Antigravity compatibility path, inserts
+approved text into a copy of the master. The source DOCX is hashed before and
+after every run and is never an output target.
 
 The web UI is optional. `tailor-resume` remains the complete terminal interface;
 `tailor-resume-ui` starts the browser interface on `127.0.0.1`.
 
 ## Pipeline architecture
 
-1. Read a job posting from the Linux clipboard or a UTF-8 text file, or ask a
-   dedicated Codex session with live search to retrieve exactly one supplied
-   public LinkedIn job-detail URL.
+1. Read a job posting from the Linux clipboard or a UTF-8 text file, or send
+   exactly one supplied public LinkedIn job-detail URL to the configured Apify
+   Actor.
 2. For URL mode, local Python validates HTTPS, hostname, path, requested URL,
-   canonical URL, and stable job-ID consistency; strictly validates the one
-   structured Codex result; saves canonical `job-source.json`; displays the
-   posting; and requires approval. The retrieval session receives the URL and
-   locally extracted job ID, but no résumé content or Antigravity content.
+   canonical URL, and stable job-ID consistency; starts and boundedly polls the
+   Actor; selects the matching dataset record; maps it into canonical
+   `job-source.json`; displays the normalized posting; and requires approval.
+   Apify receives only the URL, never résumé or writer content.
 3. Validate and structurally extract the master DOCX with `python-docx`.
 4. Send the extracted resume and untrusted posting to Codex in an ephemeral,
    read-only session with a strict analysis schema.
 5. Print the analysis. Stop on unanswered factual questions; otherwise require
    explicit approval.
 6. Run a local completeness and hash-authentication preflight, then send the
-   original content, immutable résumé source catalog, and approved edit catalog
-   to Antigravity over UTF-8 stdin in sandboxed print mode with a strict
-   tailored-content schema. Tailoring is an execution task, not generic plan
-   mode. Prompt text is never placed in argv or environment variables.
-7. Select exactly one documented Antigravity print-mode response candidate,
-   validate it strictly against the tailoring schema, and then run immutable-fact,
+   original content, relevant immutable résumé evidence, and approved edit
+   catalog to `resume-tailor-qwen` through Ollama's fixed
+   `http://127.0.0.1:11434` endpoint. The request is non-streaming, thinking is
+   disabled, and Ollama receives a run-specific JSON Schema as its `format`.
+   Prompt text travels to a cancellable child worker over UTF-8 stdin and never
+   appears in argv, environment variables, or a prompt file.
+7. Parse exactly `message.content` as one strict JSON object, validate it against
+   the complete canonical tailoring schema, and then run immutable-fact,
    approved-edit, technology, metrics, seniority, availability, structure, and
-   content-budget checks. Prose, Markdown fences, fragments, and ambiguous
-   candidates fail closed.
+   content-budget checks. Prose, Markdown fences, duplicate keys, non-finite
+   numbers, fragments, and invalid shapes fail closed.
 8. Write and display a section-by-section before/after diff. Refuse questionable
    claims; otherwise require explicit approval.
-9. Copy the master, replace only mapped text runs, and verify that paragraph/run
-   formatting, hyperlinks, contact information, section geometry, and list
-   structure remain unchanged.
+9. Render the approved content into a deterministic, single-column Headless-style
+   DOCX. Python—not Qwen—controls typography, page geometry, section ordering,
+   real list styles, contact information, and hyperlink targets. The original
+   master remains unchanged.
 10. Export one PDF page through a unique LibreOffice profile, validate text and
    bounding boxes with Poppler, and render `preview.png`.
 11. Give Codex the preview and complete evidence bundle for a fresh read-only QA.
-    A material QA finding returns a nonzero status and preserves every artifact.
+    A material QA finding stops for explicit authorization of at most one bounded
+    writer revision; the revised content must pass local evidence, diff approval,
+    rendering, and a second fresh Codex QA. A rejected or unsuccessful revision
+    returns a nonzero status and preserves every artifact.
 
 The step-2 trust and transport boundary is documented in
-[docs/codex-linkedin-retrieval.md](docs/codex-linkedin-retrieval.md).
+[docs/apify-linkedin-retrieval.md](docs/apify-linkedin-retrieval.md).
 
-Codex uses separate schemas and adapters for retrieval, analysis, and final QA.
+Codex uses separate schemas and adapters for analysis and final QA.
 The full Draft 2020-12 schemas `linkedin_job.schema.json`,
 `codex_analysis.schema.json`, and `final_qa.schema.json` remain canonical for
 local validation and retain constraints such as `uniqueItems`, size limits, and
-nonempty strings. Their checked-in `*.openai.schema.json` counterparts are
-compatibility sentinels derived for OpenAI's Structured Outputs subset. After
+nonempty strings. The Codex schemas have checked-in `*.openai.schema.json`
+compatibility sentinels derived for OpenAI's Structured Outputs subset; the
+Apify job record is normalized locally and has no model transport schema. After
 the posting is confirmed and the résumé is extracted, local code builds two
 immutable catalogs: exact résumé source blocks and exact job requirements with
 stable IDs and categories. Analysis receives a fresh run-specific transport
@@ -85,12 +93,19 @@ artifact is saved and a `*-normalization-warnings.json` sidecar records every
 affected field. All remaining Draft 2020-12 constraints are enforced locally;
 the transport transformation does not weaken factual-integrity validation.
 
-The current template validator expects the inspected design: one section, 32
+The master-input validator expects the inspected design: one section, 32
 paragraphs, no tables, US Letter geometry, three skill groups, three projects
 with 3/4/3 bullets, one open-source entry, one experience entry, six hyperlinks,
 real `List Bullet` styles, and the established direct-run formatting patterns.
 This is a deliberate safety boundary. Significant template drift stops the run
 instead of risking edits to the wrong paragraphs.
+
+New Qwen runs render the validated master content into the deterministic
+format documented in
+[docs/headless-resume-format.md](docs/headless-resume-format.md). The canonical
+content structure remains unchanged, so all existing evidence and revision
+checks still apply. `--writer-provider antigravity` retains the exact legacy
+copy-and-replace renderer and authenticated Antigravity recovery behavior.
 
 ### Local web architecture
 
@@ -102,14 +117,12 @@ cancellation hooks.
 
 The workflow page polls a small structured status endpoint. It displays concise
 stage messages, never hidden reasoning, raw prompts, environment variables,
-provider transcripts, or credentials. During Codex retrieval and analysis it
-reports elapsed time and periodic
-process-liveness heartbeats, distinguishes “still running” from “no process
-detected” during local validation, and never invents an ETA. Cancellation and bounded
-timeouts terminate the full subprocess group. Only one run can be active. A
-cancel request reaches the shared
-subprocess runner, terminates the complete process group, and preserves useful
-run artifacts.
+provider transcripts, or credentials. During Apify retrieval it reports the
+start, bounded Actor wait, dataset read, normalization, and ready-for-review
+states. During Codex analysis it reports elapsed time and process-liveness
+heartbeats without inventing an ETA. Cancellation best-effort aborts an active
+Actor run and terminates active local subprocess groups. Only one run can be
+active, and useful run artifacts are preserved.
 
 Provider failures use a concise public message. Sanitized, length-limited
 technical details are available in a collapsed disclosure instead of exposing a
@@ -121,7 +134,7 @@ transport schema, resolved analysis, company, and role. An Antigravity-only
 recovery is offered for authenticated post-approval launch, tailoring-contract,
 response-envelope, bounded `cannot_apply`, and technical failures when that
 record and every bound artifact still match. Recovery creates a new isolated
-run, skips Codex retrieval and analysis, and pauses at the normal
+run, skips Apify retrieval and Codex analysis, and pauses at the normal
 validated-content-diff approval gate. When a preserved response itself is one
 complete schema-valid result, a separate authenticated offline reprocessing
 path skips all providers;
@@ -149,8 +162,10 @@ The installer does **not** install dependencies. Check and install them yourself
 - `python-docx`
 - `jsonschema`
 - `fastapi`, `uvicorn`, `jinja2`, and `python-multipart` for the local UI
+- An Apify account, API token, and LinkedIn job-detail Actor for URL mode
 - OpenAI Codex CLI
-- Google Antigravity CLI (`agy`)
+- Ollama with the local `resume-tailor-qwen` model profile
+- Google Antigravity CLI (`agy`) only for the optional compatibility provider
 - LibreOffice
 - Poppler (`pdfinfo`, `pdftotext`, and `pdftoppm`)
 - `wl-paste`, `xclip`, or `xsel` only when using `--clipboard`
@@ -169,29 +184,68 @@ sudo pacman -S --needed python uv libreoffice-fresh poppler wl-clipboard
 sudo pacman -S --needed shellcheck
 ```
 
-Install Codex CLI and Antigravity CLI through their official distribution
-channels. This project never runs `sudo`, package managers, or global installers.
+Install Codex CLI, Ollama, and optionally Antigravity through their official
+distribution channels. This project never runs `sudo`, package managers, or
+global installers.
+
+Create the local writer profile once after downloading Qwen:
+
+```text
+FROM qwen3.5:9b
+PARAMETER num_ctx 8192
+PARAMETER temperature 0.2
+```
+
+Save that as a `Modelfile`, then run:
+
+```bash
+ollama create resume-tailor-qwen -f Modelfile
+ollama list
+```
+
+The application also sends `num_ctx: 8192`, `num_predict: 4096`, and a low
+temperature on each request. Start Ollama normally and verify the profile with
+`ollama ps` after a request. Resume Tailor intentionally refuses configurable or
+remote Ollama endpoints; only `127.0.0.1:11434` is used.
 
 ### Authentication prerequisites
 
-Before the first real pipeline run, authenticate Codex and Antigravity using
-their normal vendor login flows. Verify the exact executables used by your shell:
+Before the first real pipeline run, authenticate Codex using its normal vendor
+login flow and confirm the local Ollama service/model. Verify the exact tools:
 
 ```bash
 codex --version
 codex exec --help
+ollama --version
+ollama show resume-tailor-qwen
 agy --version
 agy --help
 ```
 
-`resume-tailor` does not read, copy, print, or store credentials. Authentication
-must already be available to each CLI in headless mode.
+The `agy` checks are needed only when selecting the Antigravity compatibility
+provider or recovering a historical Antigravity run.
 
-URL mode requires the installed Codex CLI to support its global `--search`
-switch. Retrieval is a fresh ephemeral, read-only Codex execution; it does not
-use a LinkedIn account, automate a browser, click Apply, submit a form, or send a
-message. If public search cannot retrieve the exact posting, the run fails
-closed and directs the user to pasted text, the clipboard, or a UTF-8 job file.
+`resume-tailor` does not print or store provider credentials. Authentication
+must already be available to each CLI in headless mode. URL mode additionally
+requires these process environment variables:
+
+```bash
+export APIFY_API_TOKEN='apify_api_REPLACE_WITH_THE_COMPLETE_TOKEN'
+export APIFY_ACTOR_ID='username/actor-name'
+```
+
+Obtain the exact Actor ID from the tested Actor's Apify Console page. Either its
+Apify ID or normal `username/actor-name` form is accepted. Preserve the entire
+token exactly as issued, including the `apify_api_` prefix; do not paste it into
+source, command output, screenshots, fixtures, or diagnostics. `.env.example`
+contains placeholders only, while populated `.env*` files and token files are
+gitignored. Resume Tailor reads the existing process environment and does not
+overwrite local configuration or automatically parse `.env` files.
+
+Start `tailor-resume-ui` from the same configured shell. URL retrieval sends the
+validated URL to Apify over HTTPS with bearer-header authentication, never uses
+a LinkedIn account or browser automation, and fails closed before résumé
+analysis when the Actor result cannot be authenticated and normalized.
 
 ## Local installation
 
@@ -340,12 +394,11 @@ tailor-resume \
   --output-dir "$HOME/Documents/Resumes/Tailored"
 ```
 
-URL retrieval always uses the dedicated Codex adapter. It provides no alternate
-web provider and never silently falls back after a retrieval failure. Codex
-receives only the normalized public URL, the stable job ID extracted locally,
-and data-handling instructions; it receives no résumé, résumé path, résumé hash,
-or Antigravity content. Pasted text, clipboard input, and UTF-8 job files bypass
-web retrieval entirely.
+URL retrieval always uses the dedicated Apify adapter. It provides no alternate
+web provider and never silently falls back after a retrieval failure. The Actor
+receives one `searchUrls` value containing the normalized public URL; it receives
+no résumé, résumé path, résumé hash, approved analysis, or writer content. Pasted
+text, clipboard input, and UTF-8 job files bypass web retrieval entirely.
 
 Only public `https://linkedin.com/jobs/view/...` and
 `https://www.linkedin.com/jobs/view/...` URLs are accepted initially. Tracking
@@ -373,10 +426,17 @@ tailor-resume --resume PATH
               [--yes]
               [--keep-workdir]
               [--timeout DURATION]
+              [--writer-provider {ollama,antigravity}]
+              [--ollama-model MODEL]
 ```
 
 Durations accept positive seconds, minutes, or hours such as `90s`, `15m`, and
 `1h`; the maximum is 24 hours. The default is `15m`.
+
+The default writer is `--writer-provider ollama --ollama-model
+resume-tailor-qwen`. Select `--writer-provider antigravity` only when you
+explicitly want the legacy provider and master-template renderer. No writer
+fallback happens automatically.
 
 `--yes` skips interactive approval input. In URL mode the posting confirmation
 screen is still displayed and recorded as approved by `--yes`. The flag does
@@ -410,13 +470,13 @@ That action replaces the retrieved description only with text you explicitly
 paste; it never clicks LinkedIn controls or accesses an account. The next gate
 groups Codex's proposed summary, experience, and project changes, supported
 keywords, gaps, forbidden claims, and unchanged sections. A final before/after
-content gate still protects deterministic rendering after Antigravity and local
+content gate still protects deterministic rendering after Qwen and local
 evidence checks.
 
 Any other input, including end-of-input, stops the pipeline and keeps the
 artifacts already produced. If Codex asks an unanswered factual question, the
 pipeline stops even with `--yes`; answer it outside the tool and update the
-factual master only when appropriate. Antigravity runs only after analysis
+factual master only when appropriate. The writer runs only after analysis
 approval and cannot reopen factual discovery or request unlisted experience.
 
 ## Output artifacts
@@ -427,7 +487,7 @@ new mode-0700 directory with sanitized company/role names and a timestamp:
 ```text
 rg-talent-agentic-ai-developer-YYYYMMDD-HHMMSS/
 ├── job-source.json               # URL mode only
-├── codex-linkedin-retrieval-diagnostic.json  # URL mode, content-free diagnostic
+├── apify-linkedin-retrieval-diagnostic.json  # URL mode, token-free diagnostic
 ├── job-description.txt
 ├── job-requirements.json
 ├── extracted-master-resume.json
@@ -436,8 +496,9 @@ rg-talent-agentic-ai-developer-YYYYMMDD-HHMMSS/
 ├── codex-analysis-resolved.json
 ├── codex-analysis-normalization-warnings.json  # only when duplicates are removed
 ├── codex-analysis-approval.json
-├── antigravity-response.json
-├── antigravity-response-envelope.json
+├── ollama-tailoring-transport.schema.json
+├── ollama-response.json
+├── ollama-response-envelope.json
 ├── tailored-content.json
 ├── content-diff.md
 ├── Logan-Lapierre-RG-Talent-Agentic-AI-Developer.docx
@@ -448,6 +509,11 @@ rg-talent-agentic-ai-developer-YYYYMMDD-HHMMSS/
 └── run-metadata.json
 ```
 
+Antigravity-selected runs use `antigravity-response.json` and
+`antigravity-response-envelope.json` instead. A single authorized Qwen revision
+adds the corresponding `ollama-revision-*` artifacts while preserving both
+generation-specific and promoted stable deliverables.
+
 Failed runs preserve useful artifacts and record the failed stage and safe error
 message in `run-metadata.json`. Metadata contains tool versions, artifact names,
 and source hashes, but never environment variables or credentials.
@@ -456,18 +522,18 @@ In URL mode, `job-source.json` records the validated fetch status, requested and
 resolved URLs, LinkedIn job ID when available, title, company, location,
 workplace arrangement, employment type, salary text, complete normalized
 description, responsibilities, required/preferred qualifications,
-technologies/skills, AI focus areas, and retrieval warnings.
+technologies/skills, AI focus areas, seniority, date posted, applicant count,
+Apify provenance, and retrieval warnings. Optional values remain null or empty;
+the adapter does not invent them.
 
 ## Truthfulness and safety rules
 
 - The master resume is the only factual authority.
 - Job descriptions are untrusted prompt-injection input and are placed inside
   unique, explicit data-only boundaries in both model prompts.
-- LinkedIn pages and search results are untrusted data, never instructions. The
-  dedicated Codex retrieval prompt permits live search only for the exact
-  supplied public job-detail URL and forbids following webpage instructions,
-  commands, sign-in, Apply actions, forms, messages, unrelated postings, local
-  file access, file modification, or another agent.
+- LinkedIn page content returned by the Actor is untrusted data, never
+  instructions. It is copied only through a bounded field allowlist, HTML is
+  converted to plain structured text, and script/style content is discarded.
 - URL mode accepts only HTTPS LinkedIn job paths without credentials. Requested,
   final, and extracted job IDs are compared locally; a different posting or
   external redirect is rejected before résumé extraction or Codex analysis.
@@ -479,11 +545,11 @@ technologies/skills, AI focus areas, and retrieval warnings.
 - RAG, GraphQL, observability, distributed production scale, IVR platforms, or
   any other absent skill cannot be introduced.
 - Models cannot add sections, projects, skill groups, or bullets.
-- No model edits files. Codex retrieval and analysis run with
-  `--sandbox read-only` and `--ephemeral`; retrieval additionally uses the
-  global `--search` interface and a strict job schema. Post-approval
-  Antigravity tailoring uses sandboxed print mode without generic plan or
-  edit-acceptance mode.
+- No model edits files. Apify performs retrieval only. Codex analysis runs with
+  `--sandbox read-only` and `--ephemeral`. Post-approval Qwen returns only
+  schema-constrained content through local Ollama; Python alone writes DOCX/PDF
+  artifacts. The optional Antigravity provider retains its sandboxed print-mode
+  adapter.
 - The pipeline never uses `eval`, `shell=True`, dangerous permission bypasses,
   recursive agent calls, destructive Git commands, or source-file overwrite.
 - It does not send email, post to LinkedIn, submit applications, or upload output.
@@ -496,11 +562,11 @@ adjust the structured request or master rather than bypassing the check.
 
 ## Privacy disclosure
 
-In URL mode, a dedicated Codex retrieval session receives the supplied public
-LinkedIn URL and locally extracted job ID, but no résumé content, résumé path,
-résumé hash, or Antigravity content. Only after the user confirms the posting
-does a separate Codex analysis session receive extracted résumé content and the
-confirmed job description. Antigravity receives the approved analysis and
+In URL mode, the configured Apify Actor receives the supplied public LinkedIn
+URL, but no résumé content, résumé path, résumé hash, approved analysis, or
+writer content. Only after the user confirms the normalized posting does a
+separate Codex analysis session receive extracted résumé content and the
+confirmed job description. Local Qwen receives the approved analysis and
 authenticated source material only at step 6 so it can write the complete
 tailored résumé content. A fresh final Codex session receives the rendered
 preview and evidence bundle for independent QA. Review those services' data
@@ -508,6 +574,13 @@ controls before use.
 
 Generated artifacts otherwise remain on the local filesystem unless you
 explicitly upload or share them. No keys or environment variables are logged.
+Ollama is contacted only at `127.0.0.1:11434`; Resume Tailor does not implement
+a remote Ollama endpoint or an automatic cloud-writer fallback. Raw prompt text
+is not stored. The sanitized envelope records prompt byte count/hash, selected
+model, schema hash, response-artifact hash, local endpoint, and validation
+result.
+
+When the optional Antigravity provider is selected,
 Antigravity 1.1.8 print mode accepts stdin prompts. Resume Tailor keeps
 Antigravity argv limited to flags and short schema paths and sends prompt bytes
 through UTF-8 stdin, so résumé/job/prompt content is absent from process command
@@ -552,8 +625,10 @@ temporary directory. The pipeline then requires:
 - every Poppler text bounding box inside the page;
 - no detected overlapping text lines;
 - a nonempty PNG preview;
-- unchanged DOCX geometry, run/paragraph formatting, list structure, contact
-  information, and all six hyperlink targets.
+- deterministic US Letter geometry, Arial text, single-column/table-free
+  structure, real bullets, unchanged contact information, and all original
+  hyperlink targets for Headless output. Antigravity compatibility runs retain
+  the stricter exact master-template formatting comparison.
 
 The final Codex review inspects clipping, overflow, readability, grammar,
 truthfulness, duplication, ATS alignment, and keyword density. It is read-only
@@ -602,48 +677,56 @@ The web UI uses pasted clipboard text instead of invoking a system clipboard
 binary. Click **Paste from clipboard** when the browser grants permission, or
 focus the field and use `Ctrl+V`.
 
-### LinkedIn login wall
+### Apify configuration or authentication fails
 
-URL mode never automates login or accesses your LinkedIn account. If retrieval
-returns `login_required`, copy the complete posting text yourself and rerun with:
+URL mode stops before an Actor run when `APIFY_API_TOKEN` or `APIFY_ACTOR_ID`
+is missing or malformed. Authentication failures and an Actor-not-found response
+are reported separately. Correct the environment in the shell that starts the
+CLI or UI; never paste the token into a diagnostic or issue report.
+
+Expected configuration/provider messages identify these cases without echoing a
+credential:
+
+- Apify token configuration required
+- Apify Actor configuration required
+- Apify authentication failed
+- Apify Actor not found
+
+### Apify run, network, or rate-limit failure
+
+Actor runs are asynchronous and bounded by the pipeline timeout. Resume Tailor
+polls documented run states, best-effort aborts a still-active run on
+cancellation or timeout, and does not invoke another retrieval provider.
+`actor_failure`, `actor_timeout`, `network_error`, and `rate_limited` stop
+before résumé extraction or Codex analysis.
+
+Live Actor runs can consume Apify platform credits according to that Actor's
+pricing and compute usage. Offline tests inject a fake client and never contact
+Apify or consume credits.
+
+### Empty, mismatched, or malformed Apify result
+
+After a successful run, Resume Tailor reads at most 20 default-dataset records
+and requires exactly one record matching the requested URL or locally extracted
+job ID. An empty dataset, no unique match, missing meaningful title or
+substantive description, unsafe text, or schema-invalid normalized record fails
+closed.
+
+`apify-linkedin-retrieval-diagnostic.json` may contain the HTTP status,
+sanitized provider message, Actor/run/dataset IDs, terminal state, item count,
+recognized field names, byte count/hash, and validation result. It never
+contains the API token, authorization header, signed credential URL, raw dataset
+record, job description, environment dump, or résumé data.
+
+For any retrieval failure, copy the complete posting text yourself and rerun
+with:
 
 ```bash
 tailor-resume ... --job-file "/path/to/job.txt" --company "Company" --role "Role"
 ```
 
-Clipboard mode is an equivalent fallback.
+Clipboard mode and the UI's pasted-text mode are equivalent local fallbacks.
 
-In the web UI, return to the dashboard and select **Clipboard text** or **Text
-file**. The failed URL run remains visible with its safe diagnostic artifacts.
-
-### Codex live search is unavailable
-
-URL mode requires the installed Codex CLI's global `--search` interface. A
-bounded `search_unavailable` or `provider_failure` outcome stops before résumé
-extraction and analysis. Resume Tailor does not switch providers or fabricate a
-posting. Use a complete description through `--job-file`, `--clipboard`, or the
-web UI while checking Codex authentication and live-search availability.
-
-`codex-linkedin-retrieval-diagnostic.json` contains only a bounded
-classification, stage, exit status, byte counts, hashes, root field names/types,
-schema hashes, and validation state. It excludes provider prose, credentials,
-hidden reasoning, environment variables, and posting text.
-
-### Codex retrieval output is malformed
-
-Retrieval accepts exactly one complete JSON document from
-`--output-last-message`. Missing fields, schema drift, multiple JSON values,
-Markdown fences, prose, fragments, oversized output, or an invalid document are
-classified locally and rejected. Resume Tailor never strips fences, scrapes
-braces, joins fragments, or chooses among candidates. Use pasted text, the
-clipboard, or a UTF-8 job file while correcting the adapter or CLI compatibility.
-
-### Expired or unavailable LinkedIn posting
-
-`expired`, `unavailable`, and `insufficient_content` stop before résumé
-extraction or Codex analysis.
-Find an active posting or provide a complete saved description through
-`--job-file` or `--clipboard`. Search-card snippets are intentionally rejected.
 
 ### Incorrect or suspicious LinkedIn redirect
 
@@ -680,7 +763,7 @@ every source, requirement, schema, approval, response, and ancestry hash
 authenticates, **Reprocess preserved Antigravity response** creates a new
 provider-free run and pauses at the content-diff gate. Otherwise, offline salvage
 is unavailable; authenticated **Retry Antigravity tailoring** remains available
-without rerunning Codex retrieval or analysis.
+without rerunning Apify retrieval or Codex analysis.
 
 ### The UI does not open
 
@@ -730,9 +813,11 @@ facts and technologies.
 Development and inspection verified these local interfaces:
 
 - Codex CLI `0.146.0`: `codex exec`, stdin prompt (`-`), `--cd`,
-  global `--search` placed before `exec`, `--ignore-user-config`,
-  `--sandbox read-only`, `--ephemeral`, `--skip-git-repo-check`,
+  `--ignore-user-config`, `--sandbox read-only`, `--ephemeral`, `--skip-git-repo-check`,
   `--output-schema`, `--output-last-message`, and `--image`.
+- Apify API v2: bearer-header authentication, asynchronous Actor runs,
+  run-status polling, best-effort abort, and default-dataset item retrieval.
+  The configured job-detail Actor receives one `searchUrls` entry.
 - Antigravity CLI `1.1.8`: `--prompt` print mode with UTF-8 stdin, optional
   `--sandbox`, `--output-format json`, `--json-schema`, and `--print-timeout`
   for step-6 tailoring.
@@ -744,8 +829,8 @@ Development and inspection verified these local interfaces:
 Antigravity 1.1.8 does not expose a `--cwd` option, so this project sets the
 subprocess working directory directly. At startup it records detected versions.
 If a newer CLI removes a verified flag or changes its structured output, the
-adapter fails closed with an actionable error; re-run the four help/version
-commands and update the corresponding adapter and tests.
+adapter fails closed with an actionable error; re-check the relevant provider
+interface and update the corresponding adapter and tests.
 
 ## Development and tests
 
@@ -765,12 +850,13 @@ bash -n tailor-resume tailor-resume-ui install.sh uninstall.sh
 shellcheck tailor-resume tailor-resume-ui install.sh uninstall.sh
 ```
 
-The current suite contains **227 synthetic/offline tests**. Tests prepend
-`tests/stubs` to `PATH` for Codex and Antigravity. They never make
-real model or network calls. URL tests simulate successful and redirected
-postings, multiple companies and AI titles, mismatches, login walls, expiry,
-missing content, malformed output, unsafe URLs, webpage prompt injection,
-rejection, and confirmed continuation. Integration tests
+The suite is synthetic and offline. Tests prepend `tests/stubs` to `PATH` for
+Codex and Antigravity and inject a fake Apify HTTP/run client. They never make
+real model or network calls or consume Apify credits. URL tests cover valid and
+unsafe URLs, job-ID extraction, configuration failures, exact Actor input,
+successful run/dataset handling, field normalization, HTML cleanup, optional
+fields, authentication/HTTP failures, empty or mismatched results, timeout,
+token redaction, rejection, and confirmed continuation. Integration tests
 exercise `python-docx`, LibreOffice, and Poppler against the fixture copy,
 validate one-page output, and confirm the master hash is unchanged.
 
@@ -785,9 +871,9 @@ cancellation. No test invokes a real model or network fetch.
 
 Resume Tailor is a personal, local-first portfolio project rather than a hosted
 multi-user service. Its deterministic template mapper intentionally supports one
-inspected DOCX structure; significant template drift fails closed. Provider CLI
-formats and authentication behavior can change, model output can still be
-incorrect, LinkedIn or live search may block public retrieval, local schema
+inspected DOCX structure; significant template drift fails closed. Provider API
+and CLI formats and authentication behavior can change, model output can still
+be incorrect, LinkedIn or the configured Actor may block public retrieval, local schema
 validation cannot prove semantic equivalence, and human review remains
 mandatory. This tool does not submit applications or replace factual résumé
 maintenance.

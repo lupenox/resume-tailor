@@ -6,23 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
-from .utilities import CodexLinkedInRetrievalError, InputError
+from .utilities import ApifyLinkedInRetrievalError, InputError
 
 
-FETCH_STATUSES = frozenset(
-    {
-        "success",
-        "login_required",
-        "expired",
-        "unavailable",
-        "insufficient_content",
-        "url_mismatch",
-        "job_id_mismatch",
-        "search_unavailable",
-        "provider_failure",
-        "malformed_output",
-    }
-)
+FETCH_STATUSES = frozenset({"success"})
 ALLOWED_LINKEDIN_HOSTS = frozenset({"linkedin.com", "www.linkedin.com"})
 _JOB_PATH_RE = re.compile(r"^/jobs/view/[^/]+/?$")
 _JOB_ID_RE = re.compile(r"(?:^|-)([0-9]{5,20})$")
@@ -160,7 +147,7 @@ def normalize_job_description(value: str) -> str:
 
 
 def _raise_malformed() -> None:
-    raise CodexLinkedInRetrievalError("malformed_output")
+    raise ApifyLinkedInRetrievalError("malformed_output")
 
 
 def _validate_safe_web_text(payload: dict[str, Any]) -> None:
@@ -170,11 +157,16 @@ def _validate_safe_web_text(payload: dict[str, Any]) -> None:
         "location",
         "employment_type",
         "salary",
+        "seniority_level",
+        "date_posted",
     )
     for field in scalar_fields:
-        value = payload[field]
+        value = payload.get(field)
         if value is not None and _has_unsafe_control(value):
             _raise_malformed()
+    applicant_count = payload.get("applicant_count")
+    if isinstance(applicant_count, str) and _has_unsafe_control(applicant_count):
+        _raise_malformed()
     description = payload["normalized_job_description"]
     if _has_unsafe_control(description, allow_layout=True):
         _raise_malformed()
@@ -205,23 +197,23 @@ def validate_job_source(
     try:
         returned_request = validate_linkedin_url(payload["requested_url"])
     except InputError as exc:
-        raise CodexLinkedInRetrievalError("url_mismatch") from exc
+        raise ApifyLinkedInRetrievalError("no_matching_result") from exc
     if returned_request.normalized != requested.normalized:
-        raise CodexLinkedInRetrievalError("url_mismatch")
+        raise ApifyLinkedInRetrievalError("no_matching_result")
 
     status = payload["fetch_status"]
     if status not in FETCH_STATUSES:
         _raise_malformed()
     if status != "success":
-        raise CodexLinkedInRetrievalError(status)
+        _raise_malformed()
 
     final_url = payload["final_resolved_url"]
     if not isinstance(final_url, str):
-        raise CodexLinkedInRetrievalError("url_mismatch")
+        raise ApifyLinkedInRetrievalError("no_matching_result")
     try:
         validated_final = validate_linkedin_url(final_url)
     except InputError as exc:
-        raise CodexLinkedInRetrievalError("url_mismatch") from exc
+        raise ApifyLinkedInRetrievalError("no_matching_result") from exc
 
     extracted_id = payload["linkedin_job_id"]
     if (
@@ -229,20 +221,20 @@ def validate_job_source(
         or validated_final.job_id != requested.job_id
         or returned_request.job_id != requested.job_id
     ):
-        raise CodexLinkedInRetrievalError("job_id_mismatch")
+        raise ApifyLinkedInRetrievalError("no_matching_result")
 
     company = payload["company"]
     title = payload["job_title"]
     if not isinstance(company, str) or not company.strip():
-        raise CodexLinkedInRetrievalError("insufficient_content")
+        raise ApifyLinkedInRetrievalError("insufficient_content")
     if not isinstance(title, str) or not title.strip():
-        raise CodexLinkedInRetrievalError("insufficient_content")
+        raise ApifyLinkedInRetrievalError("insufficient_content")
     description = normalize_job_description(payload["normalized_job_description"])
     if (
         len(description) < _MINIMUM_DESCRIPTION_CHARACTERS
         or len(description.split()) < _MINIMUM_DESCRIPTION_WORDS
     ):
-        raise CodexLinkedInRetrievalError("insufficient_content")
+        raise ApifyLinkedInRetrievalError("insufficient_content")
 
     normalized_payload = dict(payload)
     normalized_payload["requested_url"] = requested.normalized

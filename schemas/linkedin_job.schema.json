@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Codex LinkedIn job retrieval",
+  "title": "Canonical LinkedIn job posting",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -25,18 +25,7 @@
   "properties": {
     "fetch_status": {
       "type": "string",
-      "enum": [
-        "success",
-        "login_required",
-        "expired",
-        "unavailable",
-        "insufficient_content",
-        "url_mismatch",
-        "job_id_mismatch",
-        "search_unavailable",
-        "provider_failure",
-        "malformed_output"
-      ]
+      "const": "success"
     },
     "requested_url": {
       "type": "string",
@@ -88,6 +77,29 @@
         {"type": "null"},
         {"type": "string", "minLength": 1, "maxLength": 500}
       ]
+    },
+    "seniority_level": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 300}
+      ]
+    },
+    "date_posted": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 200}
+      ]
+    },
+    "applicant_count": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 0},
+        {"type": "string", "minLength": 1, "maxLength": 200}
+      ]
+    },
+    "retrieval_source": {
+      "type": "string",
+      "const": "apify"
     },
     "normalized_job_description": {
       "type": "string",

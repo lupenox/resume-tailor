@@ -61,6 +61,7 @@ def build_revision_prompt(
     qa_result: dict[str, Any],
     company: str,
     role: str,
+    provider_name: str = "Antigravity",
 ) -> str:
     target_map = approved_revision_targets(
         qa_result=qa_result,
@@ -73,6 +74,8 @@ def build_revision_prompt(
         }
         for paragraph in extracted_resume["paragraphs"]
     ]
+    provider_label = provider_name.strip() or "The writer"
+    provider_token = provider_label.upper().replace(" ", "_")
     return f"""Revise the already-authored resume now. Do not plan, ask for more
 information, invoke tools, call another agent, or modify any file. Return exactly
 one strict structured result matching the supplied JSON schema.
@@ -88,7 +91,7 @@ TARGET
 Company: {company}
 Role: {role}
 
-CURRENT ANTIGRAVITY-AUTHORED CONTENT
+CURRENT {provider_token}-AUTHORED CONTENT
 BEGIN_CURRENT_TAILORED_CONTENT
 {json.dumps(current_tailored_content, ensure_ascii=False, indent=2)}
 END_CURRENT_TAILORED_CONTENT
@@ -121,7 +124,7 @@ REVISION TARGET AUTHORIZATION
 {json.dumps(target_map, ensure_ascii=False, indent=2)}
 
 NON-NEGOTIABLE RULES
-- Antigravity is the sole author. Revise the resume content now, not a plan.
+- {provider_label} is the sole author. Revise the resume content now, not a plan.
 - Address only authenticated QA issue IDs and preserve all other content exactly.
 - Change only targets present in REVISION TARGET AUTHORIZATION.
 - Keep every revision within the original approved edit and evidence boundaries.
@@ -269,12 +272,12 @@ def validate_revision_scope(
         ) from exc
     if not changed:
         raise RevisionValidationError(
-            "Antigravity returned complete without changing an authorized QA target."
+            "The writer returned complete without changing an authorized QA target."
         )
     unauthorized = [content_id for content_id in changed if content_id not in target_map]
     if unauthorized:
         raise RevisionValidationError(
-            "Antigravity changed content outside the authenticated QA target set: "
+            "The writer changed content outside the authenticated QA target set: "
             + ", ".join(unauthorized)
         )
     return {content_id: target_map[content_id] for content_id in changed}
@@ -282,7 +285,6 @@ def validate_revision_scope(
 
 def build_revision_diff(
     *,
-    master_content: dict[str, Any],
     initial_content: dict[str, Any],
     revised_content: dict[str, Any],
     issue_map: dict[str, list[str]],
@@ -297,7 +299,7 @@ def build_revision_diff(
         "",
         master_to_revision_diff.rstrip(),
         "",
-        "## Initial Antigravity output versus revision 1",
+        "## Initial writer output versus revision 1",
         "",
     ]
     for content_id, issue_ids in issue_map.items():

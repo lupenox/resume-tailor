@@ -69,7 +69,6 @@ def _job_catalog() -> dict[str, Any]:
     [
         "codex_analysis.schema.json",
         "final_qa_provider.schema.json",
-        "linkedin_job.schema.json",
     ],
 )
 def test_codex_transport_schemas_contain_no_unique_items(

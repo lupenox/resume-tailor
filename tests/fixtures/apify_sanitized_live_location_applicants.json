@@ -1,0 +1,17 @@
+{
+  "jobUrl": "https://www.linkedin.com/jobs/view/sanitized-agentic-engineer-4445544448/",
+  "jobTitle": "Sanitized Agentic Engineer",
+  "companyName": "Sanitized Employer",
+  "jobLocation": "United States\n43 applicants",
+  "description": "| 100% Remote (WFH) Opportunity\n\nGeneral Summary\n\nThis sanitized synthetic posting describes building production-grade agentic systems that execute multi-step workflows. The engineer works with language-model orchestration, tool integration, memory, human approval gates, observability, reliability, safety, and governance. This fixture preserves the live response's relevant field shape without retaining the original employer or posting text.",
+  "criteria": [
+    {
+      "name": "Employment type",
+      "value": "Full-time"
+    },
+    {
+      "name": "Seniority level",
+      "value": "Mid-Senior level"
+    }
+  ]
+}

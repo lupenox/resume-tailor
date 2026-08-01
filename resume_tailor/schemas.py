@@ -20,7 +20,6 @@ SCHEMA_DIRECTORY = Path(__file__).resolve().parent.parent / "schemas"
 CODEX_TRANSPORT_SCHEMAS = {
     "codex_analysis.schema.json": "codex_analysis.openai.schema.json",
     "final_qa_provider.schema.json": "final_qa_provider.openai.schema.json",
-    "linkedin_job.schema.json": "linkedin_job.openai.schema.json",
 }
 CODEX_ANALYSIS_RUN_SCHEMA_NAME = "codex-analysis-transport.schema.json"
 

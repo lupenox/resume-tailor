@@ -53,16 +53,9 @@ def stubs_on_path(monkeypatch: pytest.MonkeyPatch, repository_root: Path) -> Pat
     monkeypatch.delenv("STUB_CODEX_MODE", raising=False)
     monkeypatch.delenv("STUB_AGY_MODE", raising=False)
     for name in (
-        "STUB_CODEX_LINKEDIN_MODE",
-        "STUB_CODEX_LINKEDIN_COMPANY",
-        "STUB_CODEX_LINKEDIN_TITLE",
-        "STUB_CODEX_LINKEDIN_LOCATION",
-        "STUB_CODEX_LINKEDIN_WORKPLACE",
-        "STUB_CODEX_LINKEDIN_FINAL_URL",
-        "STUB_CODEX_RETRIEVAL_LOG",
         "STUB_CODEX_INVOCATION_LOG",
-        "STUB_CODEX_PID_LOG",
-        "STUB_CODEX_CHILD_PID_LOG",
+        "APIFY_API_TOKEN",
+        "APIFY_ACTOR_ID",
     ):
         monkeypatch.delenv(name, raising=False)
     return stubs

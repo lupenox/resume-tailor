@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .apify_job import invoke_apify_linkedin_retrieval
 from .antigravity_writer import (
     ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
     invoke_antigravity,
@@ -16,7 +17,6 @@ from .antigravity_writer import (
 )
 from .clipboard import read_clipboard
 from .codex_analysis import invoke_codex_analysis, readable_analysis
-from .codex_linkedin import invoke_codex_linkedin_retrieval
 from .evidence import (
     build_content_diff,
     resolve_analysis_evidence,
@@ -28,9 +28,17 @@ from .linkedin_job import (
 )
 from .job_requirements import build_job_requirement_catalog
 from .orchestration import PipelineHooks
+from .ollama_transport import ollama_dependency_versions
+from .ollama_writer import (
+    DEFAULT_OLLAMA_MODEL,
+    OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
+    invoke_ollama,
+    invoke_ollama_revision,
+    load_ollama_response_metadata,
+    validate_ollama_model_name,
+)
 from .qa import invoke_final_qa
 from .revision import (
-    REVISION_RESPONSE_FILENAME,
     REVISION_RESPONSE_METADATA_FILENAME,
     REVISION_SCHEMA_NAME,
     approved_revision_targets,
@@ -57,6 +65,8 @@ from .schemas import (
     validate_codex_analysis_transport_artifact,
 )
 from .utilities import (
+    ApifyConfigurationError,
+    ApifyLinkedInRetrievalError,
     ApprovalError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
@@ -68,14 +78,21 @@ from .utilities import (
     AntigravityTailoringPreflightError,
     AntigravityTechnicalFailureError,
     CancellationError,
-    CodexLinkedInRetrievalError,
     ExitCode,
     InputError,
     IntegrityError,
+    OllamaCannotApplyError,
+    OllamaConnectionError,
+    OllamaRevisionCannotApplyError,
+    OllamaRevisionContractError,
+    OllamaRevisionTechnicalFailureError,
+    OllamaTailoringContractError,
+    OllamaTechnicalFailureError,
     QAError,
     RevisionValidationError,
     ResumeTailorError,
     SourceEvidenceError,
+    TailoringPreflightError,
     TruthfulnessError,
     WaitingError,
     atomic_write_bytes,
@@ -152,6 +169,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=_duration_argument("15m"),
         metavar="DURATION",
         help="model timeout such as 90s, 15m, or 1h (default: 15m)",
+    )
+    parser.add_argument(
+        "--writer-provider",
+        choices=("ollama", "antigravity"),
+        default="ollama",
+        help=(
+            "résumé-writing provider (default: ollama; antigravity remains a "
+            "compatibility option)"
+        ),
+    )
+    parser.add_argument(
+        "--ollama-model",
+        default=DEFAULT_OLLAMA_MODEL,
+        help=f"local Ollama model/profile (default: {DEFAULT_OLLAMA_MODEL})",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
@@ -233,16 +264,31 @@ def _analysis_dependency_versions(cwd: Path) -> dict[str, str]:
     }
 
 
-def _tailoring_dependency_versions(cwd: Path) -> dict[str, str]:
-    agy = require_executable("agy")
+def _tailoring_dependency_versions(
+    cwd: Path,
+    provider: str = "antigravity",
+    ollama_model: str = DEFAULT_OLLAMA_MODEL,
+) -> dict[str, str]:
     libreoffice = require_executable("libreoffice")
     require_executable("pdfinfo")
     require_executable("pdftotext")
     require_executable("pdftoppm")
-    return {
-        "antigravity": _tool_version(agy, ["--version"], cwd=cwd),
+    versions = {
         "libreoffice": _tool_version(libreoffice, ["--version"], cwd=cwd),
     }
+    if provider == "antigravity":
+        agy = require_executable("agy")
+        versions["antigravity"] = _tool_version(agy, ["--version"], cwd=cwd)
+        return versions
+    if provider == "ollama":
+        versions.update(
+            ollama_dependency_versions(
+                model=validate_ollama_model_name(ollama_model),
+                cwd=cwd,
+            )
+        )
+        return versions
+    raise InputError(f"Unsupported résumé writer provider: {provider!r}.")
 
 
 def _header_name(extracted: dict[str, Any]) -> str:
@@ -252,10 +298,17 @@ def _header_name(extracted: dict[str, Any]) -> str:
     raise InputError("Could not determine the resume owner's name from the template.")
 
 
-def _required_pdf_text(extracted: dict[str, Any]) -> list[str]:
-    from .docx_extract import SECTION_HEADINGS
+def _required_pdf_text(
+    extracted: dict[str, Any],
+    *,
+    document_format: str = "master-template",
+) -> list[str]:
+    if document_format == "headless":
+        from .headless_render import HEADLESS_SECTION_HEADINGS as headings
+    else:
+        from .docx_extract import SECTION_HEADINGS as headings
 
-    required = [_header_name(extracted), *SECTION_HEADINGS]
+    required = [_header_name(extracted), *headings]
     required.extend(
         link["text"]
         for link in extracted["document"]["hyperlinks"]
@@ -358,6 +411,28 @@ def _elapsed_label(elapsed_seconds: float) -> str:
     return f"{seconds}s"
 
 
+def _apify_progress_message(
+    phase: str,
+    elapsed_seconds: float,
+    status: str | None,
+) -> str:
+    if phase == "starting_actor":
+        return "Starting Apify retrieval."
+    if phase == "waiting_for_actor":
+        status_text = f"; status {status}" if status else ""
+        return (
+            "Waiting for the Apify Actor "
+            f"— elapsed {_elapsed_label(elapsed_seconds)}{status_text}."
+        )
+    if phase == "reading_job_result":
+        return "Reading the matching job result from the Apify dataset."
+    if phase == "normalizing_job_posting":
+        return "Normalizing the Apify result into the canonical job posting."
+    if phase == "ready_for_review":
+        return "Canonical validation passed. The job posting is ready for review."
+    return "Apify LinkedIn retrieval is continuing."
+
+
 def run_pipeline(
     args: argparse.Namespace,
     *,
@@ -372,6 +447,14 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     hooks.progress("validating_input", "Validating the résumé and job input.")
     resume_path = _validate_resume_path(args.resume)
     timeout_seconds, antigravity_duration = args.timeout
+    writer_provider = getattr(args, "writer_provider", "antigravity")
+    if writer_provider not in {"ollama", "antigravity"}:
+        raise InputError(
+            f"Unsupported résumé writer provider: {writer_provider!r}."
+        )
+    ollama_model = validate_ollama_model_name(
+        getattr(args, "ollama_model", DEFAULT_OLLAMA_MODEL)
+    )
     retry_context = getattr(args, "retry_context", None)
     retry_inputs = None
     antigravity_retry_context = getattr(
@@ -434,6 +517,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             current_resume=resume_path,
         )
         antigravity_retry_inputs = antigravity_reprocess_inputs.retry_inputs
+    if antigravity_retry_inputs is not None:
+        writer_provider = "antigravity"
+    writer_name = "Qwen" if writer_provider == "ollama" else "Antigravity"
+    document_format = (
+        "headless" if writer_provider == "ollama" else "master-template"
+    )
     requested_linkedin_url = None
     fetched_job: dict[str, Any] | None = None
     if antigravity_retry_inputs is not None:
@@ -497,7 +586,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     if requested_linkedin_url is not None:
         run_directory = create_unique_run_dir(
             output_dir,
-            "codex-linkedin",
+            "apify-linkedin",
             "retrieval",
         )
     else:
@@ -514,6 +603,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         "company": company,
         "role": role,
         "job_source": job_source,
+        "writer": {
+            "provider": writer_provider,
+            "name": writer_name,
+            "model": ollama_model if writer_provider == "ollama" else None,
+            "document_format": document_format,
+        },
         "source_resume": {
             "filename": resume_path.name,
             "sha256_before": source_hash,
@@ -550,7 +645,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         metadata["approved_analysis_reused"] = True
     if antigravity_reprocess_inputs is not None:
         metadata["provider_calls_reused"] = {
-            "codex_linkedin_retrieval": False,
+            "apify_linkedin_retrieval": False,
             "codex_analysis": False,
             "antigravity_tailoring": False,
         }
@@ -598,17 +693,18 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
         if requested_linkedin_url is not None:
-            metadata["stage"] = "codex-linkedin-retrieval"
+            metadata["stage"] = "apify-linkedin-retrieval"
             hooks.progress(
                 "fetching_job",
-                "Codex is retrieving the exact public LinkedIn posting with live search.",
+                "Validating the LinkedIn URL and locally extracted job ID.",
             )
-            metadata["codex_linkedin_retrieval"] = {
-                "provider": "codex",
-                "interface": "codex --search exec",
-                "live_search": True,
-                "sandbox": "read-only",
-                "session": "ephemeral",
+            metadata["apify_linkedin_retrieval"] = {
+                "provider": "apify",
+                "interface": "Apify API v2",
+                "actor_configuration": "APIFY_ACTOR_ID",
+                "actor_input_format": "searchUrls",
+                "authentication_transport": "bearer-header",
+                "retrieval_only": True,
                 "automatic_fallback": False,
             }
             metadata["linkedin_job"] = {
@@ -617,23 +713,16 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 "linkedin_job_id": requested_linkedin_url.job_id,
             }
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            fetched_job = invoke_codex_linkedin_retrieval(
+            fetched_job = invoke_apify_linkedin_retrieval(
                 requested_url=requested_linkedin_url,
                 run_directory=run_directory,
                 timeout_seconds=timeout_seconds,
-                progress_handler=lambda elapsed, alive: hooks.progress(
+                progress_handler=lambda phase, elapsed, status: hooks.progress(
                     "fetching_job",
-                    (
-                        "Codex LinkedIn retrieval is still running"
-                        if alive
-                        else (
-                            "No Codex retrieval process detected; local structured "
-                            "job validation is continuing"
-                        )
-                    )
-                    + f" — elapsed {_elapsed_label(elapsed)}.",
+                    _apify_progress_message(phase, elapsed, status),
                     elapsed_seconds=max(0, int(elapsed)),
-                    provider_process_alive=alive,
+                    apify_phase=phase,
+                    actor_status=status,
                 ),
             )
             job_description = fetched_job["normalized_job_description"]
@@ -814,7 +903,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             hooks.progress(
                 "antigravity_tailoring",
                 "Verifying and reusing the previously approved Codex analysis. "
-                "Codex retrieval and analysis are not being invoked.",
+                "Apify retrieval and Codex analysis are not being invoked.",
             )
             transport_bytes = antigravity_retry_inputs.artifact_bytes[
                 "codex-analysis-transport.schema.json"
@@ -1051,7 +1140,11 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 "Checking downstream tools after the Codex analysis approval.",
             )
             metadata["tools"].update(
-                _tailoring_dependency_versions(run_directory)
+                _tailoring_dependency_versions(
+                    run_directory,
+                    writer_provider,
+                    ollama_model,
+                )
             )
             _update_metadata(
                 metadata,
@@ -1059,10 +1152,10 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 run_directory=run_directory,
             )
 
-        metadata["stage"] = "antigravity-tailoring-preflight"
+        metadata["stage"] = f"{writer_provider}-tailoring-preflight"
         hooks.progress(
             "antigravity_tailoring",
-            "Authenticating the approved tailoring inputs before Antigravity.",
+            f"Authenticating the approved tailoring inputs before {writer_name}.",
         )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
         try:
@@ -1075,7 +1168,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 company=company,
                 role=role,
             )
-            metadata["antigravity_tailoring_preflight"] = (
+            metadata[f"{writer_provider}_tailoring_preflight"] = (
                 verify_tailoring_run_artifacts(
                     run_directory,
                     source_resume_sha256=source_hash,
@@ -1087,9 +1180,16 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     role=role,
                 )
             )
-        except AntigravityTailoringPreflightError:
+        except AntigravityTailoringPreflightError as exc:
+            if writer_provider == "ollama":
+                raise TailoringPreflightError(
+                    "Local Qwen tailoring preflight failed. No writer request "
+                    "was launched."
+                ) from exc
             raise
         except InputError as exc:
+            if writer_provider == "ollama":
+                raise TailoringPreflightError(str(exc)) from exc
             raise AntigravityTailoringPreflightError(str(exc)) from exc
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
@@ -1103,34 +1203,63 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
             tailored_content = antigravity_reprocess_inputs.tailored_content
         else:
-            metadata["stage"] = "antigravity-tailoring"
+            metadata["stage"] = f"{writer_provider}-tailoring"
             hooks.progress(
                 "antigravity_tailoring",
-                "Antigravity is writing the complete tailored résumé content from "
-                "the approved schema-constrained edits.",
+                f"{writer_name} is writing the complete tailored résumé content "
+                "from the approved schema-constrained edits.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            tailored_content = invoke_antigravity(
-                master_content=extracted["content"],
-                extracted_resume=extracted,
-                job_description=job_description,
-                job_requirements=job_requirements,
-                approved_analysis=analysis,
-                company=company,
-                role=role,
-                run_directory=run_directory,
-                timeout_seconds=timeout_seconds,
-                antigravity_duration=antigravity_duration,
-            )
+            if writer_provider == "ollama":
+                tailored_content = invoke_ollama(
+                    master_content=extracted["content"],
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    approved_analysis=analysis,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    model=ollama_model,
+                    heartbeat_handler=lambda elapsed, alive: hooks.progress(
+                        "antigravity_tailoring",
+                        (
+                            "Qwen is still writing locally"
+                            if alive
+                            else "Qwen completed; local validation is continuing"
+                        )
+                        + f" — elapsed {_elapsed_label(elapsed)}.",
+                        elapsed_seconds=max(0, int(elapsed)),
+                    ),
+                )
+            else:
+                tailored_content = invoke_antigravity(
+                    master_content=extracted["content"],
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    approved_analysis=analysis,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    antigravity_duration=antigravity_duration,
+                )
         initial_content_path = run_directory / "tailored-content.initial.json"
         atomic_write_json(initial_content_path, tailored_content)
-        initial_response_metadata = load_antigravity_response_metadata(run_directory)
+        initial_response_metadata = (
+            load_ollama_response_metadata(run_directory)
+            if writer_provider == "ollama"
+            else load_antigravity_response_metadata(run_directory)
+        )
         if initial_response_metadata is None:
             raise IntegrityError(
-                "The initial Antigravity response metadata is unavailable."
+                f"The initial {writer_name} response metadata is unavailable."
             )
         metadata["revision_cycle"]["initial"] = {
-            "provider": "antigravity",
+            "provider": writer_provider,
+            "model": ollama_model if writer_provider == "ollama" else None,
             "response": dict(initial_response_metadata["response"]),
             "response_envelope_type": initial_response_metadata[
                 "response_envelope_type"
@@ -1244,12 +1373,23 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
 
         from .docx_render import export_and_validate_pdf, render_tailored_docx
 
-        render_tailored_docx(
-            source_path=resume_path,
-            destination_path=docx_path,
-            tailored_content=tailored_content,
-            expected_source_hash=source_hash,
-        )
+        if document_format == "headless":
+            from .headless_render import render_headless_docx
+
+            render_headless_docx(
+                source_path=resume_path,
+                destination_path=docx_path,
+                tailored_content=tailored_content,
+                extracted_resume=extracted,
+                expected_source_hash=source_hash,
+            )
+        else:
+            render_tailored_docx(
+                source_path=resume_path,
+                destination_path=docx_path,
+                tailored_content=tailored_content,
+                expected_source_hash=source_hash,
+            )
         metadata["stage"] = "pdf-export-validation"
         hooks.progress(
             "rendering",
@@ -1261,7 +1401,10 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             pdf_path=pdf_path,
             preview_path=preview_path,
             working_directory=work_directory / "initial",
-            required_text=_required_pdf_text(extracted),
+            required_text=_required_pdf_text(
+                extracted,
+                document_format=document_format,
+            ),
         )
         initial_layout = {
             "status": "PASS",
@@ -1328,7 +1471,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["stage"] = "revision-authorization"
             hooks.progress(
                 "revision_phase",
-                "Codex found material issues. One optional Antigravity revision "
+                f"Codex found material issues. One optional {writer_name} revision "
                 "requires explicit authorization.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
@@ -1344,7 +1487,10 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     "qa_result": qa_result,
                     "maximum_attempts": 1,
                     "initial_preview": preview_path.name,
-                }
+                    "writer_provider": writer_provider,
+                    "writer_name": writer_name,
+                },
+                provider_name=writer_name,
             )
             authorization_record = {
                 "decision": revision_authorization.action,
@@ -1407,31 +1553,49 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 "state": "provider_in_progress",
                 "input_manifest": revision_input_manifest,
             }
-            metadata["stage"] = "antigravity-revision-1"
+            metadata["stage"] = f"{writer_provider}-revision-1"
             hooks.progress(
                 "revision_phase",
-                "Antigravity is applying the one authorized QA revision.",
+                f"{writer_name} is applying the one authorized QA revision.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            revised_content = invoke_antigravity_revision(
-                current_tailored_content=tailored_content,
-                extracted_resume=extracted,
-                approved_analysis=analysis,
-                qa_result=qa_result,
-                company=company,
-                role=role,
-                run_directory=run_directory,
-                timeout_seconds=timeout_seconds,
-                antigravity_duration=antigravity_duration,
-                attempt_number=1,
-            )
-            revision_response_metadata = load_antigravity_response_metadata(
-                run_directory,
-                filename=REVISION_RESPONSE_METADATA_FILENAME,
-            )
+            if writer_provider == "ollama":
+                revised_content = invoke_ollama_revision(
+                    current_tailored_content=tailored_content,
+                    extracted_resume=extracted,
+                    approved_analysis=analysis,
+                    qa_result=qa_result,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    attempt_number=1,
+                    model=ollama_model,
+                )
+                revision_response_metadata = load_ollama_response_metadata(
+                    run_directory,
+                    filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
+                )
+            else:
+                revised_content = invoke_antigravity_revision(
+                    current_tailored_content=tailored_content,
+                    extracted_resume=extracted,
+                    approved_analysis=analysis,
+                    qa_result=qa_result,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    antigravity_duration=antigravity_duration,
+                    attempt_number=1,
+                )
+                revision_response_metadata = load_antigravity_response_metadata(
+                    run_directory,
+                    filename=REVISION_RESPONSE_METADATA_FILENAME,
+                )
             if revision_response_metadata is None:
                 raise IntegrityError(
-                    "The Antigravity revision response metadata is unavailable."
+                    f"The {writer_name} revision response metadata is unavailable."
                 )
             revised_content_path = (
                 run_directory / "tailored-content.revision-1.json"
@@ -1440,7 +1604,8 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["revision_cycle"]["revision_1"].update(
                 {
                     "state": "local_validation",
-                    "provider": "antigravity",
+                    "provider": writer_provider,
+                    "model": ollama_model if writer_provider == "ollama" else None,
                     "response": dict(revision_response_metadata["response"]),
                     "response_envelope_type": revision_response_metadata[
                         "response_envelope_type"
@@ -1477,7 +1642,6 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 revision_report,
             )
             revision_diff = build_revision_diff(
-                master_content=extracted["content"],
                 initial_content=tailored_content,
                 revised_content=revised_content,
                 issue_map=issue_map,
@@ -1561,18 +1725,30 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 "Python is rendering the approved revision 1 without overwriting "
                 "the initial generation.",
             )
-            render_tailored_docx(
-                source_path=resume_path,
-                destination_path=revision_docx_path,
-                tailored_content=revised_content,
-                expected_source_hash=source_hash,
-            )
+            if document_format == "headless":
+                render_headless_docx(
+                    source_path=resume_path,
+                    destination_path=revision_docx_path,
+                    tailored_content=revised_content,
+                    extracted_resume=extracted,
+                    expected_source_hash=source_hash,
+                )
+            else:
+                render_tailored_docx(
+                    source_path=resume_path,
+                    destination_path=revision_docx_path,
+                    tailored_content=revised_content,
+                    expected_source_hash=source_hash,
+                )
             revision_pdf_text = export_and_validate_pdf(
                 docx_path=revision_docx_path,
                 pdf_path=revision_pdf_path,
                 preview_path=revision_preview_path,
                 working_directory=work_directory / "revision-1",
-                required_text=_required_pdf_text(extracted),
+                required_text=_required_pdf_text(
+                    extracted,
+                    document_format=document_format,
+                ),
             )
             revision_layout = {
                 "status": "PASS",
@@ -1680,8 +1856,11 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         revision_stage = "revision" in str(metadata.get("stage", ""))
         if isinstance(exc, SourceEvidenceError):
             metadata["failure_class"] = "source-evidence-analysis"
-        if isinstance(exc, CodexLinkedInRetrievalError):
-            metadata["failure_class"] = "codex-linkedin-retrieval"
+        if isinstance(exc, ApifyConfigurationError):
+            metadata["failure_class"] = "apify-configuration"
+            metadata["retrieval_classification"] = exc.classification
+        if isinstance(exc, ApifyLinkedInRetrievalError):
+            metadata["failure_class"] = "apify-linkedin-retrieval"
             metadata["retrieval_classification"] = exc.classification
         if isinstance(exc, AntigravityLaunchSizeError):
             metadata["failure_class"] = "antigravity-launch-size"
@@ -1703,12 +1882,31 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["failure_class"] = "antigravity-revision-cannot-apply"
         if isinstance(exc, AntigravityRevisionTechnicalFailureError):
             metadata["failure_class"] = "antigravity-revision-technical-failure"
+        if isinstance(exc, OllamaConnectionError):
+            metadata["failure_class"] = "ollama-connection"
+        if isinstance(exc, OllamaTailoringContractError):
+            metadata["failure_class"] = "ollama-tailoring-contract"
+        if isinstance(exc, OllamaCannotApplyError):
+            metadata["failure_class"] = "ollama-cannot-apply"
+        if isinstance(exc, OllamaTechnicalFailureError):
+            metadata["failure_class"] = "ollama-technical-failure"
+        if isinstance(exc, OllamaRevisionContractError):
+            metadata["failure_class"] = "ollama-revision-contract"
+        if isinstance(exc, OllamaRevisionCannotApplyError):
+            metadata["failure_class"] = "ollama-revision-cannot-apply"
+        if isinstance(exc, OllamaRevisionTechnicalFailureError):
+            metadata["failure_class"] = "ollama-revision-technical-failure"
         if isinstance(exc, RevisionValidationError):
             metadata["failure_class"] = "revision-local-validation"
         if isinstance(exc, QAError):
             metadata["failure_class"] = "codex-final-qa"
         if isinstance(exc, AntigravityTailoringPreflightError):
             metadata["failure_class"] = "antigravity-tailoring-preflight"
+        if (
+            isinstance(exc, TailoringPreflightError)
+            and not isinstance(exc, AntigravityTailoringPreflightError)
+        ):
+            metadata["failure_class"] = "ollama-tailoring-preflight"
         metadata["error"] = {
             "type": type(exc).__name__,
             "message": str(exc),
@@ -1747,6 +1945,17 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             revision_state = metadata.get("revision_cycle", {}).get("revision_1")
             if isinstance(revision_state, dict):
                 revision_state["response_metadata"] = revision_response_metadata
+        ollama_response_metadata = load_ollama_response_metadata(run_directory)
+        if ollama_response_metadata is not None:
+            metadata["ollama_response"] = ollama_response_metadata
+        ollama_revision_metadata = load_ollama_response_metadata(
+            run_directory,
+            filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
+        )
+        if ollama_revision_metadata is not None:
+            revision_state = metadata.get("revision_cycle", {}).get("revision_1")
+            if isinstance(revision_state, dict):
+                revision_state["response_metadata"] = ollama_revision_metadata
         actual_hash = sha256_file(resume_path) if resume_path.is_file() else None
         unchanged = actual_hash == source_hash
         metadata["source_resume"]["sha256_after"] = actual_hash
