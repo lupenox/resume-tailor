@@ -97,29 +97,9 @@
                 value="{{ form_values.get('job_url', '') }}" autocomplete="off">
             </div>
             <p class="field-help">
-              HTTPS LinkedIn job pages only. No login, Apply interaction, or account access.
+              Codex uses live search for this exact public posting in a fresh,
+              read-only session. No login, Apply interaction, or account access.
             </p>
-            <div class="provider-field">
-              <label for="linkedin-provider">Retrieval provider</label>
-              <select id="linkedin-provider" name="linkedin_provider">
-                <option value="auto"
-                  {% if form_values.get("linkedin_provider", "auto") == "auto" %}selected{% endif %}>
-                  Automatic — Apify when configured
-                </option>
-                <option value="apify"
-                  {% if form_values.get("linkedin_provider") == "apify" %}selected{% endif %}>
-                  Apify job details
-                </option>
-                <option value="antigravity"
-                  {% if form_values.get("linkedin_provider") == "antigravity" %}selected{% endif %}>
-                  Antigravity fallback
-                </option>
-              </select>
-              <p class="field-help">
-                Apify maps the exact job-detail URL locally. Automatic does not call a
-                second provider after a failed paid request.
-              </p>
-            </div>
           </div>
 
           <div class="input-panel" data-job-panel="pasted" hidden>
@@ -157,8 +137,10 @@
         <div class="privacy-note">
           <span class="shield-icon" aria-hidden="true">✓</span>
           <p>
-            The master file is never overwritten. In a real run, résumé and posting
-            content are sent through your authenticated Codex and Antigravity CLIs.
+            The master file is never overwritten. URL retrieval sends only the public
+            URL and job ID to Codex; no résumé content is included. After you approve
+            the posting, Codex analyzes, Antigravity writes, and a fresh Codex session
+            independently reviews the completed résumé.
           </p>
         </div>
 
@@ -180,7 +162,7 @@
         <ul class="feature-list">
           <li>
             <span class="feature-icon" aria-hidden="true">1</span>
-            <div><strong>Confirm the posting</strong><small>Nothing reaches Codex until the fetched identity is approved.</small></div>
+            <div><strong>Confirm the posting</strong><small>Codex retrieves it first, but résumé extraction and analysis wait for your approval.</small></div>
           </li>
           <li>
             <span class="feature-icon" aria-hidden="true">2</span>
@@ -188,7 +170,7 @@
           </li>
           <li>
             <span class="feature-icon" aria-hidden="true">3</span>
-            <div><strong>Validate the final page</strong><small>DOCX formatting, PDF layout, and visual QA are checked locally.</small></div>
+            <div><strong>Validate the final page</strong><small>Python checks DOCX/PDF integrity; a fresh Codex session performs independent final QA.</small></div>
           </li>
         </ul>
       </section>

@@ -64,3 +64,65 @@ class PipelineHooks:
         if response.action not in {"approve", "use_pasted"}:
             raise ApprovalError(f"{title} was not approved; artifacts were preserved.")
         return response
+
+    def authorize_revision(
+        self,
+        *,
+        payload: Mapping[str, Any],
+    ) -> ApprovalResponse:
+        """Request the one optional extra provider call; --yes never bypasses it."""
+        check_cancelled()
+        title = "One optional Antigravity revision"
+        if self.approval_handler is None:
+            try:
+                answer = input(
+                    "\nCodex found material issues. Exactly one Antigravity "
+                    "revision is available. Type 'revise' to authorize that "
+                    "provider call, or press Enter to stop and keep artifacts: "
+                ).strip()
+            except (EOFError, OSError):
+                answer = ""
+            check_cancelled()
+            return ApprovalResponse(
+                "revise_once" if answer == "revise" else "stop"
+            )
+        response = self.approval_handler(
+            ApprovalRequest(kind="qa_revision", title=title, payload=payload)
+        )
+        check_cancelled()
+        if response.action not in {"revise_once", "stop"}:
+            raise ApprovalError(
+                "The revision authorization response was invalid; artifacts were "
+                "preserved."
+            )
+        return response
+
+    def approve_revised_content(
+        self,
+        *,
+        payload: Mapping[str, Any],
+    ) -> ApprovalResponse:
+        """Require a distinct human decision before rendering revision 1."""
+        check_cancelled()
+        title = "Revision 1 content diff"
+        if self.approval_handler is None:
+            try:
+                answer = input(
+                    "\nRevision 1 passed local validation. Type 'approve' to "
+                    "render it, or press Enter to reject it and keep both "
+                    "generations: "
+                ).strip()
+            except (EOFError, OSError):
+                answer = ""
+            check_cancelled()
+            return ApprovalResponse("approve" if answer == "approve" else "reject")
+        response = self.approval_handler(
+            ApprovalRequest(kind="revised_content", title=title, payload=payload)
+        )
+        check_cancelled()
+        if response.action not in {"approve", "reject"}:
+            raise ApprovalError(
+                "The revision-content approval response was invalid; artifacts "
+                "were preserved."
+            )
+        return response

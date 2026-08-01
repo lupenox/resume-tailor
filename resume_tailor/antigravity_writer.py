@@ -6,14 +6,18 @@ from typing import Any
 
 from .antigravity_response import (
     AntigravityResponseCandidate,
+    locate_stream_json_terminal,
     locate_json_tailoring_candidate,
+    parse_json_output,
+    parse_stream_json_events,
+    parse_stream_json_output,
 )
 from .antigravity_transport import (
     antigravity_parse_diagnostic,
     antigravity_process_failure,
     run_antigravity_prompt,
 )
-from .schemas import load_schema, parse_json_text, schema_path, validate_payload
+from .schemas import load_schema, schema_path, validate_payload
 from .utilities import (
     AntigravityCannotApplyError,
     AntigravityResponseEnvelopeError,
@@ -271,14 +275,17 @@ def _write_response_metadata(
     response_path: Path,
     envelope_type: str,
     validation_result: str,
+    output_format: str = "stream-json",
+    schema_name: str = "tailored_resume.schema.json",
+    metadata_filename: str = ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
 ) -> dict[str, Any]:
-    schema = schema_path("tailored_resume.schema.json")
+    schema = schema_path(schema_name)
     metadata = {
         "version": 1,
         "provider": "antigravity",
         "execution_mode": "print",
         "agent_mode": "default",
-        "output_format": "json",
+        "output_format": output_format,
         "sandboxed": True,
         "response_envelope_type": envelope_type,
         "validation_result": validation_result,
@@ -292,7 +299,7 @@ def _write_response_metadata(
         },
     }
     atomic_write_json(
-        run_directory / ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
+        run_directory / metadata_filename,
         metadata,
     )
     return metadata
@@ -300,8 +307,10 @@ def _write_response_metadata(
 
 def load_antigravity_response_metadata(
     run_directory: Path,
+    *,
+    filename: str = ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
 ) -> dict[str, Any] | None:
-    path = run_directory / ANTIGRAVITY_RESPONSE_METADATA_FILENAME
+    path = run_directory / filename
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 50_000:
             return None
@@ -392,6 +401,117 @@ def resolve_tailoring_response(
     return content
 
 
+def resolve_tailoring_response_text_with_envelope(
+    response_text: str,
+    *,
+    output_format: str,
+    approved_analysis: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Strictly resolve an authenticated stored JSON or stream-json response."""
+    schema = load_schema("tailored_resume.schema.json")
+    if output_format == "json":
+        _, candidate = parse_json_output(
+            response_text,
+            expected_schema=schema,
+        )
+    elif output_format == "stream-json":
+        _, candidate = parse_stream_json_output(
+            response_text,
+            expected_schema=schema,
+        )
+    else:
+        raise AntigravityResponseEnvelopeError(
+            "Antigravity returned JSON in an unsupported response format.",
+            envelope_type="unsupported-output-format",
+        )
+    return (
+        _resolve_tailoring_candidate(
+            candidate,
+            approved_analysis=approved_analysis,
+        ),
+        candidate.envelope_type,
+    )
+
+
+def _invoke_antigravity_candidate(
+    *,
+    executable: str,
+    prompt: str,
+    prompt_label: str,
+    schema_name: str,
+    response_filename: str,
+    metadata_filename: str,
+    run_directory: Path,
+    timeout_seconds: int,
+    antigravity_duration: str,
+) -> tuple[AntigravityResponseCandidate, Path]:
+    """Run one strict stream-json authorship request and locate its payload."""
+    result = run_antigravity_prompt(
+        executable=executable,
+        prompt=prompt,
+        prompt_label=prompt_label,
+        schema=schema_path(schema_name),
+        print_timeout=antigravity_duration,
+        cwd=run_directory,
+        timeout_seconds=timeout_seconds + 10,
+    )
+    response_path = run_directory / response_filename
+    try:
+        events = parse_stream_json_events(result.stdout)
+    except AntigravityResponseEnvelopeError as exc:
+        atomic_write_json(
+            response_path,
+            antigravity_parse_diagnostic(result),
+        )
+        _write_response_metadata(
+            run_directory=run_directory,
+            response_path=response_path,
+            envelope_type=exc.envelope_type,
+            validation_result="REJECTED",
+            schema_name=schema_name,
+            metadata_filename=metadata_filename,
+        )
+        if result.returncode != 0:
+            raise antigravity_process_failure(result, label="Antigravity")
+        raise
+    atomic_write_text(response_path, result.stdout)
+
+    if result.returncode != 0:
+        _write_response_metadata(
+            run_directory=run_directory,
+            response_path=response_path,
+            envelope_type="stream-json-process-failure",
+            validation_result="REJECTED",
+            schema_name=schema_name,
+            metadata_filename=metadata_filename,
+        )
+        raise antigravity_process_failure(result, label="Antigravity")
+
+    try:
+        envelope, stream_type = locate_stream_json_terminal(events)
+        candidate = locate_json_tailoring_candidate(
+            envelope,
+            expected_schema=load_schema(schema_name),
+        )
+        return (
+            AntigravityResponseCandidate(
+                payload=candidate.payload,
+                envelope_type=f"{stream_type}:{candidate.envelope_type}",
+            ),
+            response_path,
+        )
+    except AntigravityResponseEnvelopeError as exc:
+        _write_response_metadata(
+            run_directory=run_directory,
+            response_path=response_path,
+            envelope_type=exc.envelope_type,
+            validation_result="REJECTED",
+            schema_name=schema_name,
+            metadata_filename=metadata_filename,
+        )
+        raise
+
+
 def invoke_antigravity(
     *,
     master_content: dict[str, Any],
@@ -416,55 +536,17 @@ def invoke_antigravity(
         company=company,
         role=role,
     )
-    result = run_antigravity_prompt(
+    candidate, response_path = _invoke_antigravity_candidate(
         executable=agy,
         prompt=prompt,
         prompt_label="Antigravity tailoring prompt",
-        schema=schema_path("tailored_resume.schema.json"),
-        print_timeout=antigravity_duration,
-        cwd=run_directory,
-        timeout_seconds=timeout_seconds + 10,
+        schema_name="tailored_resume.schema.json",
+        response_filename="antigravity-response.json",
+        metadata_filename=ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
+        run_directory=run_directory,
+        timeout_seconds=timeout_seconds,
+        antigravity_duration=antigravity_duration,
     )
-    response_path = run_directory / "antigravity-response.json"
-    try:
-        raw_payload = parse_json_text(result.stdout, label="Antigravity")
-    except ModelError as exc:
-        atomic_write_json(
-            response_path,
-            antigravity_parse_diagnostic(result),
-        )
-        _write_response_metadata(
-            run_directory=run_directory,
-            response_path=response_path,
-            envelope_type="malformed-json-output",
-            validation_result="REJECTED",
-        )
-        if result.returncode != 0:
-            raise antigravity_process_failure(result, label="Antigravity")
-        raise AntigravityResponseEnvelopeError(
-            "Antigravity returned malformed JSON output.",
-            envelope_type="malformed-json-output",
-        ) from exc
-    # Preserve the exact valid UTF-8 JSON bytes returned by print mode so its
-    # recorded hash authenticates the provider response used by local parsing.
-    atomic_write_text(response_path, result.stdout)
-
-    if result.returncode != 0:
-        raise antigravity_process_failure(result, label="Antigravity")
-
-    try:
-        candidate = locate_json_tailoring_candidate(
-            raw_payload,
-            expected_schema=load_schema("tailored_resume.schema.json"),
-        )
-    except AntigravityResponseEnvelopeError as exc:
-        _write_response_metadata(
-            run_directory=run_directory,
-            response_path=response_path,
-            envelope_type=exc.envelope_type,
-            validation_result="REJECTED",
-        )
-        raise
     try:
         resolved = _resolve_tailoring_candidate(
             candidate,

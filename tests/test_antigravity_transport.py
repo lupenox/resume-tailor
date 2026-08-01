@@ -170,31 +170,9 @@ def test_prompt_free_argument_array_contains_only_flags_and_short_paths() -> Non
     )
     assert "--prompt" in args
     assert "--mode=plan" not in args
+    assert args[args.index("--output-format") + 1] == "stream-json"
     assert marker not in "\0".join(args)
     assert all(len(value.encode("utf-8")) < 4_096 for value in args)
-
-
-def test_linkedin_transport_selects_documented_stream_json_format() -> None:
-    args = antigravity_print_args(
-        executable="/synthetic/bin/agy",
-        schema=Path("/synthetic/linkedin.schema.json"),
-        print_timeout="30s",
-        agent_mode="plan",
-        output_format="stream-json",
-    )
-
-    assert args[args.index("--output-format") + 1] == "stream-json"
-    assert "--mode=plan" in args
-
-
-def test_unknown_antigravity_output_format_is_rejected() -> None:
-    with pytest.raises(DependencyError, match="output format"):
-        antigravity_print_args(
-            executable="/synthetic/bin/agy",
-            schema=Path("/synthetic/schema.json"),
-            print_timeout="30s",
-            output_format="synthetic-unknown",
-        )
 
 
 def test_cancellation_hides_prompt_from_cmdline_and_stops_process_group(
@@ -371,5 +349,87 @@ def test_malformed_output_diagnostic_omits_provider_text(
             encoding="utf-8"
         )
     )
-    assert envelope["response_envelope_type"] == "malformed-json-output"
+    assert envelope["response_envelope_type"] == "stream-json-malformed-event"
     assert envelope["validation_result"] == "REJECTED"
+
+
+def test_process_failure_after_partial_stream_is_not_salvaged(
+    master_resume: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    description = "Synthetic partial-stream process-failure test."
+    requirements = build_job_requirement_catalog(description)
+    analysis = _resolved_analysis(extracted, requirements)
+    monkeypatch.setenv("STUB_AGY_MODE", "process_error_after_partial")
+
+    with pytest.raises(ModelError, match="exited with status 8"):
+        invoke_antigravity(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=description,
+            job_requirements=requirements,
+            approved_analysis=analysis,
+            company="Synthetic Systems",
+            role="Evidence Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+            antigravity_duration="30s",
+            executable=str(stubs_on_path / "agy"),
+        )
+
+    metadata = json.loads(
+        (tmp_path / "antigravity-response-envelope.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["response_envelope_type"] == "stream-json-process-failure"
+    assert metadata["validation_result"] == "REJECTED"
+
+
+@pytest.mark.parametrize(
+    ("mode", "envelope_type"),
+    [
+        ("missing_terminal", "stream-json-missing-terminal-result"),
+        ("multiple_terminal", "stream-json-multiple-terminal-results"),
+        ("incomplete_stream", "stream-json-malformed-event"),
+    ],
+)
+def test_invalid_stream_transport_is_classified_content_free(
+    mode: str,
+    envelope_type: str,
+    master_resume: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    description = "Synthetic invalid-stream test."
+    requirements = build_job_requirement_catalog(description)
+    analysis = _resolved_analysis(extracted, requirements)
+    monkeypatch.setenv("STUB_AGY_MODE", mode)
+
+    with pytest.raises(AntigravityResponseEnvelopeError):
+        invoke_antigravity(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=description,
+            job_requirements=requirements,
+            approved_analysis=analysis,
+            company="Synthetic Systems",
+            role="Evidence Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+            antigravity_duration="30s",
+            executable=str(stubs_on_path / "agy"),
+        )
+
+    metadata = json.loads(
+        (tmp_path / "antigravity-response-envelope.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["response_envelope_type"] == envelope_type
+    assert metadata["validation_result"] == "REJECTED"

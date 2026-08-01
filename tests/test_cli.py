@@ -66,43 +66,22 @@ def test_url_mode_derives_company_and_role() -> None:
     _validate_mode_arguments(parser, args)
     assert args.company is None
     assert args.role is None
-    assert args.linkedin_provider == "auto"
+    assert not hasattr(args, "linkedin_provider")
 
 
-def test_url_mode_accepts_explicit_linkedin_provider() -> None:
+def test_removed_linkedin_provider_flag_is_rejected() -> None:
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "--resume",
-            "resume.docx",
-            "--job-url",
-            "https://www.linkedin.com/jobs/view/4123456789/",
-            "--linkedin-provider",
-            "apify",
-        ]
-    )
-    _validate_mode_arguments(parser, args)
-    assert args.linkedin_provider == "apify"
-
-
-def test_non_url_mode_rejects_linkedin_provider() -> None:
-    parser = build_parser()
-    args = parser.parse_args(
-        [
-            "--resume",
-            "resume.docx",
-            "--job-file",
-            "job.txt",
-            "--company",
-            "Example",
-            "--role",
-            "Developer",
-            "--linkedin-provider",
-            "apify",
-        ]
-    )
     with pytest.raises(SystemExit):
-        _validate_mode_arguments(parser, args)
+        parser.parse_args(
+            [
+                "--resume",
+                "resume.docx",
+                "--job-url",
+                "https://www.linkedin.com/jobs/view/4123456789/",
+                "--linkedin-provider",
+                "apify",
+            ]
+        )
 
 
 def test_file_mode_still_requires_company_and_role() -> None:
@@ -194,11 +173,14 @@ def test_existing_installation_refuses_overwrite(
     assert first.returncode == 0, first.stderr
     installed = fake_home / ".local" / "share" / "resume-tailor"
     assert (installed / "resume_tailor" / "linkedin_job.py").is_file()
+    assert (installed / "resume_tailor" / "codex_linkedin.py").is_file()
+    assert not (installed / "resume_tailor" / "apify_job.py").exists()
     assert (installed / "resume_tailor" / "smoke.py").is_file()
     assert (installed / "resume_tailor" / "ui.py").is_file()
     assert (installed / "resume_tailor" / "templates" / "dashboard.html").is_file()
     assert (installed / "resume_tailor" / "static" / "app.css").is_file()
     assert (installed / "schemas" / "linkedin_job.schema.json").is_file()
+    assert (installed / "schemas" / "linkedin_job.openai.schema.json").is_file()
     if (installer_source / ".venv" / "bin" / "python").is_file():
         assert (installed / ".venv").is_symlink()
         assert (installed / ".venv").resolve() == (installer_source / ".venv").resolve()

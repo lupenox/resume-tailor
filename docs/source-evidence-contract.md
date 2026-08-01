@@ -124,7 +124,7 @@ job-requirement catalog. A retry:
 - cannot reach Antigravity unless the new analysis passes local resolution and
   a human separately approves it.
 
-Legacy LinkedIn runs without the new hash manifest are eligible only when the
+Legacy URL-mode runs without the new hash manifest are eligible only when the
 metadata and extracted source hashes agree with the unchanged current master
 and every stored extraction field matches a fresh deterministic read-only
 extraction of that master. The independently stored structured job description

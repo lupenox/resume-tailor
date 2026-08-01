@@ -598,10 +598,6 @@ textarea::placeholder {
   font-size: 12px;
 }
 
-.provider-field {
-  margin-top: 16px;
-}
-
 .privacy-note,
 .safe-activity-note {
   display: flex;

@@ -1238,19 +1238,31 @@ def _validated_antigravity_reprocess_payloads(
         maximum=_MAX_ANTIGRAVITY_RESPONSE_BYTES,
     )
     response_hash = _digest(response_bytes)
-    response_payload = _json_object(
-        response_bytes,
-        label="Antigravity response",
-    )
-    from .antigravity_writer import resolve_tailoring_response_with_envelope
+    try:
+        response_text = response_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InputError(
+            "Stored Antigravity response is not valid UTF-8 text."
+        ) from exc
+    stored_response_metadata = metadata.get("antigravity_response")
+    output_format = "json"
+    if stored_response_metadata is not None:
+        if not isinstance(stored_response_metadata, dict):
+            raise InputError("Stored Antigravity response metadata is invalid.")
+        output_format_value = stored_response_metadata.get("output_format")
+        if output_format_value not in {"json", "stream-json"}:
+            raise InputError("Stored Antigravity output format is unsupported.")
+        output_format = output_format_value
+    from .antigravity_writer import resolve_tailoring_response_text_with_envelope
     from .schemas import schema_path
     from .utilities import AntigravityResponseEnvelopeError
 
     tailoring_schema = schema_path("tailored_resume.schema.json")
     tailoring_schema_hash = sha256_file(tailoring_schema)
     try:
-        tailored_content, envelope_type = resolve_tailoring_response_with_envelope(
-            response_payload,
+        tailored_content, envelope_type = resolve_tailoring_response_text_with_envelope(
+            response_text,
+            output_format=output_format,
             approved_analysis=analysis,
         )
     except Exception as exc:
@@ -1264,10 +1276,7 @@ def _validated_antigravity_reprocess_payloads(
             "offline reprocessing is unavailable."
         ) from exc
 
-    stored_response_metadata = metadata.get("antigravity_response")
     if stored_response_metadata is not None:
-        if not isinstance(stored_response_metadata, dict):
-            raise InputError("Stored Antigravity response metadata is invalid.")
         stored_response = stored_response_metadata.get("response")
         stored_schema = stored_response_metadata.get("schema")
         if (
@@ -1331,7 +1340,7 @@ def _validated_antigravity_reprocess_payloads(
         "provider": "antigravity",
         "execution_mode": "print",
         "agent_mode": "default",
-        "output_format": "json",
+        "output_format": output_format,
         "sandboxed": True,
         "response_envelope_type": envelope_type,
         "validation_result": "PASS",

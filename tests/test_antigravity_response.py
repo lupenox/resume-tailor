@@ -9,9 +9,13 @@ import pytest
 
 from resume_tailor.antigravity_response import (
     locate_json_tailoring_candidate,
+    parse_json_output,
     parse_stream_json_output,
 )
-from resume_tailor.antigravity_writer import resolve_tailoring_response
+from resume_tailor.antigravity_writer import (
+    resolve_tailoring_response,
+    resolve_tailoring_response_text_with_envelope,
+)
 from resume_tailor.docx_extract import extract_resume
 from resume_tailor.schemas import load_schema
 from resume_tailor.utilities import (
@@ -32,6 +36,15 @@ def _complete(content: dict[str, Any]) -> dict[str, Any]:
 
 def _analysis() -> dict[str, Any]:
     return {"recommended_edits": []}
+
+
+def _stream(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            json.dumps({"event": "init", "init": {"status": "started"}}),
+            json.dumps({"event": "result", "result": result}),
+        ]
+    )
 
 
 @pytest.fixture
@@ -112,71 +125,56 @@ def test_wrapper_accepts_identical_documented_structured_output_and_response(
     assert located.payload == complete
 
 
-def test_stream_json_accepts_current_documented_terminal_result(
+@pytest.mark.parametrize("string_valued", [False, True])
+def test_stream_terminal_extracts_one_complete_object_or_json_string(
+    synthetic_content: dict[str, Any],
+    string_valued: bool,
+) -> None:
+    complete = _complete(copy.deepcopy(synthetic_content))
+    represented: Any = json.dumps(complete) if string_valued else complete
+    events, located = parse_stream_json_output(
+        _stream({"structured_output": represented}),
+        expected_schema=load_schema("tailored_resume.schema.json"),
+    )
+
+    assert len(events) == 2
+    assert located.envelope_type == (
+        "stream-json-event-result:json-wrapper-structured_output"
+    )
+    assert located.payload == complete
+
+
+def test_stream_equivalent_duplicate_representations_prefer_structured_output(
     synthetic_content: dict[str, Any],
 ) -> None:
     complete = _complete(copy.deepcopy(synthetic_content))
-    schema = load_schema("tailored_resume.schema.json")
-    stream = "\n".join(
-        (
-            json.dumps({"event": "init", "init": {"conversation_id": "synthetic"}}),
-            json.dumps(
-                {"event": "step_update", "step_update": {"status": "running"}}
-            ),
-            json.dumps(
-                {
-                    "event": "result",
-                    "result": {
-                        "status": "SUCCESS",
-                        "structured_output": complete,
-                        "response": json.dumps(complete, ensure_ascii=False),
-                        "json_schema": schema,
-                    },
-                },
-                ensure_ascii=False,
-            ),
+    _, located = parse_stream_json_output(
+        _stream(
+            {
+                "structured_output": complete,
+                "response": json.dumps(complete),
+            }
         )
     )
 
-    events, candidate = parse_stream_json_output(
-        stream,
-        expected_schema=load_schema("tailored_resume.schema.json"),
-    )
-
-    assert len(events) == 3
-    assert (
-        candidate.envelope_type
-        == "stream-json-event-result:json-wrapper-structured_output"
-    )
-    assert resolve_tailoring_response(
-        candidate.payload,
-        approved_analysis=_analysis(),
-    ) == synthetic_content
+    assert located.envelope_type.endswith("json-wrapper-structured_output")
+    assert located.payload == complete
 
 
-def test_stream_json_retains_legacy_terminal_compatibility(
+def test_nested_equivalent_representations_are_not_ambiguous(
     synthetic_content: dict[str, Any],
 ) -> None:
     complete = _complete(copy.deepcopy(synthetic_content))
-    stream = json.dumps(
+    located = locate_json_tailoring_candidate(
         {
-            "step_type": "result",
-            "result": complete,
-            "json_schema": load_schema("tailored_resume.schema.json"),
-        },
-        ensure_ascii=False,
+            "response": {
+                "structured_output": complete,
+                "result": json.dumps(complete),
+            }
+        }
     )
 
-    events, candidate = parse_stream_json_output(
-        stream,
-        expected_schema=load_schema("tailored_resume.schema.json"),
-    )
-
-    assert len(events) == 1
-    assert (
-        candidate.envelope_type
-        == "stream-json-legacy-step-result:json-wrapper-result"
-    )
+    assert located.envelope_type == "json-wrapper-response-structured_output"
 
 
 def test_exact_print_wrapper_shape_is_rejected_without_prose_scraping(
@@ -198,6 +196,36 @@ def test_exact_print_wrapper_shape_is_rejected_without_prose_scraping(
     ) as raised:
         resolve_tailoring_response(
             fixture,
+            approved_analysis=_analysis(),
+        )
+
+    assert raised.value.envelope_type == "json-wrapper-unstructured-response"
+
+
+def test_observed_json_mode_shape_with_four_invalid_fragments_remains_rejected(
+) -> None:
+    fragment = {
+        "status": "complete",
+        "message": "Synthetic incomplete fragment.",
+        "cannot_apply": None,
+        "technical_failure": None,
+        "tailored_resume": None,
+    }
+    response = {
+        "conversation_id": "00000000-0000-4000-8000-000000000000",
+        "duration_seconds": 1.0,
+        "json_schema": load_schema("tailored_resume.schema.json"),
+        "num_turns": 1,
+        "response": "Synthetic provider prose "
+        + " ".join(json.dumps(fragment) for _ in range(4)),
+        "status": "SUCCESS",
+        "usage": {"total_tokens": 1},
+    }
+
+    with pytest.raises(AntigravityResponseEnvelopeError) as raised:
+        resolve_tailoring_response_text_with_envelope(
+            json.dumps(response),
+            output_format="json",
             approved_analysis=_analysis(),
         )
 
@@ -271,3 +299,97 @@ def test_embedded_schema_must_match_the_local_expected_schema(
         )
 
     assert raised.value.envelope_type == "json-wrapper-schema-mismatch"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_type"),
+    [
+        ('{"event":"init"}\n', "stream-json-missing-terminal-result"),
+        (
+            '{"event":"result","result":{}}\n'
+            '{"event":"result","result":{}}\n',
+            "stream-json-multiple-terminal-results",
+        ),
+        ('{"event":"result","result":', "stream-json-malformed-event"),
+        ('{"event":"result","event":"result","result":{}}', "stream-json-malformed-event"),
+        ('{"event":"result","result":{"value":NaN}}', "stream-json-malformed-event"),
+    ],
+)
+def test_stream_missing_multiple_malformed_duplicate_and_nonfinite_are_rejected(
+    text: str,
+    expected_type: str,
+) -> None:
+    with pytest.raises(AntigravityResponseEnvelopeError) as raised:
+        parse_stream_json_output(text)
+
+    assert raised.value.envelope_type == expected_type
+
+
+def test_stream_conflicting_complete_candidates_are_rejected(
+    synthetic_content: dict[str, Any],
+) -> None:
+    first = _complete(copy.deepcopy(synthetic_content))
+    second = copy.deepcopy(first)
+    second["message"] = "Conflicting synthetic representation."
+
+    with pytest.raises(AntigravityResponseEnvelopeError) as raised:
+        parse_stream_json_output(
+            _stream(
+                {
+                    "structured_output": first,
+                    "response": json.dumps(second),
+                }
+            )
+        )
+
+    assert raised.value.envelope_type == "json-wrapper-multiple-structured-candidates"
+
+
+def test_stream_unknown_wrapper_and_schema_invalid_payload_are_rejected(
+    synthetic_content: dict[str, Any],
+) -> None:
+    with pytest.raises(AntigravityResponseEnvelopeError):
+        parse_stream_json_output(_stream({"data": _complete(synthetic_content)}))
+
+    with pytest.raises(AntigravityTailoringContractError):
+        resolve_tailoring_response_text_with_envelope(
+            _stream(
+                {
+                    "structured_output": {
+                        "status": "complete",
+                        "message": "Synthetic incomplete payload.",
+                    }
+                }
+            ),
+            output_format="stream-json",
+            approved_analysis=_analysis(),
+        )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        'Prose {"status":"complete"}',
+        '```json\n{"status":"complete"}\n```',
+        '{"status":"complete"}\n{"tailored_resume":{}}',
+    ],
+)
+def test_stream_never_scrapes_prose_fences_or_fragments(candidate: str) -> None:
+    with pytest.raises(AntigravityResponseEnvelopeError):
+        parse_stream_json_output(_stream({"response": candidate}))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"structured_output":{"status":"complete"},"structured_output":{}}',
+        '{"structured_output":{"status":"complete","score":NaN}}',
+    ],
+)
+def test_stored_json_mode_rejects_duplicate_keys_and_nonfinite_values(
+    text: str,
+) -> None:
+    with pytest.raises(AntigravityResponseEnvelopeError) as raised:
+        parse_json_output(text)
+
+    assert raised.value.envelope_type == "malformed-json-output"

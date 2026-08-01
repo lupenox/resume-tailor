@@ -30,7 +30,6 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.datastructures import FormData, UploadFile
 
 from . import __version__
-from .apify_job import resolve_linkedin_provider
 from .cli import _validate_label, run_pipeline
 from .docx_extract import validate_template
 from .linkedin_job import validate_linkedin_url
@@ -46,8 +45,6 @@ from .retry import (
     build_retry_context,
 )
 from .utilities import (
-    ApifyConfigurationError,
-    ApifyProviderError,
     ApprovalError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
@@ -56,9 +53,9 @@ from .utilities import (
     AntigravityTailoringPreflightError,
     AntigravityTechnicalFailureError,
     CancellationError,
+    CodexLinkedInRetrievalError,
     CodexSchemaCompatibilityError,
     InputError,
-    LinkedInResponseEnvelopeError,
     ModelError,
     ResumeTailorError,
     SourceEvidenceError,
@@ -77,22 +74,22 @@ COOKIE_NAME = "resume_tailor_session"
 
 WORKFLOW_STAGES: tuple[tuple[str, str], ...] = (
     ("validating_input", "Validating input"),
-    ("fetching_job", "Fetching job posting"),
+    ("fetching_job", "Codex job retrieval"),
     ("confirming_posting", "Confirming posting"),
     ("codex_analysis", "Codex analysis"),
     ("reviewing_changes", "Reviewing proposed changes"),
     ("antigravity_tailoring", "Antigravity tailoring"),
     ("evidence_validation", "Evidence validation"),
     ("rendering", "Rendering DOCX/PDF"),
-    ("final_qa", "Final Codex QA"),
+    ("final_qa", "Initial Codex QA"),
+    ("revision_phase", "Optional one-shot revision"),
     ("complete", "Complete"),
 )
 _STAGE_INDEX = {name: index for index, (name, _) in enumerate(WORKFLOW_STAGES)}
 _TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
 _DOWNLOAD_EXACT = {
     "job-source.json",
-    "apify-job-response.json",
-    "linkedin-response-envelope.json",
+    "codex-linkedin-retrieval-diagnostic.json",
     "job-description.txt",
     "job-requirements.json",
     "extracted-master-resume.json",
@@ -101,11 +98,27 @@ _DOWNLOAD_EXACT = {
     "codex-analysis-normalization-warnings.json",
     "codex-analysis-transport.schema.json",
     "antigravity-response.json",
+    "antigravity-response-envelope.json",
+    "antigravity-revision-response.json",
+    "antigravity-revision-response-envelope.json",
+    "revision-request.json",
     "tailored-content.json",
+    "tailored-content.initial.json",
+    "tailored-content.revision-1.json",
     "content-diff.md",
+    "content-diff.initial.md",
+    "content-diff.revision-1.md",
     "preview.png",
+    "preview.initial.png",
+    "preview.revision-1.png",
     "final-qa.md",
+    "final-qa.initial.json",
+    "final-qa.initial.md",
+    "final-qa.revision-1.json",
+    "final-qa.revision-1.md",
     "final-qa-normalization-warnings.json",
+    "final-qa.initial.normalization-warnings.json",
+    "final-qa.revision-1.normalization-warnings.json",
     "run-metadata.json",
 }
 
@@ -142,6 +155,7 @@ class RunRecord:
     artifact_directory: Path | None = None
     error: str | None = None
     failure_kind: str | None = None
+    retrieval_classification: str | None = None
     events: list[dict[str, str]] = field(default_factory=list)
     approval: ApprovalRequest | None = None
     approval_response: ApprovalResponse | None = None
@@ -376,6 +390,8 @@ class RunManager:
                 record.status = "FAILED"
                 record.error = _sanitized_technical_details(exc)
                 record.failure_kind = _failure_kind_for_error(exc, record.stage)
+                if isinstance(exc, CodexLinkedInRetrievalError):
+                    record.retrieval_classification = exc.classification
                 record.message = _safe_error_message(exc)
                 record.approval = None
                 record.events.append(
@@ -501,7 +517,13 @@ class RunManager:
             response = record.approval_response
             record.approval = None
             record.approval_response = None
-            if response.action in {"approve", "use_pasted"}:
+            if response.action in {
+                "approve",
+                "use_pasted",
+                "revise_once",
+                "stop",
+                "reject",
+            }:
                 record.status = "RUNNING"
                 record.message = f"{request.title} approved."
                 record.events.append(
@@ -527,11 +549,14 @@ class RunManager:
             if record.status != "AWAITING_APPROVAL" or record.approval is None:
                 raise InputError("This run is not currently waiting for approval.")
             kind = record.approval.kind
-            allowed = (
-                {"approve", "cancel", "use_pasted"}
-                if kind == "linkedin_posting"
-                else {"approve", "cancel"}
-            )
+            if kind == "linkedin_posting":
+                allowed = {"approve", "cancel", "use_pasted"}
+            elif kind == "qa_revision":
+                allowed = {"revise_once", "stop", "cancel"}
+            elif kind == "revised_content":
+                allowed = {"approve", "reject", "cancel"}
+            else:
+                allowed = {"approve", "cancel"}
             if action not in allowed:
                 raise InputError("That approval action is not valid for this gate.")
             data: dict[str, Any] = {}
@@ -595,8 +620,30 @@ class RunManager:
         company = record.company or metadata.get("company")
         role = record.role or metadata.get("role")
         artifacts = _artifact_entries(record.artifact_directory)
-        pdf = next((item["name"] for item in artifacts if item["kind"] == "PDF"), None)
+        final_generation = (
+            metadata.get("revision_cycle", {}).get("final_generation")
+            if isinstance(metadata.get("revision_cycle"), dict)
+            else None
+        )
+        generation_marker = (
+            ".revision-1." if final_generation == "revision-1" else ".initial."
+        )
+        pdf = next(
+            (
+                item["name"]
+                for item in artifacts
+                if item["kind"] == "PDF" and generation_marker in item["name"]
+            ),
+            next(
+                (item["name"] for item in artifacts if item["kind"] == "PDF"),
+                None,
+            ),
+        )
         failure_kind = record.failure_kind or _failure_kind_from_metadata(metadata)
+        retrieval_classification = (
+            record.retrieval_classification
+            or _retrieval_classification_from_metadata(metadata)
+        )
         retry_eligible, retry_reason = self._retry_state(
             record.artifact_directory,
             failure_kind=failure_kind,
@@ -632,6 +679,7 @@ class RunManager:
             ),
             "error": record.error,
             "failure_kind": failure_kind,
+            "retrieval_classification": retrieval_classification,
             "retry_eligible": retry_eligible,
             "retry_reason": retry_reason,
             "antigravity_retry_eligible": antigravity_retry_eligible,
@@ -643,6 +691,7 @@ class RunManager:
             "revision": record.revision,
             "artifacts": artifacts,
             "pdf_name": pdf,
+            "final_generation": final_generation,
             "metadata": metadata,
         }
 
@@ -754,6 +803,7 @@ class RunManager:
         status = str(metadata.get("status", "UNKNOWN"))
         stage = _ui_stage_from_metadata(str(metadata.get("stage", "")))
         failure_kind = _failure_kind_from_metadata(metadata)
+        retrieval_classification = _retrieval_classification_from_metadata(metadata)
         artifacts = _artifact_entries(run_directory)
         pdf = next((item["name"] for item in artifacts if item["kind"] == "PDF"), None)
         retry_eligible, retry_reason = self._retry_state(
@@ -794,25 +844,16 @@ class RunManager:
                 "argument vector before provider startup. Prompt content is omitted."
             )
             message = _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
-        elif failure_kind == "linkedin_response_envelope":
+        elif failure_kind == "codex_linkedin_retrieval":
             technical = (
-                "Antigravity's terminal LinkedIn retrieval event did not contain "
-                "one schema-valid structured result. Provider prose and posting "
-                "content are omitted."
+                "Codex LinkedIn retrieval was rejected with the bounded local "
+                f"classification {retrieval_classification or 'provider_failure'}. "
+                "Provider prose and posting content are omitted."
             )
-            message = _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE
-        elif failure_kind == "apify_configuration":
-            technical = (
-                "Apify URL retrieval was selected without a usable local API-token "
-                "configuration. No token value is stored or displayed."
+            message = _CODEX_LINKEDIN_UI_MESSAGES.get(
+                retrieval_classification or "provider_failure",
+                _CODEX_LINKEDIN_UI_MESSAGES["provider_failure"],
             )
-            message = _APIFY_CONFIGURATION_UI_MESSAGE
-        elif failure_kind == "apify_retrieval":
-            technical = (
-                "Apify did not return exactly one locally verifiable, schema-valid "
-                "job-detail record. Provider response content is omitted."
-            )
-            message = _APIFY_RETRIEVAL_UI_MESSAGE
         elif failure_kind == "antigravity_response_envelope":
             technical = (
                 "Antigravity returned a documented print-mode JSON wrapper, but "
@@ -863,6 +904,7 @@ class RunManager:
             "artifact_directory": str(run_directory),
             "error": technical,
             "failure_kind": failure_kind,
+            "retrieval_classification": retrieval_classification,
             "retry_eligible": retry_eligible,
             "retry_reason": retry_reason,
             "antigravity_retry_eligible": antigravity_retry_eligible,
@@ -1136,18 +1178,27 @@ _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE = (
 _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE = (
     "Antigravity returned JSON in an unsupported response format."
 )
-_LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE = (
-    "Antigravity could not return the LinkedIn posting in its documented "
-    "structured-output envelope. No résumé analysis or tailoring was started."
-)
-_APIFY_CONFIGURATION_UI_MESSAGE = (
-    "Apify retrieval is not configured. Add APIFY_API_TOKEN to the local launch "
-    "environment or choose Antigravity, pasted text, or a UTF-8 job file."
-)
-_APIFY_RETRIEVAL_UI_MESSAGE = (
-    "Apify could not return one locally verified LinkedIn job-detail record. "
-    "No résumé analysis or tailoring was started."
-)
+_CODEX_LINKEDIN_UI_MESSAGES = {
+    "login_required": (
+        "LinkedIn requires sign-in, and Resume Tailor will not access an account."
+    ),
+    "expired": "The exact LinkedIn posting appears to be expired.",
+    "unavailable": "The exact LinkedIn posting is unavailable.",
+    "insufficient_content": (
+        "Codex could not retrieve the complete substantive job description."
+    ),
+    "url_mismatch": (
+        "The retrieved URL did not authenticate as the exact requested posting."
+    ),
+    "job_id_mismatch": (
+        "The retrieved LinkedIn job ID did not match the locally extracted ID."
+    ),
+    "search_unavailable": "Codex live web search was unavailable for this retrieval.",
+    "provider_failure": "Codex LinkedIn retrieval stopped with a provider failure.",
+    "malformed_output": (
+        "Codex did not return one complete schema-valid LinkedIn job result."
+    ),
+}
 _ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE = (
     "Antigravity did not apply the approved tailoring plan and returned a "
     "non-actionable request for another task. All authenticated inputs were "
@@ -1169,20 +1220,13 @@ def _failure_kind_for_error(
 ) -> str:
     if isinstance(error, SourceEvidenceError):
         return "source_evidence"
-    if isinstance(error, ApifyConfigurationError):
-        return "apify_configuration"
-    if isinstance(error, ApifyProviderError):
-        return "apify_retrieval"
+    if isinstance(error, CodexLinkedInRetrievalError):
+        return "codex_linkedin_retrieval"
     if isinstance(error, AntigravityLaunchSizeError) or (
         stage == "antigravity_tailoring"
         and "Argument list too long" in str(error)
     ):
         return "antigravity_launch_size"
-    if isinstance(error, LinkedInResponseEnvelopeError) or (
-        stage in {"fetching_job", "confirming_posting"}
-        and isinstance(error, AntigravityResponseEnvelopeError)
-    ):
-        return "linkedin_response_envelope"
     if isinstance(error, AntigravityResponseEnvelopeError):
         return "antigravity_response_envelope"
     if isinstance(error, AntigravityTailoringContractError):
@@ -1210,24 +1254,10 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
     error_message = error.get("message") if isinstance(error, Mapping) else None
     stage = str(metadata.get("stage", ""))
     if (
-        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
-        and (
-            metadata.get("failure_class") == "linkedin-response-envelope"
-            or error_type
-            in {"LinkedInResponseEnvelopeError", "AntigravityResponseEnvelopeError"}
-        )
+        metadata.get("failure_class") == "codex-linkedin-retrieval"
+        or error_type == "CodexLinkedInRetrievalError"
     ):
-        return "linkedin_response_envelope"
-    if (
-        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
-        and error_type == "ApifyConfigurationError"
-    ):
-        return "apify_configuration"
-    if (
-        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
-        and error_type == "ApifyProviderError"
-    ):
-        return "apify_retrieval"
+        return "codex_linkedin_retrieval"
     antigravity_failure = antigravity_retry_failure_kind(dict(metadata))
     if antigravity_failure == "launch_size":
         return "antigravity_launch_size"
@@ -1251,8 +1281,17 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         )
     ):
         return "source_evidence"
-    if stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}:
+    if stage in {"codex-linkedin-retrieval", "linkedin-posting-confirmation"}:
         return "retrieval"
+    return None
+
+
+def _retrieval_classification_from_metadata(
+    metadata: Mapping[str, Any],
+) -> str | None:
+    value = metadata.get("retrieval_classification")
+    if isinstance(value, str) and value in _CODEX_LINKEDIN_UI_MESSAGES:
+        return value
     return None
 
 
@@ -1260,7 +1299,7 @@ def _ui_stage_from_metadata(stage: str) -> str:
     return {
         "initializing": "validating_input",
         "dependency-check": "validating_input",
-        "linkedin-job-extraction": "fetching_job",
+        "codex-linkedin-retrieval": "fetching_job",
         "linkedin-posting-confirmation": "confirming_posting",
         "extracting-master": "codex_analysis",
         "codex-analysis-schema-preflight": "codex_analysis",
@@ -1274,6 +1313,12 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "docx-render": "rendering",
         "pdf-export-validation": "rendering",
         "final-codex-qa": "final_qa",
+        "revision-authorization": "revision_phase",
+        "antigravity-revision-1": "revision_phase",
+        "revision-1-local-evidence-check": "revision_phase",
+        "revision-1-content-approval": "revision_phase",
+        "revision-1-docx-render": "revision_phase",
+        "revision-1-final-codex-qa": "revision_phase",
         "complete": "complete",
     }.get(stage, "validating_input")
 
@@ -1281,17 +1326,13 @@ def _ui_stage_from_metadata(stage: str) -> str:
 def _safe_error_message(error: ResumeTailorError) -> str:
     if isinstance(error, SourceEvidenceError):
         return _SOURCE_EVIDENCE_UI_MESSAGE
-    if isinstance(error, ApifyConfigurationError):
-        return _APIFY_CONFIGURATION_UI_MESSAGE
-    if isinstance(error, ApifyProviderError):
-        return _APIFY_RETRIEVAL_UI_MESSAGE
+    if isinstance(error, CodexLinkedInRetrievalError):
+        return _CODEX_LINKEDIN_UI_MESSAGES[error.classification]
     if isinstance(error, AntigravityLaunchSizeError) or (
         "Argument list too long" in str(error)
         and "agy" in str(error)
     ):
         return _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
-    if isinstance(error, LinkedInResponseEnvelopeError):
-        return _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE
     if isinstance(error, AntigravityResponseEnvelopeError):
         return _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE
     if isinstance(error, AntigravityTailoringContractError):
@@ -1503,18 +1544,12 @@ async def _prepare_namespace(
         company: str | None = None
         role: str | None = None
         job_url: str | None = None
-        linkedin_provider = "auto"
         job_file: Path | None = None
         if source_mode == "url":
             job_url = _form_text(form, "job_url")
             if not job_url:
                 raise InputError("Enter a LinkedIn job URL.")
             job_url = validate_linkedin_url(job_url).normalized
-            linkedin_provider = _form_text(form, "linkedin_provider") or "auto"
-            resolve_linkedin_provider(
-                linkedin_provider,
-                environment={},
-            )
         else:
             company = _validate_label(_form_text(form, "company"), "Company")
             role = _validate_label(_form_text(form, "role"), "Role")
@@ -1553,7 +1588,6 @@ async def _prepare_namespace(
             clipboard=False,
             job_file=job_file,
             job_url=job_url,
-            linkedin_provider=linkedin_provider,
             company=company,
             role=role,
             output_dir=manager.settings.output_directory,
@@ -1846,7 +1880,6 @@ def _safe_form_values(form: FormData) -> dict[str, str]:
         "resume_mode",
         "job_mode",
         "job_url",
-        "linkedin_provider",
         "company",
         "role",
         "pasted_description",

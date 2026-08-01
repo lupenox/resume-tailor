@@ -109,9 +109,9 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
     ]
     response_metadata = metadata["antigravity_response"]
     assert response_metadata["execution_mode"] == "print"
-    assert response_metadata["output_format"] == "json"
+    assert response_metadata["output_format"] == "stream-json"
     assert response_metadata["response_envelope_type"] == (
-        "json-wrapper-structured_output"
+        "stream-json-event-result:json-wrapper-structured_output"
     )
     assert response_metadata["validation_result"] == "PASS"
     assert response_metadata["cli_version"] == "1.1.8-stub"
@@ -126,7 +126,7 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
     ]
     assert used_schemas == [
         "codex-analysis-transport.schema.json",
-        "final_qa.openai.schema.json",
+        "final_qa_provider.openai.schema.json",
     ]
 
 
@@ -149,6 +149,64 @@ def test_failure_preserves_useful_artifacts(
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["status"] == "FAILED"
     assert metadata["source_resume"]["unchanged"] is True
+
+
+@pytest.mark.parametrize("source_mode", ["job-file", "clipboard"])
+def test_local_text_modes_never_enable_codex_web_retrieval(
+    source_mode: str,
+    master_resume: Path,
+    job_file: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocation_log = tmp_path / f"{source_mode}-codex-invocations.jsonl"
+    monkeypatch.setenv("STUB_CODEX_INVOCATION_LOG", str(invocation_log))
+    monkeypatch.setenv("STUB_CODEX_MODE", "questions")
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_codex_linkedin_retrieval",
+        lambda **_: pytest.fail("Local text input enabled Codex live retrieval"),
+    )
+    output_dir = tmp_path / f"{source_mode}-output"
+    if source_mode == "job-file":
+        arguments = _arguments(master_resume, job_file, output_dir)
+    else:
+        monkeypatch.setattr(
+            cli_module,
+            "read_clipboard",
+            lambda: (
+                "Synthetic complete job description supplied by the local "
+                "clipboard for a Python role with testing and documentation.",
+                "clipboard-stub",
+            ),
+        )
+        arguments = [
+            "--resume",
+            str(master_resume),
+            "--clipboard",
+            "--company",
+            "Example Talent",
+            "--role",
+            "Agentic AI Developer",
+            "--output-dir",
+            str(output_dir),
+            "--timeout",
+            "30s",
+            "--yes",
+        ]
+
+    code = main(arguments)
+
+    assert code == ExitCode.WAITING
+    roles = [
+        json.loads(line)["role"]
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert roles == ["resume_analysis"]
+    run = next(output_dir.iterdir())
+    assert not (run / "job-source.json").exists()
+    assert not (run / "codex-linkedin-retrieval-diagnostic.json").exists()
 
 
 def test_unstructured_print_wrapper_is_classified_without_prose_extraction(
@@ -225,7 +283,7 @@ def test_source_evidence_failure_precedes_approval_and_antigravity(
     assert metadata["error"]["type"] == "SourceEvidenceError"
 
 
-def test_user_rejecting_linkedin_confirmation_stops_before_codex(
+def test_user_rejecting_linkedin_confirmation_stops_before_resume_analysis(
     master_resume: Path,
     tmp_path: Path,
     stubs_on_path: Path,
@@ -242,15 +300,18 @@ def test_user_rejecting_linkedin_confirmation_stops_before_codex(
     code = main(_url_arguments(master_resume, output_dir))
     assert code == ExitCode.APPROVAL
     run = next(output_dir.iterdir())
-    assert run.name.startswith("linkedin-job-fetch-")
+    assert run.name.startswith("codex-linkedin-retrieval-")
     assert (run / "job-source.json").is_file()
+    assert (run / "codex-linkedin-retrieval-diagnostic.json").is_file()
     assert (run / "job-description.txt").is_file()
     assert not (run / "codex-analysis.json").exists()
+    assert not (run / "extracted-master-resume.json").exists()
+    assert not (run / "antigravity-response.json").exists()
     assert not list(run.glob("*.docx"))
     assert prompts == ['LinkedIn posting: type "approve" to continue: ']
 
 
-def test_apify_provider_dispatches_locally_before_confirmation(
+def test_codex_is_the_only_step_2_retrieval_provider(
     master_resume: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -283,67 +344,71 @@ def test_apify_provider_dispatches_locally_before_confirmation(
         "preferred_qualifications": [],
         "technologies_and_skills": [],
         "ai_focus_areas": [],
-        "warnings": ["Synthetic Apify fixture."],
+        "warnings": ["Synthetic Codex fixture."],
     }
     calls: list[str] = []
 
-    def apify_fetch(**_: object) -> dict[str, object]:
-        calls.append("apify")
+    def codex_fetch(**_: object) -> dict[str, object]:
+        calls.append("codex_retrieval")
         return posting
 
-    monkeypatch.setattr(cli_module, "invoke_apify_job_extraction", apify_fetch)
     monkeypatch.setattr(
         cli_module,
-        "invoke_linkedin_job_extraction",
-        lambda **_: pytest.fail("Antigravity URL retrieval was invoked"),
+        "invoke_codex_linkedin_retrieval",
+        codex_fetch,
     )
     monkeypatch.setattr(
         cli_module,
-        "_dependency_versions",
+        "invoke_antigravity",
+        lambda **_: pytest.fail("Antigravity was invoked during step 2"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_tailoring_dependency_versions",
+        lambda _: pytest.fail("Antigravity dependencies were invoked during step 2"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_analysis_dependency_versions",
         lambda _: {
             "resume_tailor": "0.1.0",
             "codex": "stub",
-            "antigravity": "stub",
-            "libreoffice": "stub",
         },
     )
     monkeypatch.setattr("builtins.input", lambda _: "reject")
     output_dir = tmp_path / "url-output"
 
-    code = main(
-        [
-            *_url_arguments(master_resume, output_dir),
-            "--linkedin-provider",
-            "apify",
-        ]
-    )
+    code = main(_url_arguments(master_resume, output_dir))
 
     assert code == ExitCode.APPROVAL
-    assert calls == ["apify"]
+    assert calls == ["codex_retrieval"]
     run = next(output_dir.iterdir())
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
-    assert metadata["linkedin_retrieval"] == {
-        "requested_provider": "apify",
-        "resolved_provider": "apify",
+    assert metadata["codex_linkedin_retrieval"] == {
+        "provider": "codex",
+        "interface": "codex --search exec",
+        "live_search": True,
+        "sandbox": "read-only",
+        "session": "ephemeral",
         "automatic_fallback": False,
     }
     assert not (run / "codex-analysis.json").exists()
+    assert not (run / "antigravity-response.json").exists()
 
 
-def test_linkedin_envelope_failure_is_stage_specific_and_stops_before_codex(
+def test_malformed_codex_retrieval_is_stage_specific_and_stops_before_analysis(
     master_resume: Path,
     tmp_path: Path,
     stubs_on_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("STUB_LINKEDIN_MODE", "print_response_prose")
+    monkeypatch.setenv("STUB_CODEX_LINKEDIN_MODE", "prose")
     monkeypatch.setattr(
         cli_module,
-        "_dependency_versions",
+        "_analysis_dependency_versions",
         lambda _cwd: {
             "resume_tailor": "0.1.0",
             "codex": "stub",
-            "antigravity": "stub",
         },
     )
     output_dir = tmp_path / "url-output"
@@ -353,14 +418,13 @@ def test_linkedin_envelope_failure_is_stage_specific_and_stops_before_codex(
     assert code == ExitCode.MODEL
     run = next(output_dir.iterdir())
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
-    assert metadata["stage"] == "linkedin-job-extraction"
-    assert metadata["failure_class"] == "linkedin-response-envelope"
-    assert metadata["error"]["type"] == "LinkedInResponseEnvelopeError"
-    assert metadata["error"]["response_envelope_type"].startswith(
-        "stream-json-event-result:"
-    )
-    assert (run / "linkedin-response-envelope.json").is_file()
+    assert metadata["stage"] == "codex-linkedin-retrieval"
+    assert metadata["failure_class"] == "codex-linkedin-retrieval"
+    assert metadata["retrieval_classification"] == "malformed_output"
+    assert metadata["error"]["type"] == "CodexLinkedInRetrievalError"
+    assert (run / "codex-linkedin-retrieval-diagnostic.json").is_file()
     assert not (run / "codex-analysis.json").exists()
+    assert not (run / "extracted-master-resume.json").exists()
     assert not (run / "antigravity-response.json").exists()
     assert not list(run.glob("*.docx"))
 
@@ -372,6 +436,10 @@ def test_url_pipeline_continues_after_explicit_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prompts: list[str] = []
+    invocation_log = tmp_path / "codex-invocations.jsonl"
+    antigravity_log = tmp_path / "antigravity-transport.json"
+    monkeypatch.setenv("STUB_CODEX_INVOCATION_LOG", str(invocation_log))
+    monkeypatch.setenv("STUB_AGY_TRANSPORT_LOG", str(antigravity_log))
 
     def approve(prompt: str) -> str:
         prompts.append(prompt)
@@ -389,6 +457,14 @@ def test_url_pipeline_continues_after_explicit_confirmation(
     assert (run / f"{basename}.docx").is_file()
     assert (run / f"{basename}.pdf").is_file()
     assert (run / "final-qa.md").is_file()
+    codex_roles = [
+        json.loads(line)["role"]
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert codex_roles == ["linkedin_retrieval", "resume_analysis", "final_qa"]
+    assert json.loads(antigravity_log.read_text(encoding="utf-8"))["role"] == (
+        "tailored_resume_writer"
+    )
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["status"] == "COMPLETE"
     assert metadata["company"] == "Example AI Systems"

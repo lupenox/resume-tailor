@@ -54,16 +54,46 @@ class InputError(ResumeTailorError):
     exit_code = ExitCode.INPUT
 
 
-class ApifyConfigurationError(InputError):
-    """Apify URL retrieval was selected without a usable local configuration."""
-
-
 class ModelError(ResumeTailorError):
     exit_code = ExitCode.MODEL
 
 
-class ApifyProviderError(ModelError):
-    """Apify failed to return one locally verifiable job posting."""
+_CODEX_LINKEDIN_FAILURE_MESSAGES = {
+    "login_required": (
+        "LinkedIn requires sign-in before the exact public posting can be read."
+    ),
+    "expired": "The exact LinkedIn posting appears to be expired.",
+    "unavailable": "The exact LinkedIn posting is unavailable.",
+    "insufficient_content": (
+        "Codex could not retrieve a complete, substantive LinkedIn job description."
+    ),
+    "url_mismatch": (
+        "Codex returned a URL that does not authenticate as the exact requested "
+        "LinkedIn posting."
+    ),
+    "job_id_mismatch": (
+        "Codex returned a LinkedIn job ID that does not match the locally extracted "
+        "requested job ID."
+    ),
+    "search_unavailable": "Codex live web search was unavailable for this retrieval.",
+    "provider_failure": "Codex LinkedIn retrieval stopped with a provider failure.",
+    "malformed_output": (
+        "Codex LinkedIn retrieval did not return one complete schema-valid JSON result."
+    ),
+}
+
+
+class CodexLinkedInRetrievalError(ModelError):
+    """A bounded, content-free failure from the Codex LinkedIn retrieval stage."""
+
+    def __init__(self, classification: str) -> None:
+        if classification not in _CODEX_LINKEDIN_FAILURE_MESSAGES:
+            classification = "provider_failure"
+        self.classification = classification
+        super().__init__(
+            _CODEX_LINKEDIN_FAILURE_MESSAGES[classification]
+            + " Use pasted text, --job-file, or --clipboard as a bounded fallback."
+        )
 
 
 class AntigravityTailoringContractError(ModelError):
@@ -78,16 +108,28 @@ class AntigravityResponseEnvelopeError(ModelError):
         self.envelope_type = envelope_type
 
 
-class LinkedInResponseEnvelopeError(AntigravityResponseEnvelopeError):
-    """LinkedIn retrieval returned no documented structured-output envelope."""
-
-
 class AntigravityCannotApplyError(ModelError):
     """Antigravity could not apply one authenticated approved edit."""
 
 
 class AntigravityTechnicalFailureError(ModelError):
     """Antigravity reported a bounded technical tailoring failure."""
+
+
+class AntigravityRevisionContractError(ModelError):
+    """Antigravity violated the bounded one-shot revision contract."""
+
+
+class AntigravityRevisionCannotApplyError(ModelError):
+    """Antigravity could not apply one authenticated QA correction."""
+
+
+class AntigravityRevisionTechnicalFailureError(ModelError):
+    """Antigravity reported a bounded revision execution failure."""
+
+
+class RevisionValidationError(ModelError):
+    """A revision crossed a local authorization or integrity boundary."""
 
 
 class AntigravityTailoringPreflightError(InputError):
@@ -272,7 +314,7 @@ def rename_run_directory(
             continue
         except OSError as exc:
             raise InputError(
-                f"Could not rename URL run directory for the extracted posting: {exc}"
+                f"Could not rename URL run directory for the retrieved posting: {exc}"
             ) from exc
         return candidate
     raise InputError(f"Could not create a unique run directory under {parent}")

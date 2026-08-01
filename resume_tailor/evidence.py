@@ -741,6 +741,27 @@ def _paragraph_values(content: dict[str, Any]) -> dict[str, str]:
     return values
 
 
+def changed_content_ids(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> list[str]:
+    """Return stable logical content IDs whose exact rendered text changed."""
+    before_values = _paragraph_values(before)
+    after_values = _paragraph_values(after)
+    if before_values.keys() != after_values.keys():
+        raise ValueError("Resume content structure changed while comparing revisions.")
+    return [
+        content_id
+        for content_id, value in before_values.items()
+        if after_values[content_id] != value
+    ]
+
+
+def content_values(content: dict[str, Any]) -> dict[str, str]:
+    """Expose exact logical paragraph values for bounded local diff reporting."""
+    return dict(_paragraph_values(content))
+
+
 def _assert_exact(
     report: EvidenceReport,
     *,
@@ -921,6 +942,24 @@ def validate_tailored_content(
                 f"Possible keyword stuffing: {keyword!r} appears {count} times "
                 f"(source: {original_count})."
             )
+
+    approved_targets = {
+        edit.get("target_source_id")
+        for edit in analysis.get("recommended_edits", [])
+        if isinstance(edit, dict) and isinstance(edit.get("target_source_id"), str)
+    }
+    try:
+        changed_targets = changed_content_ids(original, tailored)
+    except (KeyError, TypeError, ValueError):
+        report.issues.append(
+            "Tailored content could not be compared against the approved edit catalog."
+        )
+    else:
+        for content_id in changed_targets:
+            if content_id not in approved_targets:
+                report.issues.append(
+                    f"Unapproved content target changed: {content_id}."
+                )
 
     report.issues = list(dict.fromkeys(report.issues))
     report.introduced_technologies = list(dict.fromkeys(report.introduced_technologies))
