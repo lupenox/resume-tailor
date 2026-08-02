@@ -119,6 +119,9 @@
                 <label for="fallback-description">Complete pasted job description</label>
                 <textarea id="fallback-description" name="fallback_description" rows="10"
                   placeholder="Paste the complete trusted copy of this posting…"></textarea>
+                <p class="field-help">
+                  Maximum {{ "{:,}".format(max_job_description_characters) }} characters.
+                </p>
                 <div class="gate-actions">
                   <button class="primary-button" type="submit">Use pasted text and continue</button>
                   <button class="text-button" type="button" data-hide-fallback>Keep reviewing posting</button>

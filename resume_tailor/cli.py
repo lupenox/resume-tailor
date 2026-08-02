@@ -27,6 +27,7 @@ from .linkedin_job import (
     validate_linkedin_url,
 )
 from .job_requirements import build_job_requirement_catalog
+from .job_text import validate_confirmed_job_description
 from .orchestration import PipelineHooks
 from .ollama_transport import ollama_dependency_versions
 from .ollama_writer import (
@@ -565,6 +566,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             )
             job_source = "job-file"
 
+    if job_description is not None:
+        validate_confirmed_job_description(job_description)
+
     source_hash = sha256_file(resume_path)
     if (
         retry_inputs is not None
@@ -725,7 +729,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     actor_status=status,
                 ),
             )
-            job_description = fetched_job["normalized_job_description"]
+            job_description = validate_confirmed_job_description(
+                fetched_job["normalized_job_description"]
+            )
             atomic_write_text(
                 run_directory / "job-description.txt",
                 job_description.rstrip() + "\n",
@@ -758,12 +764,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                         "The pasted fallback description is empty; no résumé work "
                         "was started."
                     )
-                if len(pasted_description.encode("utf-8")) > 500_000:
-                    raise InputError(
-                        "The pasted fallback description exceeds the 500,000-byte "
-                        "safety limit."
-                    )
-                job_description = pasted_description
+                job_description = validate_confirmed_job_description(
+                    pasted_description
+                )
                 job_source = "pasted-fallback"
                 metadata["job_source"] = job_source
                 metadata["linkedin_job"]["used_pasted_fallback"] = True

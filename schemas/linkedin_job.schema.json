@@ -103,7 +103,7 @@
     },
     "normalized_job_description": {
       "type": "string",
-      "maxLength": 200000
+      "maxLength": 25000
     },
     "responsibilities": {
       "type": "array",

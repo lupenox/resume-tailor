@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
+from .job_text import validate_confirmed_job_description
 from .utilities import ApifyLinkedInRetrievalError, InputError
 
 
@@ -143,7 +144,10 @@ def normalize_job_description(value: str) -> str:
             continue
         normalized_lines.append(line)
         previous_blank = blank
-    return "\n".join(normalized_lines).strip()
+    normalized = "\n".join(normalized_lines).strip()
+    if normalized:
+        validate_confirmed_job_description(normalized)
+    return normalized
 
 
 def _raise_malformed() -> None:

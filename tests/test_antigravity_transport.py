@@ -94,9 +94,11 @@ def test_large_utf8_prompt_uses_exact_stdin_and_small_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     extracted, _ = extract_resume(master_resume)
+    # The approved job input remains within its shared content bound. The large
+    # forbidden-claim fixture below is what exercises stdin versus argv transport.
     synthetic_job = (
         "Synthetic résumé evidence — naïve café; no real person or employer.\n"
-        * 3_000
+        * 350
     )
     requirements = build_job_requirement_catalog(
         synthetic_job,

@@ -33,6 +33,10 @@ from . import __version__
 from .cli import _validate_label, run_pipeline
 from .docx_extract import validate_template
 from .linkedin_job import validate_linkedin_url
+from .job_text import (
+    MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS,
+    validate_confirmed_job_description,
+)
 from .orchestration import (
     ApprovalRequest,
     ApprovalResponse,
@@ -583,10 +587,7 @@ class RunManager:
                 description = job_description.strip()
                 if not description:
                     raise InputError("Paste a complete job description first.")
-                if len(description.encode("utf-8")) > MAX_JOB_BYTES:
-                    raise InputError(
-                        "The pasted job description exceeds the 500,000-byte limit."
-                    )
+                validate_confirmed_job_description(description)
                 data["job_description"] = description
             if action == "cancel":
                 record.cancel_event.set()
@@ -1553,6 +1554,9 @@ def _render(
         csrf_token=app.state.settings.launch_token,
         version=__version__,
         workflow_stages=WORKFLOW_STAGES,
+        max_job_description_characters=(
+            MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+        ),
         **context,
     )
     response = HTMLResponse(html, status_code=status_code)
@@ -1691,10 +1695,7 @@ async def _prepare_namespace(
                 description = _form_text(form, "pasted_description")
                 if not description:
                     raise InputError("Paste a complete job description.")
-                if len(description.encode("utf-8")) > MAX_JOB_BYTES:
-                    raise InputError(
-                        "The pasted job description exceeds the 500,000-byte limit."
-                    )
+                validate_confirmed_job_description(description)
             else:
                 upload = form.get("job_file")
                 if not isinstance(upload, UploadFile) or not upload.filename:
@@ -1714,6 +1715,7 @@ async def _prepare_namespace(
                     ) from exc
                 if not description:
                     raise InputError("The job-description upload is empty.")
+                validate_confirmed_job_description(description)
             job_file = staging / "job-description.txt"
             atomic_write_text(job_file, description.rstrip() + "\n")
 
@@ -2021,7 +2023,7 @@ def _safe_form_values(form: FormData) -> dict[str, str]:
         "pasted_description",
     }
     return {
-        name: value[:10_000]
+        name: value
         for name in allowed
         if isinstance((value := form.get(name)), str)
     }

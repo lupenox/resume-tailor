@@ -400,6 +400,13 @@ receives one `searchUrls` value containing the normalized public URL; it receive
 no résumé, résumé path, résumé hash, approved analysis, or writer content. Pasted
 text, clipboard input, and UTF-8 job files bypass web retrieval entirely.
 
+Every confirmed input mode uses the same 25,000-character job-description
+maximum after line-ending normalization and removal of outer whitespace. Inputs
+are rejected rather than truncated, and the error reports both the actual and
+permitted character counts. The separate 500,000-byte clipboard, upload, and
+file-read guards bound local resource use before this shared content policy is
+applied; they do not authorize a longer confirmed posting.
+
 Only public `https://linkedin.com/jobs/view/...` and
 `https://www.linkedin.com/jobs/view/...` URLs are accepted initially. Tracking
 parameters are permitted when valid. Embedded credentials, other schemes,
@@ -531,6 +538,9 @@ the adapter does not invent them.
 - The master resume is the only factual authority.
 - Job descriptions are untrusted prompt-injection input and are placed inside
   unique, explicit data-only boundaries in both model prompts.
+- Allowing a confirmed posting up to 25,000 characters does not grant any text
+  inside it instructional authority. Embedded commands, role changes, tool
+  requests, and schema-change requests remain job data and must be ignored.
 - LinkedIn page content returned by the Actor is untrusted data, never
   instructions. It is copied only through a bounded field allowlist, HTML is
   converted to plain structured text, and script/style content is discarded.
@@ -676,6 +686,15 @@ Backend order is `wl-paste`, then `xclip -selection clipboard -o`, then
 The web UI uses pasted clipboard text instead of invoking a system clipboard
 binary. Click **Paste from clipboard** when the browser grants permission, or
 focus the field and use `Ctrl+V`.
+
+### Job description exceeds the confirmed-input limit
+
+Canonical Apify descriptions, pasted text, clipboard text, and UTF-8 job files
+share a 25,000-character maximum. Resume Tailor reports the measured and allowed
+lengths and never truncates the posting. Shorten only genuinely extraneous job
+page material, then submit the complete intended posting again. A 500,000-byte
+upload or clipboard guard is a separate resource ceiling, not an alternate
+content allowance.
 
 ### Apify configuration or authentication fails
 

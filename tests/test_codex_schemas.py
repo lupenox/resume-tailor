@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+
 import resume_tailor.codex_analysis as codex_analysis_module
 from resume_tailor.codex_analysis import invoke_codex_analysis
 from resume_tailor.job_requirements import build_job_requirement_catalog
@@ -126,7 +128,7 @@ def test_canonical_schema_retains_local_uniqueness_constraints() -> None:
     assert linkedin_job["properties"]["responsibilities"]["uniqueItems"] is True
     assert linkedin_job["properties"]["normalized_job_description"][
         "maxLength"
-    ] == 200000
+    ] == MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 
 
 def test_transport_preserves_supported_bounds_and_references() -> None:

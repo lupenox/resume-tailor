@@ -99,6 +99,11 @@ Missing optional values remain `null`, `unspecified`, or empty arrays. Local cod
 does not infer or fabricate facts. A meaningful title, company, and substantive
 description are required by the current downstream run-identity contract.
 
+The canonical description and every local text-input mode share one bounded
+25,000-character confirmed-posting policy. Over-limit text is rejected with its
+actual and permitted lengths; it is never truncated. Larger byte-level request
+guards exist only to bound reads and uploads before character validation.
+
 Only the canonical result reaches posting review and later job-requirement
 catalog construction. Raw Actor keys and JSON never reach Codex, Qwen,
 Antigravity, or the normal UI.

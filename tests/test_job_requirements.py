@@ -9,6 +9,7 @@ from resume_tailor.job_requirements import (
     job_requirement_index,
     validate_job_requirement_catalog,
 )
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.utilities import InputError
 
 
@@ -71,4 +72,38 @@ def test_catalog_hash_mismatch_and_duplicate_ids_fail_closed() -> None:
         validate_job_requirement_catalog(
             catalog,
             job_description="Changed synthetic requirement.",
+        )
+
+
+@pytest.mark.parametrize("length", [5_000, 6_318, 25_000])
+def test_confirmed_job_description_supported_boundaries_succeed(length: int) -> None:
+    description = "x" * length
+
+    catalog = build_job_requirement_catalog(description)
+
+    assert len(catalog["requirements"]) == 1
+    assert len(catalog["requirements"][0]["exact_text"]) == length
+    assert validate_job_requirement_catalog(
+        catalog,
+        job_description=description,
+    )
+
+
+def test_confirmed_job_description_over_limit_reports_actual_and_permitted() -> None:
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+
+    with pytest.raises(InputError) as raised:
+        build_job_requirement_catalog("x" * actual)
+
+    message = str(raised.value)
+    assert f"{actual:,}" in message
+    assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in message
+    assert "maximum permitted length" in message
+
+
+def test_structured_requirement_items_retain_their_separate_safety_bound() -> None:
+    with pytest.raises(InputError, match=r"5,001.*5,000"):
+        build_job_requirement_catalog(
+            "Confirmed synthetic posting.",
+            structured_job={"responsibilities": ["x" * 5_001]},
         )

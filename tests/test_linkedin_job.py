@@ -23,6 +23,7 @@ from resume_tailor.linkedin_job import (
     posting_confirmation_text,
     validate_linkedin_url,
 )
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.utilities import (
     ApifyConfigurationError,
     ApifyLinkedInRetrievalError,
@@ -81,6 +82,15 @@ def _item(**overrides: Any) -> dict[str, Any]:
     }
     item.update(overrides)
     return item
+
+
+def _description_with_length(length: int) -> str:
+    fragment = "Build safe Python services and automated tests. "
+    value = (fragment * ((length // len(fragment)) + 1))[:length]
+    if value[-1].isspace():
+        value = value[:-1] + "x"
+    assert len(value) == length
+    return value
 
 
 def _sanitized_live_item() -> dict[str, Any]:
@@ -344,6 +354,34 @@ def test_html_description_cleanup_preserves_paragraphs_and_lists() -> None:
     assert "EXPOSE" not in description
     assert "apify_api_PRIVATE_VALUE" not in description
     assert "<p>" not in description
+
+
+@pytest.mark.parametrize(
+    "length",
+    [6_318, MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS],
+)
+def test_long_canonical_descriptions_pass_local_normalization(length: int) -> None:
+    payload = normalize_apify_job_item(
+        _item(description=_description_with_length(length)),
+        requested=validate_linkedin_url(JOB_URL),
+        final_url=JOB_URL,
+    )
+
+    assert len(payload["normalized_job_description"]) == length
+
+
+def test_over_limit_canonical_description_reports_actual_and_permitted() -> None:
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+
+    with pytest.raises(InputError) as raised:
+        normalize_apify_job_item(
+            _item(description=_description_with_length(actual)),
+            requested=validate_linkedin_url(JOB_URL),
+            final_url=JOB_URL,
+        )
+
+    assert f"{actual:,}" in str(raised.value)
+    assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in str(raised.value)
 
 
 def test_sanitized_live_shape_removes_applicant_text_from_location() -> None:

@@ -111,13 +111,18 @@
               placeholder="Paste the complete posting as plain text…">{{ form_values.get("pasted_description", "") }}</textarea>
             <p id="clipboard-status" class="field-help" aria-live="polite">
               Browser clipboard access is optional; manual paste always works.
+              Maximum {{ "{:,}".format(max_job_description_characters) }} characters.
             </p>
           </div>
 
           <div class="input-panel" data-job-panel="file" hidden>
             <label for="job-file">UTF-8 job-description file</label>
             <input id="job-file" name="job_file" type="file" accept=".txt,text/plain">
-            <p class="field-help">Plain-text `.txt` files up to 500,000 bytes.</p>
+            <p class="field-help">
+              Plain-text `.txt` files use a 500,000-byte upload guard and a
+              {{ "{:,}".format(max_job_description_characters) }}-character
+              confirmed-posting limit.
+            </p>
           </div>
 
           <div class="identity-grid" data-manual-identity hidden>
