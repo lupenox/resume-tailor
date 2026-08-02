@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ollama revision patch envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "message",
+    "authorization_sha256",
+    "cannot_apply",
+    "technical_failure",
+    "patches"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["complete", "cannot_apply", "technical_failure"]
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "authorization_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "cannot_apply": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["issue_id", "reason_code", "reason"],
+          "properties": {
+            "issue_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reason_code": {
+              "type": "string",
+              "enum": [
+                "target_not_applicable",
+                "evidence_conflict",
+                "immutable_fact_conflict",
+                "content_budget_conflict",
+                "unsupported_claim_risk",
+                "other_bounded_constraint"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
+        }
+      ]
+    },
+    "technical_failure": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason_code", "reason"],
+          "properties": {
+            "reason_code": {
+              "type": "string",
+              "enum": [
+                "provider_unavailable",
+                "structured_output_failure",
+                "internal_tool_failure",
+                "output_constraint",
+                "other_technical_failure"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
+        }
+      ]
+    },
+    "patches": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "issue_id",
+              "target_source_id",
+              "replacement_text"
+            ],
+            "properties": {
+              "issue_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "target_source_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "replacement_text": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "complete"}}},
+      "then": {
+        "properties": {
+          "patches": {
+            "type": "array",
+            "minItems": 1
+          },
+          "cannot_apply": {"type": "null"},
+          "technical_failure": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "cannot_apply"}}},
+      "then": {
+        "properties": {
+          "cannot_apply": {"type": "object"},
+          "technical_failure": {"type": "null"},
+          "patches": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "technical_failure"}}},
+      "then": {
+        "properties": {
+          "cannot_apply": {"type": "null"},
+          "technical_failure": {"type": "object"},
+          "patches": {"type": "null"}
+        }
+      }
+    }
+  ]
+}

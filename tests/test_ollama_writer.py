@@ -76,13 +76,35 @@ def _inputs(master_resume: Path) -> tuple[dict, str, dict, dict]:
     return extracted, private_job, requirements, analysis
 
 
-def _complete(content: dict) -> dict:
+def _complete(analysis: dict | None = None, patches: list[dict] | None = None) -> dict:
+    if analysis is not None:
+        catalog = writer.approved_edit_catalog(analysis)
+        catalog_sha256 = writer.canonical_digest(catalog)
+        if patches is None:
+            patches = [
+                {
+                    "edit_id": edit["edit_id"],
+                    "target_source_id": edit["target_source_id"],
+                    "operation": edit.get("operation", "replace"),
+                    "replacement_text": edit.get("proposed_text", "Updated text"),
+                }
+                for edit in catalog
+            ]
+        return {
+            "status": "complete",
+            "message": "Applied the approved synthetic plan.",
+            "catalog_sha256": catalog_sha256,
+            "cannot_apply": None,
+            "technical_failure": None,
+            "patches": patches,
+        }
     return {
         "status": "complete",
         "message": "Applied the approved synthetic plan.",
+        "catalog_sha256": "0" * 64,
         "cannot_apply": None,
         "technical_failure": None,
-        "tailored_resume": content,
+        "patches": patches or [],
     }
 
 
@@ -101,10 +123,9 @@ def test_ollama_prompt_uses_approved_plan_not_raw_job_description(
     )
 
     assert "SYNTHETIC_PRIVATE_JOB_MARKER" not in prompt
-    assert "Return exactly one" in prompt
-    assert "WHAT supported skill" in prompt
-    assert "Never add an unsupported" in prompt
-    assert "first half of the resume" in prompt
+    assert "Author target-only edits" in prompt
+    assert "NO UNSUPPORTED CLAIMS" in prompt
+    assert "CATALOG SHA256 DIGEST" in prompt
 
 
 def test_gemma_invocation_uses_schema_mode_and_canonical_validation(
@@ -125,7 +146,7 @@ def test_gemma_invocation_uses_schema_mode_and_canonical_validation(
             "done_reason": "stop",
             "message": {
                 "role": "assistant",
-                "content": json.dumps(_complete(extracted["content"])),
+                "content": json.dumps(_complete(analysis)),
             },
             "eval_count": 100,
         }
@@ -284,7 +305,7 @@ def test_preserved_wrong_root_response_is_classified_as_transport_schema_failure
     # The specific class must remain a contract error for existing handlers.
     assert isinstance(caught.value, OllamaTailoringContractError)
     message = str(caught.value)
-    for field in fixture["expected_classification"]["missing_required_root_fields"]:
+    for field in ["status", "cannot_apply", "technical_failure"]:
         assert field in message
     # No résumé-derived value may appear in the sanitized error message.
     assert "Synthetic Candidate" not in message
@@ -313,7 +334,7 @@ def test_preserved_wrong_root_response_is_classified_as_transport_schema_failure
 def test_wrong_root_shape_is_rejected_by_the_derived_transport_schema() -> None:
     """The derived transport schema alone must reject the observed historical root."""
     fixture = _fixture_body()
-    schema = writer._ollama_transport_schema("tailored_resume.schema.json")
+    schema = writer._ollama_transport_schema("ollama_tailoring_patch.schema.json")
     wrong_root = json.loads(fixture["chat_body"]["message"]["content"])
     assert sorted(wrong_root) == sorted(OBSERVED_WRONG_ROOT_KEYS)
     with pytest.raises(OllamaTransportSchemaError):
@@ -331,10 +352,10 @@ def test_envelope_shaped_output_failing_canonical_rules_is_a_canonical_failure(
 ) -> None:
     """A correct envelope with a canonical violation is classified separately."""
     extracted, private_job, requirements, analysis = _inputs(master_resume)
-    # status=complete with a null tailored_resume satisfies the transport schema
+    # status=complete with a null patches satisfies the transport schema
     # (its cross-field allOf is stripped) but violates the canonical contract.
-    payload = _complete(extracted["content"])
-    payload["tailored_resume"] = None
+    payload = _complete(analysis)
+    payload["patches"] = None
     monkeypatch.setattr(
         writer,
         "run_ollama_request",
@@ -465,9 +486,9 @@ def test_oversized_prompt_budget_refuses_before_any_request(
             run_directory=tmp_path,
             timeout_seconds=30,
             capability_overrides={
-                "context_window": 4096,
-                "max_output_tokens": 2048,
-                "min_output_tokens": 2048,
+                "context_window": 1024,
+                "max_output_tokens": 1024,
+                "min_output_tokens": 1024,
             },
         )
 
@@ -513,7 +534,7 @@ def test_model_capabilities_resolve_by_tagged_and_unknown_name() -> None:
 
 def test_structured_output_probe_covers_required_constructs_offline() -> None:
     """The probe must assert $ref, oneOf, additionalProperties, required roots."""
-    schema = writer._ollama_transport_schema("tailored_resume.schema.json")
+    schema = writer._ollama_transport_schema("ollama_tailoring_patch.schema.json")
     result = probe_structured_output_support(schema)
     assert result["provider_called"] is False
     assert result["supported"] is True
@@ -589,7 +610,7 @@ def test_gemma_request_body_uses_expected_context_and_output_budgets(
             "done_reason": "stop",
             "message": {
                 "role": "assistant",
-                "content": json.dumps(_complete(extracted["content"])),
+                "content": json.dumps(_complete(analysis)),
             },
             "eval_count": 50,
         }
@@ -630,7 +651,7 @@ def test_gemma_metadata_does_not_report_qwen_as_provider(
             "done_reason": "stop",
             "message": {
                 "role": "assistant",
-                "content": json.dumps(_complete(extracted["content"])),
+                "content": json.dumps(_complete(analysis)),
             },
             "eval_count": 50,
         },
@@ -674,7 +695,7 @@ def test_gemma_request_retains_structured_output_schema(
             "done_reason": "stop",
             "message": {
                 "role": "assistant",
-                "content": json.dumps(_complete(extracted["content"])),
+                "content": json.dumps(_complete(analysis)),
             },
             "eval_count": 50,
         }
@@ -720,7 +741,7 @@ def test_no_automatic_qwen_fallback_when_gemma_is_requested(
             "done_reason": "stop",
             "message": {
                 "role": "assistant",
-                "content": json.dumps(_complete(extracted["content"])),
+                "content": json.dumps(_complete(analysis)),
             },
             "eval_count": 50,
         }
@@ -760,7 +781,7 @@ def test_model_override_still_works_with_gemma_default(
             "done_reason": "stop",
             "message": {
                 "role": "assistant",
-                "content": json.dumps(_complete(extracted["content"])),
+                "content": json.dumps(_complete(analysis)),
             },
             "eval_count": 50,
         }
