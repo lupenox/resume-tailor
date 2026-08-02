@@ -3,8 +3,8 @@
 `resume-tailor` is a local Linux CLI and polished localhost web application that
 creates a truthful, job-tailored resume from a structured master DOCX. Both
 interfaces share one Python pipeline: Apify retrieves public LinkedIn postings,
-OpenAI Codex CLI performs evidence analysis, and local Qwen through Ollama
-produces the complete schema-constrained tailored résumé content,
+OpenAI Codex CLI performs evidence analysis, and local Gemma 4 12B through
+Ollama produces the complete schema-constrained tailored résumé content,
 deterministic local code validates and renders a Headless-style DOCX,
 LibreOffice and Poppler validate a one-page PDF, and Codex performs a final
 read-only visual/content review.
@@ -35,7 +35,7 @@ The web UI is optional. `tailor-resume` remains the complete terminal interface;
    explicit approval.
 6. Run a local completeness and hash-authentication preflight, then send the
    original content, relevant immutable résumé evidence, and approved edit
-   catalog to `resume-tailor-qwen` through Ollama's fixed
+   catalog to `resume-tailor-gemma` through Ollama's fixed
    `http://127.0.0.1:11434` endpoint. The request is non-streaming, thinking is
    disabled, and Ollama receives a run-specific JSON Schema as its `format`.
    Prompt text travels to a cancellable child worker over UTF-8 stdin and never
@@ -48,9 +48,9 @@ The web UI is optional. `tailor-resume` remains the complete terminal interface;
 8. Write and display a section-by-section before/after diff. Refuse questionable
    claims; otherwise require explicit approval.
 9. Render the approved content into a deterministic, single-column Headless-style
-   DOCX. Python—not Qwen—controls typography, page geometry, section ordering,
-   real list styles, contact information, and hyperlink targets. The original
-   master remains unchanged.
+   DOCX. Python—not the local writer—controls typography, page geometry,
+   section ordering, real list styles, contact information, and hyperlink targets.
+   The original master remains unchanged.
 10. Export one PDF page through a unique LibreOffice profile, validate text and
    bounding boxes with Poppler, and render `preview.png`.
 11. Give Codex the preview and complete evidence bundle for a fresh read-only QA.
@@ -103,7 +103,7 @@ real `List Bullet` styles, and the established direct-run formatting patterns.
 This is a deliberate safety boundary. Significant template drift stops the run
 instead of risking edits to the wrong paragraphs.
 
-New Qwen runs render the validated master content into the deterministic
+New Ollama runs render the validated master content into the deterministic
 format documented in
 [docs/headless-resume-format.md](docs/headless-resume-format.md). The canonical
 content structure remains unchanged, so all existing evidence and revision
@@ -171,7 +171,7 @@ The installer does **not** install dependencies. Check and install them yourself
 - `fastapi`, `uvicorn`, `jinja2`, and `python-multipart` for the local UI
 - An Apify account, API token, and LinkedIn job-detail Actor for URL mode
 - OpenAI Codex CLI
-- Ollama with the local `resume-tailor-qwen` model profile
+- Ollama with the local `resume-tailor-gemma` model profile (Gemma 4 12B)
 - Google Antigravity CLI (`agy`) only for the optional compatibility provider
 - LibreOffice
 - Poppler (`pdfinfo`, `pdftotext`, and `pdftoppm`)
@@ -195,10 +195,10 @@ Install Codex CLI, Ollama, and optionally Antigravity through their official
 distribution channels. This project never runs `sudo`, package managers, or
 global installers.
 
-Create the local writer profile once after downloading Qwen:
+Create the local writer profile once after downloading Gemma 4 12B:
 
 ```text
-FROM qwen3.5:9b
+FROM gemma4:12b
 PARAMETER num_ctx 32768
 PARAMETER temperature 0.2
 ```
@@ -207,13 +207,14 @@ PARAMETER temperature 0.2
 `resume_tailor/ollama_capabilities.py`. A smaller profile window silently
 truncates the prompt inside the Ollama server, which can produce a structurally
 wrong response even when the request itself is valid. See
-[docs/qwen-ollama-writer.md](docs/qwen-ollama-writer.md) for the budgeting and
+[docs/ollama-writer.md](docs/ollama-writer.md) for the budgeting and
 failure-classification rules.
 
 Save that as a `Modelfile`, then run:
 
 ```bash
-ollama create resume-tailor-qwen -f Modelfile
+ollama pull gemma4:12b
+ollama create resume-tailor-gemma -f Modelfile
 ollama list
 ```
 
@@ -231,7 +232,7 @@ login flow and confirm the local Ollama service/model. Verify the exact tools:
 codex --version
 codex exec --help
 ollama --version
-ollama show resume-tailor-qwen
+ollama show resume-tailor-gemma
 agy --version
 agy --help
 ```
@@ -455,7 +456,7 @@ Durations accept positive seconds, minutes, or hours such as `90s`, `15m`, and
 `1h`; the maximum is 24 hours. The default is `15m`.
 
 The default writer is `--writer-provider ollama --ollama-model
-resume-tailor-qwen`. Select `--writer-provider antigravity` only when you
+resume-tailor-gemma`. Select `--writer-provider antigravity` only when you
 explicitly want the legacy provider and master-template renderer. No writer
 fallback happens automatically.
 
@@ -491,8 +492,8 @@ That action replaces the retrieved description only with text you explicitly
 paste; it never clicks LinkedIn controls or accesses an account. The next gate
 groups Codex's proposed summary, experience, and project changes, supported
 keywords, gaps, forbidden claims, and unchanged sections. A final before/after
-content gate still protects deterministic rendering after Qwen and local
-evidence checks.
+content gate still protects deterministic rendering after the local writer and
+local evidence checks.
 
 Any other input, including end-of-input, stops the pipeline and keeps the
 artifacts already produced. If Codex asks an unanswered factual question, the
@@ -531,9 +532,9 @@ rg-talent-agentic-ai-developer-YYYYMMDD-HHMMSS/
 ```
 
 Antigravity-selected runs use `antigravity-response.json` and
-`antigravity-response-envelope.json` instead. A single authorized Qwen revision
-adds the corresponding `ollama-revision-*` artifacts while preserving both
-generation-specific and promoted stable deliverables.
+`antigravity-response-envelope.json` instead. A single authorized local writer
+revision adds the corresponding `ollama-revision-*` artifacts while preserving
+both generation-specific and promoted stable deliverables.
 
 Failed runs preserve useful artifacts and record the failed stage and safe error
 message in `run-metadata.json`. Metadata contains tool versions, artifact names,
@@ -570,10 +571,10 @@ the adapter does not invent them.
   any other absent skill cannot be introduced.
 - Models cannot add sections, projects, skill groups, or bullets.
 - No model edits files. Apify performs retrieval only. Codex analysis runs with
-  `--sandbox read-only` and `--ephemeral`. Post-approval Qwen returns only
-  schema-constrained content through local Ollama; Python alone writes DOCX/PDF
-  artifacts. The optional Antigravity provider retains its sandboxed print-mode
-  adapter.
+  `--sandbox read-only` and `--ephemeral`. Post-approval Gemma 4 12B returns
+  only schema-constrained content through local Ollama; Python alone writes
+  DOCX/PDF artifacts. The optional Antigravity provider retains its sandboxed
+  print-mode adapter.
 - The pipeline never uses `eval`, `shell=True`, dangerous permission bypasses,
   recursive agent calls, destructive Git commands, or source-file overwrite.
 - It does not send email, post to LinkedIn, submit applications, or upload output.
@@ -590,7 +591,7 @@ In URL mode, the configured Apify Actor receives the supplied public LinkedIn
 URL, but no résumé content, résumé path, résumé hash, approved analysis, or
 writer content. Only after the user confirms the normalized posting does a
 separate Codex analysis session receive extracted résumé content and the
-confirmed job description. Local Qwen receives the approved analysis and
+confirmed job description. Local Gemma 4 12B receives the approved analysis and
 authenticated source material only at step 6 so it can write the complete
 tailored résumé content. A fresh final Codex session receives the rendered
 preview and evidence bundle for independent QA. Review those services' data

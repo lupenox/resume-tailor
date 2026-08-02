@@ -700,7 +700,7 @@ def test_file_and_clipboard_text_input_modes(
             await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
             assert pipeline.namespaces[0].job_url is None
             assert pipeline.namespaces[0].writer_provider == "ollama"
-            assert pipeline.namespaces[0].ollama_model == "resume-tailor-qwen"
+            assert pipeline.namespaces[0].ollama_model == "resume-tailor-gemma"
             assert pipeline.namespaces[0].job_source_override == mode
             assert pipeline.namespaces[0].analytics_db == (
                 app.state.settings.analytics_database

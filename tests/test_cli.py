@@ -70,7 +70,7 @@ def test_url_mode_derives_company_and_role() -> None:
     assert not hasattr(args, "linkedin_provider")
 
 
-def test_local_qwen_is_the_default_writer() -> None:
+def test_local_gemma_is_the_default_writer() -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -86,7 +86,7 @@ def test_local_qwen_is_the_default_writer() -> None:
     )
 
     assert args.writer_provider == "ollama"
-    assert args.ollama_model == "resume-tailor-qwen"
+    assert args.ollama_model == "resume-tailor-gemma"
     assert args.analytics_db.name == "job-search-analytics.sqlite3"
 
 

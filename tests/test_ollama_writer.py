@@ -86,7 +86,7 @@ def _complete(content: dict) -> dict:
     }
 
 
-def test_qwen_prompt_uses_approved_plan_not_raw_job_description(
+def test_ollama_prompt_uses_approved_plan_not_raw_job_description(
     master_resume: Path,
 ) -> None:
     extracted, private_job, requirements, analysis = _inputs(master_resume)
@@ -107,7 +107,7 @@ def test_qwen_prompt_uses_approved_plan_not_raw_job_description(
     assert "first half of the resume" in prompt
 
 
-def test_qwen_invocation_uses_schema_mode_and_canonical_validation(
+def test_gemma_invocation_uses_schema_mode_and_canonical_validation(
     master_resume: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -120,7 +120,7 @@ def test_qwen_invocation_uses_schema_mode_and_canonical_validation(
         request = kwargs["body"]
         assert isinstance(request, dict)
         return {
-            "model": "resume-tailor-qwen:latest",
+            "model": "resume-tailor-gemma:latest",
             "done": True,
             "done_reason": "stop",
             "message": {
@@ -146,12 +146,11 @@ def test_qwen_invocation_uses_schema_mode_and_canonical_validation(
     assert tailored == extracted["content"]
     request = observed["body"]
     assert isinstance(request, dict)
-    assert request["model"] == "resume-tailor-qwen"
+    assert request["model"] == "resume-tailor-gemma"
     assert request["stream"] is False
     assert request["think"] is False
-    # The context window is now an explicit declared capability rather than a
-    # hardcoded 8192, and the output budget must fit inside it.
-    capabilities = capabilities_for_model("resume-tailor-qwen")
+    # The context window is an explicit declared capability, not a hardcoded value.
+    capabilities = capabilities_for_model("resume-tailor-gemma")
     assert request["options"]["num_ctx"] == capabilities.context_window
     assert request["options"]["num_predict"] <= capabilities.max_output_tokens
     assert (
@@ -167,7 +166,7 @@ def test_qwen_invocation_uses_schema_mode_and_canonical_validation(
             encoding="utf-8"
         )
     )
-    assert envelope["provider"] == "qwen"
+    assert envelope["provider"] == "gemma"
     assert envelope["runtime"] == "ollama"
     assert envelope["local_only"] is True
     assert envelope["validation_result"] == "PASS"
@@ -180,7 +179,7 @@ def test_qwen_invocation_uses_schema_mode_and_canonical_validation(
     assert envelope["generation"]["truncated"] is False
 
 
-def test_qwen_invalid_json_is_rejected_and_recorded(
+def test_ollama_invalid_json_is_rejected_and_recorded(
     master_resume: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -190,7 +189,7 @@ def test_qwen_invalid_json_is_rejected_and_recorded(
         writer,
         "run_ollama_request",
         lambda **kwargs: {
-            "model": "resume-tailor-qwen:latest",
+            "model": "resume-tailor-gemma:latest",
             "done": True,
             "message": {"role": "assistant", "content": "not-json"},
         },
@@ -217,7 +216,7 @@ def test_qwen_invalid_json_is_rejected_and_recorded(
     assert metadata["validation_path"] == "malformed_json"
 
 
-def test_qwen_preflight_failure_is_provider_neutral_and_makes_no_request(
+def test_ollama_preflight_failure_is_provider_neutral_and_makes_no_request(
     master_resume: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -252,12 +251,14 @@ def test_preserved_wrong_root_response_is_classified_as_transport_schema_failure
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression for the preserved Step 6 failure.
+    """Regression for the preserved historical Step 6 Qwen failure.
 
-    Qwen returned complete, parseable JSON and stopped naturally, but the root
-    was a bare résumé shape with none of the required envelope fields. That must
-    be classified as a transport-schema rejection, not generic malformed JSON,
-    not truncation, and not a canonical-schema failure.
+    The prior Qwen writer returned complete, parseable JSON and stopped
+    naturally, but the root was a bare résumé shape with none of the required
+    envelope fields. That response is preserved as a historical fixture and must
+    continue to be classified as a transport-schema rejection, not generic
+    malformed JSON, not truncation, and not a canonical-schema failure.
+    This test remains valid regardless of which model is currently active.
     """
     fixture = _fixture_body()
     extracted, private_job, requirements, analysis = _inputs(master_resume)
@@ -310,7 +311,7 @@ def test_preserved_wrong_root_response_is_classified_as_transport_schema_failure
 
 
 def test_wrong_root_shape_is_rejected_by_the_derived_transport_schema() -> None:
-    """The derived transport schema alone must reject the observed root."""
+    """The derived transport schema alone must reject the observed historical root."""
     fixture = _fixture_body()
     schema = writer._ollama_transport_schema("tailored_resume.schema.json")
     wrong_root = json.loads(fixture["chat_body"]["message"]["content"])
@@ -319,7 +320,7 @@ def test_wrong_root_shape_is_rejected_by_the_derived_transport_schema() -> None:
         writer._validate_transport_payload(
             wrong_root,
             transport_schema=schema,
-            label="Qwen structured output",
+            label="local writer structured output",
         )
 
 
@@ -338,7 +339,7 @@ def test_envelope_shaped_output_failing_canonical_rules_is_a_canonical_failure(
         writer,
         "run_ollama_request",
         lambda **kwargs: {
-            "model": "resume-tailor-qwen:latest",
+            "model": "resume-tailor-gemma:latest",
             "done": True,
             "done_reason": "stop",
             "message": {"role": "assistant", "content": json.dumps(payload)},
@@ -377,7 +378,7 @@ def test_truncated_output_is_classified_as_truncation_not_malformed_json(
         writer,
         "run_ollama_request",
         lambda **kwargs: {
-            "model": "resume-tailor-qwen:latest",
+            "model": "resume-tailor-gemma:latest",
             "done": True,
             "done_reason": "length",
             "message": {"role": "assistant", "content": '{"status":"comp'},
@@ -416,7 +417,7 @@ def test_incomplete_stream_envelope_is_classified_as_response_envelope(
     monkeypatch.setattr(
         writer,
         "run_ollama_request",
-        lambda **kwargs: {"model": "resume-tailor-qwen:latest", "done": False},
+        lambda **kwargs: {"model": "resume-tailor-gemma:latest", "done": False},
     )
 
     with pytest.raises(OllamaResponseEnvelopeError):
@@ -494,11 +495,16 @@ def test_declared_capabilities_reject_an_output_ceiling_above_the_window() -> No
 
 
 def test_model_capabilities_resolve_by_tagged_and_unknown_name() -> None:
-    tagged = capabilities_for_model("resume-tailor-qwen:latest")
-    assert tagged.context_window == 32_768
+    # Active default: Gemma
+    tagged_gemma = capabilities_for_model("resume-tailor-gemma:latest")
+    assert tagged_gemma.context_window == 32_768
+    assert tagged_gemma.supports_json_schema is True
+    # Historical Qwen entry still resolves (preserved for regression fixture).
+    tagged_qwen = capabilities_for_model("resume-tailor-qwen:latest")
+    assert tagged_qwen.context_window == 32_768
     assert capabilities_for_model("some-unknown-model").supports_json_schema is True
     overridden = capabilities_for_model(
-        "resume-tailor-qwen",
+        "resume-tailor-gemma",
         overrides={"context_window": 16_384},
     )
     assert overridden.context_window == 16_384
@@ -535,3 +541,292 @@ def test_structured_output_probe_detects_a_weakened_schema() -> None:
     assert result["supported"] is False
     assert result["checks"]["required_root_fields_declared"] is False
     assert result["checks"]["additional_properties_false"] is False
+
+
+# ---------------------------------------------------------------------------
+# Focused Gemma 4 12B regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_default_model_is_resume_tailor_gemma() -> None:
+    """DEFAULT_OLLAMA_MODEL must be resume-tailor-gemma after the migration."""
+    assert writer.DEFAULT_OLLAMA_MODEL == "resume-tailor-gemma"
+
+
+def test_gemma_capability_lookup_resolves_exact_name() -> None:
+    """Exact name lookup must return declared Gemma capabilities."""
+    from resume_tailor.ollama_capabilities import MODEL_CAPABILITIES
+
+    assert "resume-tailor-gemma" in MODEL_CAPABILITIES
+    caps = MODEL_CAPABILITIES["resume-tailor-gemma"]
+    assert caps.context_window == 32_768
+    assert caps.max_output_tokens == 8_192
+    assert caps.min_output_tokens == 2_048
+    assert caps.supports_json_schema is True
+
+
+def test_gemma_capability_lookup_resolves_tagged_name() -> None:
+    """Tag-free lookup must resolve resume-tailor-gemma:latest."""
+    caps = capabilities_for_model("resume-tailor-gemma:latest")
+    assert caps.context_window == 32_768
+    assert caps.supports_json_schema is True
+
+
+def test_gemma_request_body_uses_expected_context_and_output_budgets(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Request body must use the Gemma capability window and a fitting budget."""
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    observed: dict[str, object] = {}
+
+    def capture(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "model": "resume-tailor-gemma:latest",
+            "done": True,
+            "done_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(_complete(extracted["content"])),
+            },
+            "eval_count": 50,
+        }
+
+    monkeypatch.setattr(writer, "run_ollama_request", capture)
+    writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+    req = observed["body"]
+    assert isinstance(req, dict)
+    caps = capabilities_for_model("resume-tailor-gemma")
+    assert req["options"]["num_ctx"] == caps.context_window
+    assert req["options"]["num_predict"] <= caps.max_output_tokens
+    assert req["options"]["num_predict"] >= caps.min_output_tokens
+
+
+def test_gemma_metadata_does_not_report_qwen_as_provider(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response envelope must name gemma, not qwen, as the provider."""
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    monkeypatch.setattr(
+        writer,
+        "run_ollama_request",
+        lambda **kwargs: {
+            "model": "resume-tailor-gemma:latest",
+            "done": True,
+            "done_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(_complete(extracted["content"])),
+            },
+            "eval_count": 50,
+        },
+    )
+    writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+    envelope = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert envelope["provider"] == "gemma"
+    assert envelope["provider"] != "qwen"
+    assert envelope["runtime"] == "ollama"
+    assert envelope["model"] == "resume-tailor-gemma"
+
+
+def test_gemma_request_retains_structured_output_schema(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The format field must carry a JSON Schema object, not be absent or null."""
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    observed: dict[str, object] = {}
+
+    def capture(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "model": "resume-tailor-gemma:latest",
+            "done": True,
+            "done_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(_complete(extracted["content"])),
+            },
+            "eval_count": 50,
+        }
+
+    monkeypatch.setattr(writer, "run_ollama_request", capture)
+    writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+    req = observed["body"]
+    assert isinstance(req, dict)
+    schema = req["format"]
+    assert isinstance(schema, dict)
+    assert schema.get("type") == "object"
+    # allOf cross-field assertions are stripped for the transport schema only.
+    assert "allOf" not in schema
+    assert schema.get("additionalProperties") is False
+
+
+def test_no_automatic_qwen_fallback_when_gemma_is_requested(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invoking with resume-tailor-gemma must never silently fall back to Qwen."""
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    observed_models: list[str] = []
+
+    def capture(**kwargs: object) -> dict[str, object]:
+        body = kwargs.get("body", {})
+        assert isinstance(body, dict)
+        observed_models.append(body.get("model", ""))
+        return {
+            "model": "resume-tailor-gemma:latest",
+            "done": True,
+            "done_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(_complete(extracted["content"])),
+            },
+            "eval_count": 50,
+        }
+
+    monkeypatch.setattr(writer, "run_ollama_request", capture)
+    writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+    # Exactly one request, using the Gemma profile — never the Qwen profile.
+    assert len(observed_models) == 1
+    assert observed_models[0] == "resume-tailor-gemma"
+    assert "qwen" not in observed_models[0].lower()
+
+
+def test_model_override_still_works_with_gemma_default(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing an explicit model kwarg must override the default."""
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    observed: dict[str, object] = {}
+
+    def capture(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "model": "my-custom-model:latest",
+            "done": True,
+            "done_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(_complete(extracted["content"])),
+            },
+            "eval_count": 50,
+        }
+
+    monkeypatch.setattr(writer, "run_ollama_request", capture)
+    writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+        model="my-custom-model",
+    )
+    req = observed["body"]
+    assert isinstance(req, dict)
+    assert req["model"] == "my-custom-model"
+
+
+def test_unknown_ollama_model_uses_conservative_defaults() -> None:
+    """An unregistered model must fall back to the conservative capability defaults."""
+    caps = capabilities_for_model("some-never-seen-model:v99")
+    assert caps.context_window == 32_768
+    assert caps.max_output_tokens == 8_192
+    assert caps.min_output_tokens == 2_048
+    assert caps.supports_json_schema is True
+
+
+def test_historical_wrong_root_fixture_still_classifies_as_transport_schema(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserved Qwen fixture must still classify as ollama-transport-schema.
+
+    This is a direct duplicate of the primary regression test expressed as an
+    explicit Gemma-era named test so future readers understand the fixture
+    remains intentionally Qwen-labelled as a historical record.
+    """
+    fixture = _fixture_body()
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    monkeypatch.setattr(
+        writer,
+        "run_ollama_request",
+        lambda **kwargs: json.loads(json.dumps(fixture["chat_body"])),
+    )
+    with pytest.raises(OllamaTransportSchemaError) as caught:
+        writer.invoke_ollama(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=private_job,
+            job_requirements=requirements,
+            approved_analysis=analysis,
+            company="Synthetic Systems",
+            role="Validation Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+        )
+    envelope = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert envelope["validation_path"] == "transport_schema"
+    assert envelope["validation_result"] == "REJECTED"
+    assert caught.value is not None

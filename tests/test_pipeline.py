@@ -240,7 +240,7 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
     ]
 
 
-def test_default_pipeline_routes_approved_writing_to_local_qwen(
+def test_default_pipeline_routes_approved_writing_to_local_gemma(
     master_resume: Path,
     job_file: Path,
     tmp_path: Path,
@@ -248,8 +248,8 @@ def test_default_pipeline_routes_approved_writing_to_local_qwen(
 ) -> None:
     calls: list[str] = []
 
-    def fake_qwen(**kwargs: object) -> dict:
-        calls.append("qwen")
+    def fake_gemma(**kwargs: object) -> dict:
+        calls.append("gemma")
         return kwargs["extracted_resume"]["content"]  # type: ignore[index]
 
     fake_metadata = {
@@ -258,7 +258,7 @@ def test_default_pipeline_routes_approved_writing_to_local_qwen(
         "output_format": "json-schema",
         "validation_result": "PASS",
     }
-    monkeypatch.setattr(cli_module, "invoke_ollama", fake_qwen)
+    monkeypatch.setattr(cli_module, "invoke_ollama", fake_gemma)
     monkeypatch.setattr(
         cli_module,
         "invoke_antigravity",
@@ -274,7 +274,7 @@ def test_default_pipeline_routes_approved_writing_to_local_qwen(
         "_tailoring_dependency_versions",
         lambda *args, **kwargs: {
             "ollama": "synthetic",
-            "ollama_model": "resume-tailor-qwen",
+            "ollama_model": "resume-tailor-gemma",
             "libreoffice": "synthetic",
         },
     )
@@ -303,19 +303,19 @@ def test_default_pipeline_routes_approved_writing_to_local_qwen(
     with pytest.raises(ApprovalError):
         run_pipeline(args, hooks=PipelineHooks(approval_handler=approval))
 
-    assert calls == ["qwen"]
+    assert calls == ["gemma"]
     run = next((tmp_path / "output").iterdir())
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["writer"] == {
         "provider": "ollama",
-        "name": "Qwen",
-        "model": "resume-tailor-qwen",
+        "name": "Gemma 4 12B",
+        "model": "resume-tailor-gemma",
         "document_format": "headless",
     }
     assert metadata["revision_cycle"]["initial"]["provider"] == "ollama"
 
 
-def test_default_qwen_artifact_preflight_failure_is_provider_specific(
+def test_default_gemma_artifact_preflight_failure_is_provider_specific(
     master_resume: Path,
     job_file: Path,
     tmp_path: Path,
@@ -330,7 +330,7 @@ def test_default_qwen_artifact_preflight_failure_is_provider_specific(
         "_tailoring_dependency_versions",
         lambda *args, **kwargs: {
             "ollama": "synthetic",
-            "ollama_model": "resume-tailor-qwen",
+            "ollama_model": "resume-tailor-gemma",
             "libreoffice": "synthetic",
         },
     )
@@ -342,7 +342,7 @@ def test_default_qwen_artifact_preflight_failure_is_provider_specific(
     monkeypatch.setattr(
         cli_module,
         "invoke_ollama",
-        lambda **kwargs: pytest.fail("Qwen ran after a failed local preflight"),
+        lambda **kwargs: pytest.fail("Local Ollama ran after a failed local preflight"),
     )
     parser = build_parser()
     args = parser.parse_args(
