@@ -33,7 +33,6 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          from textwrap import dedent
 
           source = Path('.github/workflows/gemma-patch-review.yml').read_text(encoding='utf-8')
           start_marker = "          python - <<'PY'\n"
@@ -41,11 +40,51 @@ jobs:
           if start_marker not in source or end_marker not in source:
               raise SystemExit('Could not locate the embedded correction Python block')
           embedded = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
-          script = dedent(embedded).rstrip() + '\n'
+          lines = [line[10:] if line.startswith('          ') else line for line in embedded.splitlines()]
           path = Path('/tmp/apply-gemma-patch-review.py')
-          path.write_text(script, encoding='utf-8')
+          path.write_text('\n'.join(lines).rstrip() + '\n', encoding='utf-8')
           PY
           python /tmp/apply-gemma-patch-review.py
+
+          python - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+          import re
+
+          def normalize_block(path: str, start_pattern: str, end_pattern: str | None = None) -> None:
+              file_path = Path(path)
+              text = file_path.read_text(encoding='utf-8')
+              start = re.search(start_pattern, text, flags=re.M)
+              if start is None:
+                  raise SystemExit(f'Generated block start not found in {path}: {start_pattern}')
+              start_index = start.start()
+              if end_pattern is None:
+                  end_index = len(text)
+              else:
+                  end = re.search(end_pattern, text[start.end():], flags=re.M)
+                  if end is None:
+                      raise SystemExit(f'Generated block end not found in {path}: {end_pattern}')
+                  end_index = start.end() + end.start()
+              block = text[start_index:end_index]
+              normalized = dedent(block)
+              file_path.write_text(text[:start_index] + normalized + text[end_index:], encoding='utf-8')
+
+          normalize_block(
+              'resume_tailor/patch_engine.py',
+              r'^[ \t]+def mutable_proposed_text\(',
+          )
+          normalize_block(
+              'resume_tailor/ollama_writer.py',
+              r'^[ \t]+def build_ollama_revision_prompt\(',
+              r'^def _validate_gemma_structural_contract\(',
+          )
+          normalize_block(
+              'resume_tailor/ollama_probe.py',
+              r'^[ \t]+def _minimal_complete_instance\(',
+              r'^def probe_structured_output_support\(',
+          )
+          PY
+
           rm -f .github/workflows/gemma-patch-review.yml
           rm -f .github/workflows/trigger-gemma-patch-review.yml
 
