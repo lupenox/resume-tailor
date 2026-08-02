@@ -28,6 +28,15 @@ jobs:
         run: |
           python .github/scripts/prepare_opus_audit_hardening.py
           python .github/scripts/apply_opus_audit_hardening.py
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tests/test_gemma_patch_architecture.py")
+          path.write_text(
+              path.read_text(encoding="utf-8").rstrip() + "\n",
+              encoding="utf-8",
+          )
+          PY
           rm -f .github/scripts/prepare_opus_audit_hardening.py
           rm -f .github/scripts/apply_opus_audit_hardening.py
           rm -f .github/workflows/verify-opus-audit-hardening.yml
