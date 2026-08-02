@@ -81,6 +81,10 @@ jobs:
               'current_skill + ", FabricatedSkillWithoutEvidence"',
               'current_skill + ", Go"',
           )
+          architecture_tests.write_text(
+              architecture_tests.read_text(encoding='utf-8').rstrip() + '\n',
+              encoding='utf-8',
+          )
 
           evidence_tests = Path('tests/test_gemma_evidence_contract.py')
           replace_exact(
@@ -107,6 +111,9 @@ jobs:
             tests/test_ollama_writer.py \
             tests/test_revision.py
 
+      - name: Check whitespace
+        run: git diff --check
+
       - name: Install document rendering dependencies
         run: |
           sudo apt-get update
@@ -114,9 +121,6 @@ jobs:
 
       - name: Run full offline suite
         run: python -m pytest
-
-      - name: Check whitespace
-        run: git diff --check
 
       - name: Commit verified corrections
         run: |
