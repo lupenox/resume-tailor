@@ -137,7 +137,7 @@
                 <div>
                   <p class="eyebrow">Approval required</p>
                   <h2>Review evidence-backed recommendations</h2>
-                  <p>Local Qwen will not tailor content until you approve this analysis.</p>
+                  <p>Local Gemma 4 12B will not tailor content until you approve this analysis.</p>
                 </div>
               </div>
               <div class="analysis-overview">
@@ -316,7 +316,7 @@
 
           {% elif run.approval.kind == "qa_revision" %}
             {% set qa = run.approval.payload.qa_result %}
-            {% set writer_name = run.approval.payload.writer_name or "Qwen" %}
+            {% set writer_name = run.approval.payload.writer_name or "Gemma 4 12B" %}
             <section class="card gate-card">
               <div class="gate-heading">
                 <span class="gate-icon" aria-hidden="true">04</span>

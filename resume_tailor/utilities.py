@@ -63,7 +63,7 @@ class OllamaConnectionError(ModelError):
 
 
 class OllamaTailoringContractError(ModelError):
-    """Qwen did not satisfy the post-approval tailoring contract.
+    """Gemma 4 12B did not satisfy the post-approval tailoring contract.
 
     The subclasses below name one specific, sanitized validation path so a
     preserved failure can be diagnosed without reading résumé content. Every
@@ -76,7 +76,7 @@ class OllamaTailoringContractError(ModelError):
 
 
 class OllamaMalformedJSONError(OllamaTailoringContractError):
-    """Qwen returned message content that is not one parseable JSON object."""
+    """Gemma 4 12B returned message content that is not one parseable JSON object."""
 
     validation_path = "malformed_json"
 
@@ -123,23 +123,23 @@ class OllamaBudgetError(OllamaConnectionError):
 
 
 class OllamaCannotApplyError(ModelError):
-    """Qwen could not apply one authenticated approved edit."""
+    """Gemma 4 12B could not apply one authenticated approved edit."""
 
 
 class OllamaTechnicalFailureError(ModelError):
-    """Qwen reported a bounded technical tailoring failure."""
+    """Gemma 4 12B reported a bounded technical tailoring failure."""
 
 
 class OllamaRevisionContractError(ModelError):
-    """Qwen violated the bounded one-shot revision contract."""
+    """Gemma 4 12B violated the bounded one-shot revision contract."""
 
 
 class OllamaRevisionCannotApplyError(ModelError):
-    """Qwen could not apply one authenticated QA correction."""
+    """Gemma 4 12B could not apply one authenticated QA correction."""
 
 
 class OllamaRevisionTechnicalFailureError(ModelError):
-    """Qwen reported a bounded revision execution failure."""
+    """Gemma 4 12B reported a bounded revision execution failure."""
 
 
 _APIFY_CONFIGURATION_MESSAGES = {
