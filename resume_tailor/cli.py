@@ -91,13 +91,20 @@ from .utilities import (
     ExitCode,
     InputError,
     IntegrityError,
+    OllamaBudgetError,
+    OllamaCanonicalSchemaError,
     OllamaCannotApplyError,
     OllamaConnectionError,
+    OllamaEvidenceRejectionError,
+    OllamaMalformedJSONError,
+    OllamaOutputTruncationError,
+    OllamaResponseEnvelopeError,
     OllamaRevisionCannotApplyError,
     OllamaRevisionContractError,
     OllamaRevisionTechnicalFailureError,
     OllamaTailoringContractError,
     OllamaTechnicalFailureError,
+    OllamaTransportSchemaError,
     QAError,
     RevisionValidationError,
     ResumeTailorError,
@@ -2045,6 +2052,14 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         revision_stage = "revision" in str(metadata.get("stage", ""))
         if isinstance(exc, SourceEvidenceError):
             metadata["failure_class"] = "source-evidence-analysis"
+        elif isinstance(exc, TruthfulnessError):
+            # Schema-valid writer output rejected by the deterministic evidence
+            # and content-budget gate. Attribute it to the writer provider so a
+            # preserved Qwen failure is distinguishable from a schema failure.
+            # The exception type and exit code are deliberately unchanged.
+            stage_name = str(metadata.get("stage", ""))
+            if writer_provider == "ollama" and "evidence" in stage_name:
+                metadata["failure_class"] = "ollama-downstream-evidence"
         if isinstance(exc, ApifyConfigurationError):
             metadata["failure_class"] = "apify-configuration"
             metadata["retrieval_classification"] = exc.classification
@@ -2073,8 +2088,24 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["failure_class"] = "antigravity-revision-technical-failure"
         if isinstance(exc, OllamaConnectionError):
             metadata["failure_class"] = "ollama-connection"
+        if isinstance(exc, OllamaBudgetError):
+            metadata["failure_class"] = "ollama-budget-preflight"
         if isinstance(exc, OllamaTailoringContractError):
             metadata["failure_class"] = "ollama-tailoring-contract"
+        # Specific sanitized classifications override the generic contract
+        # class so a preserved failure names one validation path.
+        if isinstance(exc, OllamaMalformedJSONError):
+            metadata["failure_class"] = "ollama-malformed-json"
+        if isinstance(exc, OllamaResponseEnvelopeError):
+            metadata["failure_class"] = "ollama-response-envelope"
+        if isinstance(exc, OllamaTransportSchemaError):
+            metadata["failure_class"] = "ollama-transport-schema"
+        if isinstance(exc, OllamaCanonicalSchemaError):
+            metadata["failure_class"] = "ollama-canonical-schema"
+        if isinstance(exc, OllamaOutputTruncationError):
+            metadata["failure_class"] = "ollama-output-truncation"
+        if isinstance(exc, OllamaEvidenceRejectionError):
+            metadata["failure_class"] = "ollama-downstream-evidence"
         if isinstance(exc, OllamaCannotApplyError):
             metadata["failure_class"] = "ollama-cannot-apply"
         if isinstance(exc, OllamaTechnicalFailureError):

@@ -18,9 +18,11 @@ from resume_tailor.docx_extract import extract_resume
 from resume_tailor.job_requirements import build_job_requirement_catalog
 from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
-from resume_tailor.retry import analysis_input_manifest
+from resume_tailor.retry import analysis_input_manifest, antigravity_retry_failure_kind
 from resume_tailor.schemas import load_schema
+import resume_tailor.ui as ui
 from resume_tailor.ui import COOKIE_NAME, DEFAULT_HOST, create_app
+from resume_tailor.ui import _failure_kind_from_metadata
 from resume_tailor.ui_cli import build_parser as build_ui_parser
 from resume_tailor.utilities import (
     ApifyConfigurationError,
@@ -30,6 +32,8 @@ from resume_tailor.utilities import (
     AntigravityLaunchSizeError,
     ExitCode,
     InputError,
+    OllamaBudgetError,
+    OllamaConnectionError,
     atomic_write_json,
     sha256_file,
 )
@@ -2193,3 +2197,69 @@ def test_analytics_routes_require_local_session_and_csrf(
             assert denied.status_code == 403
 
     asyncio.run(scenario())
+
+
+def test_ollama_budget_refusal_is_not_reported_as_a_connection_failure() -> None:
+    """OllamaBudgetError subclasses OllamaConnectionError.
+
+    It must be matched before the connection branch in both classification
+    ladders, otherwise a local budget refusal (no request launched) would tell
+    the operator to check that Ollama is running.
+    """
+    error = OllamaBudgetError(
+        "The approved tailoring prompt needs 9000 tokens but the configured "
+        "context window leaves 4096."
+    )
+    kind = ui._failure_kind_for_error(error, stage="ollama-tailoring")
+    assert kind == "ollama_preflight"
+    assert kind != "ollama_connection"
+
+    message = ui._safe_error_message(error)
+    assert "context window" in message
+    assert "Ollama is running" not in message
+    # Sanity check that a genuine connection failure still maps correctly.
+    assert (
+        ui._failure_kind_for_error(
+            OllamaConnectionError("connection refused"), stage="ollama-tailoring"
+        )
+        == "ollama_connection"
+    )
+
+
+def test_new_ollama_failure_classes_keep_contract_guidance_and_no_recovery() -> None:
+    """Phase 1 sub-classifications must reach the existing contract branch.
+
+    They narrow diagnosis in run metadata. They must not silently fall through
+    to a blank failure card, and they must not become retry/reprocess eligible.
+    """
+    for failure_class in (
+        "ollama-malformed-json",
+        "ollama-response-envelope",
+        "ollama-transport-schema",
+        "ollama-canonical-schema",
+        "ollama-output-truncation",
+        "ollama-downstream-evidence",
+    ):
+        metadata = {
+            "status": "failed",
+            "stage": "ollama-tailoring",
+            "failure_class": failure_class,
+            "error": {"type": "OllamaTransportSchemaError", "message": "rejected"},
+        }
+        assert _failure_kind_from_metadata(metadata) == "ollama_contract", failure_class
+        # Authenticated Antigravity recovery must stay unavailable: the retry
+        # classifier only recognises antigravity-* failure classes.
+        assert antigravity_retry_failure_kind(metadata) is None, failure_class
+        assert _failure_kind_from_metadata(metadata) != "antigravity_response_envelope"
+
+    assert (
+        _failure_kind_from_metadata(
+            {
+                "status": "failed",
+                "stage": "ollama-tailoring",
+                "failure_class": "ollama-budget-preflight",
+                "error": {"type": "OllamaBudgetError", "message": "no room"},
+            }
+        )
+        == "ollama_preflight"
+    )

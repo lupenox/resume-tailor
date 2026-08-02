@@ -5,22 +5,35 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .antigravity_writer import approved_edit_catalog, preflight_tailoring_inputs
+from .ollama_capabilities import (
+    OllamaBudget,
+    OllamaModelCapabilities,
+    capabilities_for_model,
+    plan_ollama_budget,
+)
+from .ollama_probe import probe_structured_output_support
 from .ollama_transport import OLLAMA_BASE_URL, run_ollama_request
 from .revision import build_revision_prompt
-from .schemas import load_schema, parse_json_text, validate_payload
+from .schemas import _jsonschema_module, load_schema, parse_json_text, validate_payload
 from .utilities import (
     ModelError,
     AntigravityTailoringPreflightError,
+    OllamaCanonicalSchemaError,
     OllamaCannotApplyError,
     OllamaConnectionError,
+    OllamaEvidenceRejectionError,
+    OllamaMalformedJSONError,
+    OllamaOutputTruncationError,
+    OllamaResponseEnvelopeError,
     OllamaRevisionCannotApplyError,
     OllamaRevisionContractError,
     OllamaRevisionTechnicalFailureError,
     OllamaTailoringContractError,
     OllamaTechnicalFailureError,
+    OllamaTransportSchemaError,
     TailoringPreflightError,
     atomic_write_json,
     sha256_file,
@@ -40,6 +53,12 @@ OLLAMA_TAILORING_TRANSPORT_SCHEMA_FILENAME = (
 OLLAMA_REVISION_TRANSPORT_SCHEMA_FILENAME = "ollama-revision-transport.schema.json"
 
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
+
+#: ``done_reason`` values that mean generation stopped before it finished.
+_TRUNCATION_DONE_REASONS = frozenset({"length", "limit", "max_tokens"})
+
+#: Sanitized validation-path identifier recorded when nothing failed.
+_VALIDATION_PATH_PASS = "pass"
 
 
 def validate_ollama_model_name(value: str) -> str:
@@ -73,16 +92,50 @@ def _ollama_transport_schema(canonical_name: str) -> dict[str, Any]:
     try:
         import jsonschema
     except ImportError as exc:  # pragma: no cover - guarded by project dependencies
-        raise OllamaTailoringContractError(
+        raise OllamaTransportSchemaError(
             "Python package 'jsonschema' is required for Ollama output validation."
         ) from exc
     try:
         jsonschema.Draft202012Validator.check_schema(schema)
     except jsonschema.SchemaError as exc:
-        raise OllamaTailoringContractError(
+        raise OllamaTransportSchemaError(
             "The derived Ollama transport schema is invalid."
         ) from exc
     return schema
+
+
+def _validate_transport_payload(
+    payload: dict[str, Any],
+    *,
+    transport_schema: dict[str, Any],
+    label: str,
+) -> None:
+    """Reject a payload that ignored the structured-output grammar.
+
+    This runs before canonical validation so an ignored-grammar response (for
+    example a bare résumé root with no status envelope) is distinguishable from
+    an envelope-shaped response that merely fails a canonical assertion.
+    """
+    jsonschema = _jsonschema_module()
+    try:
+        jsonschema.Draft202012Validator(transport_schema).validate(payload)
+    except jsonschema.ValidationError as exc:
+        location = ".".join(str(part) for part in exc.absolute_path) or "<root>"
+        missing_root = sorted(
+            field
+            for field in transport_schema.get("required", ())
+            if field not in payload
+        )
+        detail = (
+            f" Missing required root fields: {', '.join(missing_root)}."
+            if missing_root
+            else ""
+        )
+        raise OllamaTransportSchemaError(
+            f"{label} ignored the supplied structured-output schema and failed "
+            f"transport validation at {location}.{detail} Provider prose and "
+            "résumé content were omitted."
+        ) from exc
 
 
 def _write_transport_schema(
@@ -211,6 +264,8 @@ def _ollama_chat_request(
     model: str,
     prompt: str,
     transport_schema: dict[str, Any],
+    capabilities: OllamaModelCapabilities,
+    budget: OllamaBudget,
 ) -> dict[str, Any]:
     return {
         "model": validate_ollama_model_name(model),
@@ -230,8 +285,8 @@ def _ollama_chat_request(
         ],
         "format": transport_schema,
         "options": {
-            "num_ctx": 8192,
-            "num_predict": 4096,
+            "num_ctx": capabilities.context_window,
+            "num_predict": budget.requested_output_tokens,
             "temperature": 0.2,
             "top_p": 0.9,
             "repeat_penalty": 1.05,
@@ -266,6 +321,73 @@ def _response_artifact(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _truncation_signals(body: dict[str, Any]) -> dict[str, Any]:
+    """Extract content-free generation-limit signals from a chat body."""
+    done_reason = body.get("done_reason")
+    prompt_eval_count = body.get("prompt_eval_count")
+    eval_count = body.get("eval_count")
+    total = None
+    if isinstance(prompt_eval_count, int) and isinstance(eval_count, int):
+        total = prompt_eval_count + eval_count
+    return {
+        "done": body.get("done"),
+        "done_reason": done_reason if isinstance(done_reason, str) else None,
+        "prompt_eval_count": (
+            prompt_eval_count if isinstance(prompt_eval_count, int) else None
+        ),
+        "eval_count": eval_count if isinstance(eval_count, int) else None,
+        "reported_total_tokens": total,
+    }
+
+
+def classify_generation_limit(
+    body: dict[str, Any],
+    *,
+    capabilities: OllamaModelCapabilities,
+    budget: OllamaBudget,
+) -> dict[str, Any]:
+    """Decide whether generation hit an output or context limit.
+
+    Two distinct limits matter and were previously indistinguishable:
+
+    * ``done_reason`` reporting a length stop, or ``eval_count`` reaching the
+      requested output ceiling, means the output budget was exhausted.
+    * ``prompt_eval_count + eval_count`` reaching the context window means the
+      window overflowed even though generation stopped "naturally". That is the
+      condition observed in the preserved failure (7590 + 1145 against 8192),
+      and it can silently evict the structured-output framing.
+    """
+    signals = _truncation_signals(body)
+    done_reason = signals["done_reason"]
+    eval_count = signals["eval_count"]
+    total = signals["reported_total_tokens"]
+
+    output_ceiling_reached = (
+        isinstance(eval_count, int)
+        and eval_count >= budget.requested_output_tokens
+    )
+    context_window_exceeded = (
+        isinstance(total, int) and total >= capabilities.context_window
+    )
+    reason_indicates_length = (
+        isinstance(done_reason, str)
+        and done_reason.lower() in _TRUNCATION_DONE_REASONS
+    )
+    return {
+        **signals,
+        "requested_output_tokens": budget.requested_output_tokens,
+        "context_window": capabilities.context_window,
+        "output_ceiling_reached": output_ceiling_reached,
+        "context_window_exceeded": context_window_exceeded,
+        "reason_indicates_length": reason_indicates_length,
+        "truncated": bool(
+            reason_indicates_length
+            or output_ceiling_reached
+            or context_window_exceeded
+        ),
+    }
+
+
 def _write_metadata(
     *,
     run_directory: Path,
@@ -275,10 +397,16 @@ def _write_metadata(
     model: str,
     prompt: str,
     validation_result: str,
+    validation_path: str,
+    validation_message: str | None = None,
+    capabilities: OllamaModelCapabilities,
+    budget: OllamaBudget,
+    generation: dict[str, Any] | None = None,
+    probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_bytes = prompt.encode("utf-8")
     metadata = {
-        "version": 1,
+        "version": 2,
         "provider": "qwen",
         "runtime": "ollama",
         "model": model,
@@ -288,7 +416,14 @@ def _write_metadata(
         "output_format": "json-schema",
         "response_envelope_type": "ollama-chat-message-content-json",
         "validation_result": validation_result,
-        "context_window": 8192,
+        "validation_path": validation_path,
+        "validation_message": validation_message,
+        "content_logged": False,
+        "context_window": capabilities.context_window,
+        "capabilities": capabilities.sanitized(),
+        "budget": budget.sanitized(),
+        "generation": generation,
+        "structured_output_probe": probe,
         "prompt": {
             "bytes": len(prompt_bytes),
             "sha256": hashlib.sha256(prompt_bytes).hexdigest(),
@@ -322,25 +457,42 @@ def load_ollama_response_metadata(
     return value if isinstance(value, dict) else None
 
 
-def _chat_payload(body: dict[str, Any], *, label: str) -> dict[str, Any]:
+def _chat_payload(
+    body: dict[str, Any],
+    *,
+    label: str,
+    generation: dict[str, Any],
+) -> dict[str, Any]:
+    truncated = bool(generation.get("truncated"))
     if body.get("done") is not True:
-        raise OllamaTailoringContractError(
+        raise OllamaResponseEnvelopeError(
             f"{label} did not return a completed non-streaming response."
         )
     message = body.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str) or not content.strip():
-        raise OllamaTailoringContractError(
+        if truncated:
+            raise OllamaOutputTruncationError(
+                f"{label} returned no structured content and reached a "
+                "generation limit. Increase the local model context window or "
+                "output budget."
+            )
+        raise OllamaResponseEnvelopeError(
             f"{label} did not return structured message content."
         )
     try:
         value = parse_json_text(content, label=label)
     except ModelError as exc:
-        raise OllamaTailoringContractError(
+        if truncated:
+            raise OllamaOutputTruncationError(
+                f"{label} returned incomplete JSON after reaching a generation "
+                "limit. No partial résumé content was accepted."
+            ) from exc
+        raise OllamaMalformedJSONError(
             f"{label} did not contain one valid JSON object."
         ) from exc
     if not isinstance(value, dict):
-        raise OllamaTailoringContractError(
+        raise OllamaMalformedJSONError(
             f"{label} returned JSON that was not an object."
         )
     return value
@@ -356,8 +508,11 @@ def _invoke_payload(
     metadata_filename: str,
     run_directory: Path,
     timeout_seconds: int,
+    capabilities: OllamaModelCapabilities,
+    budget: OllamaBudget,
+    probe: dict[str, Any] | None = None,
     heartbeat_handler: Callable[[float, bool], None] | None = None,
-) -> tuple[dict[str, Any], Path]:
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     response_path = run_directory / response_filename
     try:
         body = run_ollama_request(
@@ -366,6 +521,8 @@ def _invoke_payload(
                 model=model,
                 prompt=prompt,
                 transport_schema=transport_schema,
+                capabilities=capabilities,
+                budget=budget,
             ),
             cwd=run_directory,
             timeout_seconds=timeout_seconds,
@@ -387,12 +544,33 @@ def _invoke_payload(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
+            validation_path="transport_connection",
+            validation_message=(
+                "The localhost-only Ollama request did not complete."
+            ),
+            capabilities=capabilities,
+            budget=budget,
+            probe=probe,
         )
         raise
     atomic_write_json(response_path, _response_artifact(body))
+    generation = classify_generation_limit(
+        body,
+        capabilities=capabilities,
+        budget=budget,
+    )
     try:
-        payload = _chat_payload(body, label="Qwen structured output")
-    except ModelError:
+        payload = _chat_payload(
+            body,
+            label="Qwen structured output",
+            generation=generation,
+        )
+        _validate_transport_payload(
+            payload,
+            transport_schema=transport_schema,
+            label="Qwen structured output",
+        )
+    except ModelError as exc:
         _write_metadata(
             run_directory=run_directory,
             metadata_filename=metadata_filename,
@@ -401,9 +579,19 @@ def _invoke_payload(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
+            validation_path=getattr(exc, "validation_path", "tailoring_contract"),
+            validation_message=str(exc),
+            capabilities=capabilities,
+            budget=budget,
+            generation=generation,
+            probe=probe,
         )
         raise
-    return payload, response_path
+    if generation["context_window_exceeded"]:
+        # Transport-valid output can still have overflowed the window and lost
+        # its schema framing. Record the signal; never fail a valid response.
+        generation["warning"] = "context_window_exceeded_with_valid_output"
+    return payload, response_path, generation
 
 
 def _resolve_initial_payload(
@@ -418,8 +606,9 @@ def _resolve_initial_payload(
             label="Qwen output",
         )
     except ModelError as exc:
-        raise OllamaTailoringContractError(
-            "Qwen violated the post-approval tailoring response contract."
+        raise OllamaCanonicalSchemaError(
+            "Qwen output passed transport validation but violated the canonical "
+            "post-approval tailoring contract. Résumé content was omitted."
         ) from exc
     if payload["status"] == "cannot_apply":
         detail = payload["cannot_apply"]
@@ -427,7 +616,7 @@ def _resolve_initial_payload(
             edit["edit_id"] for edit in approved_edit_catalog(approved_analysis)
         }
         if detail["edit_id"] not in allowed_ids:
-            raise OllamaTailoringContractError(
+            raise OllamaEvidenceRejectionError(
                 "Qwen returned an unknown approved edit ID in cannot_apply."
             )
         raise OllamaCannotApplyError(
@@ -455,6 +644,7 @@ def invoke_ollama(
     run_directory: Path,
     timeout_seconds: int,
     model: str = DEFAULT_OLLAMA_MODEL,
+    capability_overrides: Mapping[str, Any] | None = None,
     heartbeat_handler: Callable[[float, bool], None] | None = None,
 ) -> dict[str, Any]:
     model = validate_ollama_model_name(model)
@@ -472,7 +662,10 @@ def invoke_ollama(
         canonical_name="tailored_resume.schema.json",
         filename=OLLAMA_TAILORING_TRANSPORT_SCHEMA_FILENAME,
     )
-    payload, response_path = _invoke_payload(
+    probe = probe_structured_output_support(schema)
+    capabilities = capabilities_for_model(model, overrides=capability_overrides)
+    budget = plan_ollama_budget(prompt=prompt, capabilities=capabilities)
+    payload, response_path, generation = _invoke_payload(
         model=model,
         prompt=prompt,
         transport_schema=schema,
@@ -481,6 +674,9 @@ def invoke_ollama(
         metadata_filename=OLLAMA_RESPONSE_METADATA_FILENAME,
         run_directory=run_directory,
         timeout_seconds=timeout_seconds,
+        capabilities=capabilities,
+        budget=budget,
+        probe=probe,
         heartbeat_handler=heartbeat_handler,
     )
     try:
@@ -488,7 +684,7 @@ def invoke_ollama(
             payload,
             approved_analysis=approved_analysis,
         )
-    except ModelError:
+    except ModelError as exc:
         _write_metadata(
             run_directory=run_directory,
             metadata_filename=OLLAMA_RESPONSE_METADATA_FILENAME,
@@ -497,6 +693,12 @@ def invoke_ollama(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
+            validation_path=getattr(exc, "validation_path", "tailoring_contract"),
+            validation_message=str(exc),
+            capabilities=capabilities,
+            budget=budget,
+            generation=generation,
+            probe=probe,
         )
         raise
     _write_metadata(
@@ -507,6 +709,11 @@ def invoke_ollama(
         model=model,
         prompt=prompt,
         validation_result="PASS",
+        validation_path=_VALIDATION_PATH_PASS,
+        capabilities=capabilities,
+        budget=budget,
+        generation=generation,
+        probe=probe,
     )
     return tailored
 
@@ -523,6 +730,7 @@ def invoke_ollama_revision(
     timeout_seconds: int,
     attempt_number: int,
     model: str = DEFAULT_OLLAMA_MODEL,
+    capability_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if attempt_number != 1:
         raise OllamaRevisionContractError(
@@ -552,7 +760,9 @@ def invoke_ollama_revision(
         canonical_name="antigravity_revision.schema.json",
         filename=OLLAMA_REVISION_TRANSPORT_SCHEMA_FILENAME,
     )
-    payload, response_path = _invoke_payload(
+    capabilities = capabilities_for_model(model, overrides=capability_overrides)
+    budget = plan_ollama_budget(prompt=prompt, capabilities=capabilities)
+    payload, response_path, generation = _invoke_payload(
         model=model,
         prompt=prompt,
         transport_schema=schema,
@@ -561,6 +771,8 @@ def invoke_ollama_revision(
         metadata_filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
         run_directory=run_directory,
         timeout_seconds=timeout_seconds,
+        capabilities=capabilities,
+        budget=budget,
     )
     try:
         validate_payload(
@@ -577,6 +789,11 @@ def invoke_ollama_revision(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
+            validation_path="canonical_schema",
+            validation_message=str(exc),
+            capabilities=capabilities,
+            budget=budget,
+            generation=generation,
         )
         raise OllamaRevisionContractError(
             "Qwen violated the one-shot revision response contract."
@@ -598,7 +815,7 @@ def invoke_ollama_revision(
                 "Qwen revision reported technical failure "
                 f"{detail['reason_code']}."
             )
-    except ModelError:
+    except ModelError as exc:
         _write_metadata(
             run_directory=run_directory,
             metadata_filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
@@ -607,6 +824,11 @@ def invoke_ollama_revision(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
+            validation_path=getattr(exc, "validation_path", "revision_contract"),
+            validation_message=str(exc),
+            capabilities=capabilities,
+            budget=budget,
+            generation=generation,
         )
         raise
     _write_metadata(
@@ -617,5 +839,9 @@ def invoke_ollama_revision(
         model=model,
         prompt=prompt,
         validation_result="PASS",
+        validation_path=_VALIDATION_PATH_PASS,
+        capabilities=capabilities,
+        budget=budget,
+        generation=generation,
     )
     return payload["tailored_resume"]

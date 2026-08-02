@@ -63,7 +63,63 @@ class OllamaConnectionError(ModelError):
 
 
 class OllamaTailoringContractError(ModelError):
-    """Qwen did not satisfy the post-approval tailoring contract."""
+    """Qwen did not satisfy the post-approval tailoring contract.
+
+    The subclasses below name one specific, sanitized validation path so a
+    preserved failure can be diagnosed without reading résumé content. Every
+    subclass remains an ``OllamaTailoringContractError`` so existing handlers,
+    exit codes, and recovery gates keep their current behaviour.
+    """
+
+    #: Stable, sanitized identifier persisted in the response envelope.
+    validation_path = "tailoring_contract"
+
+
+class OllamaMalformedJSONError(OllamaTailoringContractError):
+    """Qwen returned message content that is not one parseable JSON object."""
+
+    validation_path = "malformed_json"
+
+
+class OllamaResponseEnvelopeError(OllamaTailoringContractError):
+    """The Ollama chat envelope was missing, incomplete, or not structured."""
+
+    validation_path = "response_envelope"
+
+
+class OllamaTransportSchemaError(OllamaTailoringContractError):
+    """Parseable JSON that does not satisfy the derived transport schema.
+
+    This is the signature of a model that ignored the structured-output
+    grammar, for example by returning a bare résumé object instead of the
+    required status envelope.
+    """
+
+    validation_path = "transport_schema"
+
+
+class OllamaCanonicalSchemaError(OllamaTailoringContractError):
+    """Transport-valid JSON that fails the full canonical Draft 2020-12 schema."""
+
+    validation_path = "canonical_schema"
+
+
+class OllamaOutputTruncationError(OllamaTailoringContractError):
+    """Generation stopped at a length or context limit before completing."""
+
+    validation_path = "output_truncation"
+
+
+class OllamaEvidenceRejectionError(OllamaTailoringContractError):
+    """Schema-valid output rejected by a downstream evidence or edit rule."""
+
+    validation_path = "downstream_evidence"
+
+
+class OllamaBudgetError(OllamaConnectionError):
+    """The deterministic prompt/context/output budget refuses to launch."""
+
+    validation_path = "budget_preflight"
 
 
 class OllamaCannotApplyError(ModelError):

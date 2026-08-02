@@ -70,6 +70,7 @@ from .utilities import (
     CodexSchemaCompatibilityError,
     InputError,
     ModelError,
+    OllamaBudgetError,
     OllamaCannotApplyError,
     OllamaConnectionError,
     OllamaRevisionCannotApplyError,
@@ -1346,6 +1347,11 @@ _OLLAMA_PREFLIGHT_UI_MESSAGE = (
     "The authenticated tailoring inputs failed local completeness preflight. "
     "No Qwen or Ollama request was launched."
 )
+_OLLAMA_BUDGET_UI_MESSAGE = (
+    "The approved tailoring prompt does not fit the configured local model "
+    "context window with room for a complete response. No Ollama request was "
+    "launched and no approved content was trimmed."
+)
 
 
 def _failure_kind_for_error(
@@ -1372,6 +1378,9 @@ def _failure_kind_for_error(
     if isinstance(error, AntigravityTailoringPreflightError):
         return "antigravity_tailoring_preflight"
     if isinstance(error, TailoringPreflightError):
+        return "ollama_preflight"
+    # Must precede OllamaConnectionError: budget refusals subclass it.
+    if isinstance(error, OllamaBudgetError):
         return "ollama_preflight"
     if isinstance(error, OllamaConnectionError):
         return "ollama_connection"
@@ -1421,9 +1430,21 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
     ollama_failure = str(metadata.get("failure_class", ""))
     if ollama_failure == "ollama-connection":
         return "ollama_connection"
-    if ollama_failure == "ollama-tailoring-preflight":
+    if ollama_failure in {"ollama-tailoring-preflight", "ollama-budget-preflight"}:
         return "ollama_preflight"
-    if ollama_failure in {"ollama-tailoring-contract", "ollama-revision-contract"}:
+    if ollama_failure in {
+        "ollama-tailoring-contract",
+        "ollama-revision-contract",
+        # Phase 1 sanitized sub-classifications. These stay on the existing
+        # contract guidance branch; they narrow diagnosis in run metadata
+        # without changing recovery eligibility.
+        "ollama-malformed-json",
+        "ollama-response-envelope",
+        "ollama-transport-schema",
+        "ollama-canonical-schema",
+        "ollama-output-truncation",
+        "ollama-downstream-evidence",
+    }:
         return "ollama_contract"
     if ollama_failure in {"ollama-cannot-apply", "ollama-revision-cannot-apply"}:
         return "ollama_cannot_apply"
@@ -1508,6 +1529,10 @@ def _safe_error_message(error: ResumeTailorError) -> str:
         )
     if isinstance(error, TailoringPreflightError):
         return _OLLAMA_PREFLIGHT_UI_MESSAGE
+    # OllamaBudgetError subclasses OllamaConnectionError, so it must be matched
+    # first: no request was launched, so connection guidance would mislead.
+    if isinstance(error, OllamaBudgetError):
+        return _OLLAMA_BUDGET_UI_MESSAGE
     if isinstance(error, OllamaConnectionError):
         return _OLLAMA_CONNECTION_UI_MESSAGE
     if isinstance(error, (OllamaTailoringContractError, OllamaRevisionContractError)):
