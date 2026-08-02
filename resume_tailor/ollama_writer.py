@@ -16,7 +16,14 @@ from .ollama_capabilities import (
 )
 from .ollama_probe import probe_structured_output_support
 from .ollama_transport import OLLAMA_BASE_URL, run_ollama_request
-from .revision import build_revision_prompt
+from .patch_engine import (
+    canonical_digest,
+    parse_target_source_id,
+    resolve_target_descriptor,
+    validate_and_apply_patches,
+    validate_and_apply_revision_patches,
+)
+from .revision import approved_revision_targets, build_revision_prompt
 from .schemas import _jsonschema_module, load_schema, parse_json_text, validate_payload
 from .utilities import (
     ModelError,
@@ -150,6 +157,71 @@ def _write_transport_schema(
     return schema, path
 
 
+def _write_tailoring_patch_transport_schema(
+    run_directory: Path,
+    *,
+    catalog: list[dict[str, Any]],
+    catalog_sha256: str,
+    filename: str = OLLAMA_TAILORING_TRANSPORT_SCHEMA_FILENAME,
+) -> tuple[dict[str, Any], Path]:
+    schema = _ollama_transport_schema("ollama_tailoring_patch.schema.json")
+    schema["properties"]["catalog_sha256"] = {
+        "type": "string",
+        "enum": [catalog_sha256],
+    }
+    edit_ids = [edit["edit_id"] for edit in catalog if isinstance(edit, dict) and "edit_id" in edit]
+    target_ids = [edit["target_source_id"] for edit in catalog if isinstance(edit, dict) and "target_source_id" in edit]
+    ops = list({edit.get("operation", "replace") for edit in catalog if isinstance(edit, dict)})
+
+    patches_schema = schema["properties"].get("patches")
+    if isinstance(patches_schema, dict) and "oneOf" in patches_schema:
+        for branch in patches_schema["oneOf"]:
+            if isinstance(branch, dict) and branch.get("type") == "array" and "items" in branch:
+                branch["minItems"] = len(catalog)
+                branch["maxItems"] = len(catalog)
+                props = branch["items"].get("properties", {})
+                if edit_ids and "edit_id" in props:
+                    props["edit_id"]["enum"] = edit_ids
+                if target_ids and "target_source_id" in props:
+                    props["target_source_id"]["enum"] = target_ids
+                if ops and "operation" in props:
+                    props["operation"]["enum"] = ops
+
+    path = run_directory / filename
+    atomic_write_json(path, schema)
+    return schema, path
+
+
+def _write_revision_patch_transport_schema(
+    run_directory: Path,
+    *,
+    target_map: dict[str, list[str]],
+    authorization_sha256: str,
+    filename: str = OLLAMA_REVISION_TRANSPORT_SCHEMA_FILENAME,
+) -> tuple[dict[str, Any], Path]:
+    schema = _ollama_transport_schema("ollama_revision_patch.schema.json")
+    schema["properties"]["authorization_sha256"] = {
+        "type": "string",
+        "enum": [authorization_sha256],
+    }
+    all_issue_ids = sorted(list({issue_id for issues in target_map.values() for issue_id in issues}))
+    all_target_ids = sorted(list(target_map.keys()))
+
+    patches_schema = schema["properties"].get("patches")
+    if isinstance(patches_schema, dict) and "oneOf" in patches_schema:
+        for branch in patches_schema["oneOf"]:
+            if isinstance(branch, dict) and branch.get("type") == "array" and "items" in branch:
+                props = branch["items"].get("properties", {})
+                if all_issue_ids and "issue_id" in props:
+                    props["issue_id"]["enum"] = all_issue_ids
+                if all_target_ids and "target_source_id" in props:
+                    props["target_source_id"]["enum"] = all_target_ids
+
+    path = run_directory / filename
+    atomic_write_json(path, schema)
+    return schema, path
+
+
 def _authorized_source_catalog(
     extracted_resume: dict[str, Any],
     edits: list[dict[str, Any]],
@@ -244,34 +316,51 @@ def build_ollama_tailoring_prompt(
         raise TailoringPreflightError(
             "Local Ollama tailoring preflight failed. No writer request was launched."
         ) from exc
-    budgets = [
+
+    catalog = approved_edit_catalog(approved_analysis)
+    catalog_sha256 = canonical_digest(catalog)
+
+    target_descriptors = [
         {
-            "content_id": paragraph["content_id"],
-            **paragraph["content_budget"],
+            "edit_id": edit["edit_id"],
+            "target_source_id": edit["target_source_id"],
+            "operation": edit.get("operation", "replace"),
+            "current_mutable_text": resolve_target_descriptor(edit, master_content, extracted_resume).current_mutable_text,
+            "exact_rendered_existing_text": resolve_target_descriptor(edit, master_content, extracted_resume).exact_rendered_existing_text,
+            "label_if_composite": resolve_target_descriptor(edit, master_content, extracted_resume).label,
+            "maximum_rendered_characters": resolve_target_descriptor(edit, master_content, extracted_resume).maximum_rendered_characters,
+            "proposed_text": edit.get("proposed_text", ""),
+            "alignment_rationale": edit.get("alignment_rationale", ""),
+            "evidence_source_ids": edit.get("evidence_source_ids", []),
         }
-        for paragraph in extracted_resume["paragraphs"]
+        for edit in catalog
     ]
+
     source_catalog = _authorized_source_catalog(extracted_resume, edits)
     constraint_manifest = _build_constraint_manifest(
         master_content, extracted_resume, edits, approved_analysis
     )
-    return f"""Write the complete approved tailored resume now. Return exactly one
+
+    return f"""Author target-only edits for the approved resume tailoring now. Return exactly one
 JSON object matching the supplied structured-output schema. Do not return
-Markdown, commentary, planning, questions, or JSON fences. Do not use tools,
-files, commands, agents, or network access.
+Markdown, commentary, planning, questions, or JSON fences. Do not return or rewrite
+the complete resume.
 
 TARGET
 Company: {company}
 Role: {role}
 
-TRUSTED MASTER RESUME CONTENT
-{_canonical_json(master_content)}
+CATALOG SHA256 DIGEST
+{catalog_sha256}
 
-APPROVED EDIT CATALOG
-{_canonical_json(edits)}
+APPROVED EDIT CATALOG & TARGET DESCRIPTORS
+{_canonical_json(target_descriptors)}
 
 AUTHORIZED SOURCE EVIDENCE FOR THOSE EDITS
 {_canonical_json(source_catalog)}
+
+AUTHENTICATED METRICS
+{_canonical_json(constraint_manifest['authenticated_metrics'])}
 
 IMMUTABLE FACTS
 {_canonical_json(approved_analysis['immutable_facts'])}
@@ -279,47 +368,23 @@ IMMUTABLE FACTS
 FORBIDDEN CLAIMS
 {_canonical_json(approved_analysis['forbidden_claims'])}
 
-CONTENT BUDGETS
-{_canonical_json(budgets)}
-
-DETERMINISTIC CONSTRAINT MANIFEST
-{_canonical_json(constraint_manifest)}
-
-AUTHORING RULES (STRICT PRIORITY HIERARCHY)
-1. PRESERVE ALL IMMUTABLE FIELDS AND LABELS EXACTLY.
-   - Do not change section labels, employer names, job titles, school names, dates,
-     locations, project names, open-source identity, or skill-group labels.
-   - Skill-group labels (e.g. {constraint_manifest['immutable_field_values']['skill_group_labels']})
-     are IMMUTABLE. Even when editing a skill group, keep its label unchanged and only update its text.
-2. APPLY ONLY AUTHENTICATED APPROVED EDITS.
-   - Apply each edit in APPROVED EDIT CATALOG to its exact target_source_id.
-   - Do not make any unapproved edits to any part of the resume.
-3. PRESERVE ALL UNEDITED CONTENT EXACTLY.
-   - Any paragraph or bullet that does not have an approved edit target MUST remain 100% identical to the master resume.
-4. PRESERVE LIST ITEM COUNTS EXACTLY.
-   - Maintain the exact number of skill groups ({constraint_manifest['expected_item_counts']['skill_groups']}),
-     projects ({constraint_manifest['expected_item_counts']['projects']}),
-     experience bullets ({constraint_manifest['expected_item_counts']['experience_bullets']}),
-     and project bullets (e.g. project 0: {constraint_manifest['expected_item_counts']['project_bullet_counts'].get('0')}).
-   - Rewriting one bullet must NEVER omit, combine, or drop another bullet.
-5. NEVER ADD UNSUPPORTED TECHNOLOGIES, SKILLS, CLAIMS, OR NUMBERS.
-   - Never add an unsupported technology, qualification, metric, credential,
-     seniority level, leadership claim, employment fact, availability statement,
-     accomplishment, date, or customer impact.
-   - Do not introduce new technologies, tools, skills, or synonyms (e.g. 'agent state machines', 'API integration')
-     unless present in master resume or authorized edit evidence.
-   - Do not introduce any new numbers, counts, percentages, ranges, or metrics not present in master resume.
-6. BULLET STYLE & KEYWORD GUIDELINES.
-   - Write bullets for a fast recruiter scan: state WHAT supported skill or keyword
-     was used, HOW it was used, and its supported RESULT or REASON when the source
-     actually provides one. Never manufacture a result to complete that pattern.
-   - Prefer supported job keywords in the first half of the resume, but never force
-     an unsupported keyword into a claim.
-7. RETURN THE COMPLETE REQUIRED STRUCTURED ENVELOPE.
-   - Return status "complete" with tailored_content when all approved edits are applied cleanly under these rules.
-8. RETURN CANNOT_APPLY WHEN EDITS VIOLATE CONSTRAINTS.
-   - If an approved edit cannot be applied without violating these rules or constraints, return status "cannot_apply"
-     with its local edit_id and a bounded reason code. Never guess or fabricate output.
+AUTHORING RULES
+1. AUTHOR ONLY MUTABLE TARGET VALUES.
+   - Author one bounded replacement for each supplied edit in APPROVED EDIT CATALOG.
+   - For composite targets with labels (e.g. skill_groups or coursework), return ONLY the mutable body text.
+     NEVER include or rewrite the label (e.g. do NOT write 'Software & Data:').
+2. OPERATION SEMANTICS.
+   - For "replace": replacement_text is the new complete mutable text.
+   - For "append": replacement_text MUST start with the exact current_mutable_text prefix and add a nonempty suffix.
+3. STAY WITHIN CHARACTER BUDGETS.
+   - The rendered text (including label if composite) MUST NOT exceed maximum_rendered_characters.
+4. NO UNSUPPORTED CLAIMS OR NEW METRICS.
+   - Do not introduce any new numbers or metrics not present in AUTHENTICATED METRICS.
+   - Do not introduce any unsupported technology or qualification lacking verbatim source evidence.
+5. REQUIRED STRUCTURED ENVELOPE.
+   - Set "catalog_sha256" to "{catalog_sha256}".
+   - Return status "complete" with "patches" containing exactly one patch object per edit.
+   - Return status "cannot_apply" with edit_id and reason_code if an edit cannot be made safely.
 """
 
 
@@ -658,6 +723,78 @@ def _invoke_payload(
     return payload, response_path, generation
 
 
+def build_ollama_revision_prompt(
+    *,
+    current_tailored_content: dict[str, Any],
+    extracted_resume: dict[str, Any],
+    approved_analysis: dict[str, Any],
+    qa_result: dict[str, Any],
+    company: str,
+    role: str,
+) -> str:
+    target_map = approved_revision_targets(
+        qa_result=qa_result,
+        approved_analysis=approved_analysis,
+    )
+    authorization_sha256 = canonical_digest(target_map)
+
+    target_descriptors = []
+    for content_id, issue_ids in target_map.items():
+        kind, container, key, label = parse_target_source_id(content_id, current_tailored_content)
+        curr_text = str(container[key])
+        exact_rendered = f"{label}: {curr_text}" if kind == "composite_labelled" else curr_text
+        budgets = {
+            p["content_id"]: p["content_budget"]["maximum_characters"]
+            for p in extracted_resume.get("paragraphs", [])
+            if isinstance(p, dict) and "content_id" in p and "content_budget" in p
+        }
+        max_chars = budgets.get(content_id, 1000)
+        target_descriptors.append({
+            "target_source_id": content_id,
+            "authorized_issue_ids": issue_ids,
+            "current_mutable_text": curr_text,
+            "exact_rendered_existing_text": exact_rendered,
+            "label_if_composite": label,
+            "maximum_rendered_characters": max_chars,
+        })
+
+    return f"""Author target-only revision edits for the QA-identified resume issues now. Return exactly one
+JSON object matching the supplied structured-output schema. Do not return
+Markdown, commentary, planning, questions, or JSON fences. Do not return or rewrite
+the complete resume.
+
+TARGET
+Company: {company}
+Role: {role}
+
+AUTHORIZATION SHA256 DIGEST
+{authorization_sha256}
+
+LOCALLY VALIDATED CODEX QA ISSUE CATALOG
+{_canonical_json(qa_result.get('issues', []))}
+
+REVISION TARGET AUTHORIZATION & DESCRIPTORS
+{_canonical_json(target_descriptors)}
+
+IMMUTABLE FACTS
+{_canonical_json(approved_analysis.get('immutable_facts', []))}
+
+FORBIDDEN CLAIMS
+{_canonical_json(approved_analysis.get('forbidden_claims', []))}
+
+AUTHORING RULES
+1. AUTHOR ONLY MUTABLE REVISION TARGET VALUES.
+   - Author bounded replacement text for authorized targets to address specific QA issues.
+   - For composite targets with labels, return ONLY the mutable body text (NEVER include the label).
+2. ADDRESS ONLY AUTHORIZED QA ISSUES.
+   - Change only targets authorized in REVISION TARGET AUTHORIZATION.
+3. REQUIRED STRUCTURED ENVELOPE.
+   - Set "authorization_sha256" to "{authorization_sha256}".
+   - Return status "complete" with "patches" containing revision patches.
+   - Return status "cannot_apply" with issue_id and reason_code if an issue cannot be safely resolved.
+"""
+
+
 def _validate_gemma_structural_contract(
     *,
     master_content: dict[str, Any],
@@ -690,45 +827,35 @@ def _resolve_initial_payload(
     *,
     approved_analysis: dict[str, Any],
     master_content: dict[str, Any] | None = None,
+    extracted_resume: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    try:
-        validate_payload(
-            payload,
-            "tailored_resume.schema.json",
-            label="Gemma 4 12B output",
-        )
-    except ModelError as exc:
-        raise OllamaCanonicalSchemaError(
-            "Gemma 4 12B output passed transport validation but violated the canonical "
-            "post-approval tailoring contract. Résumé content was omitted."
-        ) from exc
-    if payload["status"] == "cannot_apply":
-        detail = payload["cannot_apply"]
-        allowed_ids = {
-            edit["edit_id"] for edit in approved_edit_catalog(approved_analysis)
-        }
-        if detail["edit_id"] not in allowed_ids:
-            raise OllamaEvidenceRejectionError(
-                "The local writer returned an unknown approved edit ID in cannot_apply."
+    if master_content is None or extracted_resume is None:
+        status = payload.get("status")
+        if status == "cannot_apply":
+            detail = payload.get("cannot_apply", {})
+            allowed_ids = {
+                edit["edit_id"] for edit in approved_edit_catalog(approved_analysis)
+            }
+            if not isinstance(detail, dict) or detail.get("edit_id") not in allowed_ids:
+                raise OllamaEvidenceRejectionError(
+                    "The local writer returned an unknown approved edit ID in cannot_apply."
+                )
+            raise OllamaCannotApplyError(
+                "The local writer could not apply approved "
+                f"{detail['edit_id']} ({detail['reason_code']})."
             )
-        raise OllamaCannotApplyError(
-            "The local writer could not apply approved "
-            f"{detail['edit_id']} ({detail['reason_code']})."
-        )
-    if payload["status"] == "technical_failure":
-        detail = payload["technical_failure"]
-        raise OllamaTechnicalFailureError(
-            "The local writer reported technical failure "
-            f"{detail['reason_code']}. Provider prose was omitted."
-        )
-    tailored = payload["tailored_resume"]
-    if master_content is not None:
-        _validate_gemma_structural_contract(
-            master_content=master_content,
-            tailored=tailored,
-            approved_analysis=approved_analysis,
-        )
-    return tailored
+        if status == "technical_failure":
+            detail = payload.get("technical_failure", {})
+            raise OllamaTechnicalFailureError(
+                "The local writer reported technical failure "
+                f"{detail.get('reason_code')}. Provider prose was omitted."
+            )
+    return validate_and_apply_patches(
+        payload=payload,
+        master_content=master_content or {},
+        extracted_resume=extracted_resume or {},
+        approved_analysis=approved_analysis,
+    )
 
 
 def invoke_ollama(
@@ -756,10 +883,12 @@ def invoke_ollama(
         company=company,
         role=role,
     )
-    schema, transport_path = _write_transport_schema(
+    catalog = approved_edit_catalog(approved_analysis)
+    catalog_sha256 = canonical_digest(catalog)
+    schema, transport_path = _write_tailoring_patch_transport_schema(
         run_directory,
-        canonical_name="tailored_resume.schema.json",
-        filename=OLLAMA_TAILORING_TRANSPORT_SCHEMA_FILENAME,
+        catalog=catalog,
+        catalog_sha256=catalog_sha256,
     )
     probe = probe_structured_output_support(schema)
     capabilities = capabilities_for_model(model, overrides=capability_overrides)
@@ -779,10 +908,11 @@ def invoke_ollama(
         heartbeat_handler=heartbeat_handler,
     )
     try:
-        tailored = _resolve_initial_payload(
-            payload,
-            approved_analysis=approved_analysis,
+        tailored = validate_and_apply_patches(
+            payload=payload,
             master_content=master_content,
+            extracted_resume=extracted_resume,
+            approved_analysis=approved_analysis,
         )
     except ModelError as exc:
         _write_metadata(
@@ -793,7 +923,7 @@ def invoke_ollama(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
-            validation_path=getattr(exc, "validation_path", "tailoring_contract"),
+            validation_path=getattr(exc, "validation_path", "patch_contract"),
             validation_message=str(exc),
             capabilities=capabilities,
             budget=budget,
@@ -846,19 +976,23 @@ def invoke_ollama_revision(
             "A local writer revision requires authenticated material QA findings."
         )
     model = validate_ollama_model_name(model)
-    prompt = build_revision_prompt(
+    prompt = build_ollama_revision_prompt(
         current_tailored_content=current_tailored_content,
         extracted_resume=extracted_resume,
         approved_analysis=approved_analysis,
         qa_result=qa_result,
         company=company,
         role=role,
-        provider_name="Gemma 4 12B",
     )
-    schema, transport_path = _write_transport_schema(
+    target_map = approved_revision_targets(
+        qa_result=qa_result,
+        approved_analysis=approved_analysis,
+    )
+    authorization_sha256 = canonical_digest(target_map)
+    schema, transport_path = _write_revision_patch_transport_schema(
         run_directory,
-        canonical_name="antigravity_revision.schema.json",
-        filename=OLLAMA_REVISION_TRANSPORT_SCHEMA_FILENAME,
+        target_map=target_map,
+        authorization_sha256=authorization_sha256,
     )
     capabilities = capabilities_for_model(model, overrides=capability_overrides)
     budget = plan_ollama_budget(prompt=prompt, capabilities=capabilities)
@@ -875,10 +1009,12 @@ def invoke_ollama_revision(
         budget=budget,
     )
     try:
-        validate_payload(
-            payload,
-            "antigravity_revision.schema.json",
-            label="Gemma 4 12B revision output",
+        revised = validate_and_apply_revision_patches(
+            payload=payload,
+            current_tailored_content=current_tailored_content,
+            extracted_resume=extracted_resume,
+            approved_analysis=approved_analysis,
+            qa_result=qa_result,
         )
     except ModelError as exc:
         _write_metadata(
@@ -889,42 +1025,7 @@ def invoke_ollama_revision(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
-            validation_path="canonical_schema",
-            validation_message=str(exc),
-            capabilities=capabilities,
-            budget=budget,
-            generation=generation,
-        )
-        raise OllamaRevisionContractError(
-            "The local writer violated the one-shot revision response contract."
-        ) from exc
-    try:
-        if payload["status"] == "cannot_apply":
-            detail = payload["cannot_apply"]
-            if detail["issue_id"] not in issue_ids:
-                raise OllamaRevisionContractError(
-                    "The local writer returned an unknown QA issue ID in cannot_apply."
-                )
-            raise OllamaRevisionCannotApplyError(
-                "The local writer could not apply the bounded correction for "
-                f"{detail['issue_id']} ({detail['reason_code']})."
-            )
-        if payload["status"] == "technical_failure":
-            detail = payload["technical_failure"]
-            raise OllamaRevisionTechnicalFailureError(
-                "The local writer revision reported technical failure "
-                f"{detail['reason_code']}."
-            )
-    except ModelError as exc:
-        _write_metadata(
-            run_directory=run_directory,
-            metadata_filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
-            response_path=response_path,
-            schema_path=transport_path,
-            model=model,
-            prompt=prompt,
-            validation_result="REJECTED",
-            validation_path=getattr(exc, "validation_path", "revision_contract"),
+            validation_path=getattr(exc, "validation_path", "revision_patch_contract"),
             validation_message=str(exc),
             capabilities=capabilities,
             budget=budget,
@@ -944,4 +1045,4 @@ def invoke_ollama_revision(
         budget=budget,
         generation=generation,
     )
-    return payload["tailored_resume"]
+    return revised

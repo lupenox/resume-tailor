@@ -349,9 +349,8 @@ def test_15_constraint_manifest_is_present_in_writer_prompt(master_resume: Path)
         company="Synthetic Corp",
         role="AI Solutions Engineer",
     )
-    assert "DETERMINISTIC CONSTRAINT MANIFEST" in prompt
-    assert '"expected_item_counts"' in prompt
-    assert '"authenticated_metrics"' in prompt
+    assert "AUTHENTICATED METRICS" in prompt
+    assert "CATALOG SHA256 DIGEST" in prompt
 
 def test_16_no_qwen_or_antigravity_fallback_introduced() -> None:
     from resume_tailor.ollama_writer import DEFAULT_OLLAMA_MODEL
@@ -374,7 +373,7 @@ def test_18_historical_wrong_root_ollama_regression_still_passes(master_resume: 
     from resume_tailor.ollama_writer import _invoke_payload, _write_transport_schema
     schema, transport_path = _write_transport_schema(
         tmp_path,
-        canonical_name="tailored_resume.schema.json",
+        canonical_name="ollama_tailoring_patch.schema.json",
         filename="ollama-tailoring-transport.schema.json",
     )
     capabilities = capabilities_for_model("resume-tailor-gemma")

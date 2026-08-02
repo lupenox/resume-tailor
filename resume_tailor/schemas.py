@@ -159,6 +159,28 @@ def validate_payload(payload: Any, schema_name: str, *, label: str) -> None:
         ) from exc
 
 
+def validate_resume_content_payload(payload: Any, *, label: str) -> None:
+    jsonschema = _jsonschema_module()
+    root_schema = load_schema("tailored_resume.schema.json")
+    wrapper_schema = {
+        "$schema": root_schema.get("$schema"),
+        "$defs": root_schema.get("$defs", {}),
+        "$ref": "#/$defs/resume",
+    }
+    try:
+        jsonschema.Draft202012Validator.check_schema(wrapper_schema)
+        jsonschema.validate(instance=payload, schema=wrapper_schema)
+    except jsonschema.SchemaError as exc:
+        raise DependencyError(
+            f"Bundled schema tailored_resume.schema.json is invalid: {exc.message}"
+        ) from exc
+    except jsonschema.ValidationError as exc:
+        location = ".".join(str(part) for part in exc.absolute_path) or "<root>"
+        raise ModelError(
+            f"{label} failed local schema validation at {location}: {exc.message}"
+        ) from exc
+
+
 def parse_json_text(text: str, *, label: str) -> Any:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         value: dict[str, Any] = {}
