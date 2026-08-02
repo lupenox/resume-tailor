@@ -24,29 +24,38 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install YAML parser
-        run: python -m pip install PyYAML
-
       - name: Apply bounded review corrections in disposable checkout
         run: |
           python - <<'PY'
           from pathlib import Path
-          import yaml
 
-          workflow_path = Path('.github/workflows/gemma-patch-review.yml')
-          workflow = yaml.safe_load(workflow_path.read_text(encoding='utf-8'))
-          steps = workflow['jobs']['correct-and-test']['steps']
-          correction_step = next(
-              step for step in steps
-              if step.get('name') == 'Apply bounded review corrections'
-          )
-          shell_script = correction_step['run']
-          lines = shell_script.splitlines()
-          start = lines.index("python - <<'PY'")
-          end = lines.index('PY', start + 1)
-          python_source = '\n'.join(lines[start + 1:end]).rstrip() + '\n'
+          source = Path('.github/workflows/gemma-patch-review.yml').read_text(encoding='utf-8')
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n"
+          if start_marker not in source or end_marker not in source:
+              raise SystemExit('Could not locate the embedded correction Python block')
+          embedded = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
+
+          output: list[str] = []
+          in_source_literal = False
+          for line in embedded.splitlines():
+              stripped_outer = line[10:] if line.startswith('          ') else line
+              delimiter_line = stripped_outer.strip() in {"'''", "r'''"}
+              if in_source_literal:
+                  if delimiter_line:
+                      output.append(stripped_outer)
+                      in_source_literal = False
+                  else:
+                      output.append(line)
+                  continue
+              output.append(stripped_outer)
+              if "r'''" in stripped_outer and not delimiter_line:
+                  in_source_literal = True
+
+          if in_source_literal:
+              raise SystemExit('Unclosed source-code literal in correction script')
           Path('/tmp/apply-gemma-patch-review.py').write_text(
-              python_source,
+              '\n'.join(output).rstrip() + '\n',
               encoding='utf-8',
           )
           PY
