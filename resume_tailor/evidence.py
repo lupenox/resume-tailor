@@ -804,24 +804,15 @@ def validate_tailored_content(
     if len(tailored["skill_groups"]) != len(original["skill_groups"]):
         report.issues.append("The number of technical-skill groups changed.")
     else:
-        approved_label_targets = {
-            edit.get("target_source_id")
-            for edit in analysis.get("recommended_edits", [])
-            if isinstance(edit, dict)
-            and isinstance(edit.get("target_source_id"), str)
-            and edit.get("target_source_id", "").endswith(".label")
-        }
         for index, (before, after) in enumerate(
             zip(original["skill_groups"], tailored["skill_groups"], strict=True)
         ):
-            target_id = f"skill_groups.{index}.label"
-            if target_id not in approved_label_targets:
-                _assert_exact(
-                    report,
-                    field_name=target_id,
-                    original=before["label"],
-                    tailored=after["label"],
-                )
+            _assert_exact(
+                report,
+                field_name=f"skill_groups.{index}.label",
+                original=before["label"],
+                tailored=after["label"],
+            )
 
     if len(tailored["projects"]) != len(original["projects"]):
         report.issues.append("The number of projects changed.")
@@ -836,18 +827,10 @@ def validate_tailored_content(
                 tailored=after["name"],
             )
             if len(before["bullets"]) != len(after["bullets"]):
-                project_target_id = f"projects.{index}"
-                structural_edit_approved = any(
-                    edit.get("target_source_id") == project_target_id
-                    and edit.get("operation") in {"add_bullet", "remove_bullet", "structural_edit"}
-                    for edit in analysis.get("recommended_edits", [])
-                    if isinstance(edit, dict)
+                report.issues.append(
+                    f"Project {before['name']!r} changed from "
+                    f"{len(before['bullets'])} to {len(after['bullets'])} bullets."
                 )
-                if not structural_edit_approved:
-                    report.issues.append(
-                        f"Project {before['name']!r} changed from "
-                        f"{len(before['bullets'])} to {len(after['bullets'])} bullets."
-                    )
 
     for name in ("name", "technologies"):
         _assert_exact(

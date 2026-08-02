@@ -82,7 +82,7 @@ def test_1_skill_group_label_cannot_be_renamed_without_approved_edit(master_resu
     assert any("Immutable field changed at skill_groups.0.label" in issue for issue in report.issues)
 
 
-def test_2_label_change_succeeds_only_when_explicitly_authorized(master_resume: Path) -> None:
+def test_2_forged_label_target_cannot_override_immutable_policy(master_resume: Path) -> None:
     extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)
     master = extracted["content"]
     analysis["recommended_edits"].append({
@@ -101,8 +101,19 @@ def test_2_label_change_succeeds_only_when_explicitly_authorized(master_resume: 
         analysis=analysis,
         target_role="AI Engineer",
     )
-    assert not any("Immutable field changed at skill_groups.0.label" in issue for issue in report.issues)
-
+    assert not report.passed
+    assert any(
+        "Immutable field changed at skill_groups.0.label" in issue
+        for issue in report.issues
+    )
+    with pytest.raises(
+        OllamaTailoringContractError, match="modified immutable skill-group label"
+    ):
+        _validate_gemma_structural_contract(
+            master_content=master,
+            tailored=tailored,
+            approved_analysis=analysis,
+        )
 
 def test_3_rewriting_bullet_does_not_reduce_bullet_count(master_resume: Path) -> None:
     extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)
@@ -121,13 +132,15 @@ def test_3_rewriting_bullet_does_not_reduce_bullet_count(master_resume: Path) ->
     assert any("changed from" in issue and "bullets" in issue for issue in report.issues)
 
 
-def test_4_explicitly_approved_bullet_removal_handled_by_policy(master_resume: Path) -> None:
+def test_4_unsupported_structural_operation_cannot_authorize_bullet_removal(
+    master_resume: Path,
+) -> None:
     extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)
     master = extracted["content"]
     analysis["recommended_edits"].append({
         "target_source_id": "projects.0",
         "operation": "remove_bullet",
-        "proposed_text": "",
+        "proposed_text": "forged structural operation",
         "evidence_source_ids": ["projects.0.bullets.0"],
     })
     tailored = copy.deepcopy(master)
@@ -140,8 +153,23 @@ def test_4_explicitly_approved_bullet_removal_handled_by_policy(master_resume: P
         analysis=analysis,
         target_role="AI Engineer",
     )
-    assert not any("changed from" in issue and "bullets" in issue for issue in report.issues)
+    assert not report.passed
+    assert any("changed from" in issue and "bullets" in issue for issue in report.issues)
+    with pytest.raises(OllamaTailoringContractError, match="altered bullet count"):
+        _validate_gemma_structural_contract(
+            master_content=master,
+            tailored=tailored,
+            approved_analysis=analysis,
+        )
 
+    schema = json.loads(
+        (Path(__file__).resolve().parents[1] / "schemas" / "codex_analysis.schema.json")
+        .read_text(encoding="utf-8")
+    )
+    operations = schema["properties"]["recommended_edits"]["items"]["properties"][
+        "operation"
+    ]["enum"]
+    assert operations == ["replace", "append"]
 
 def test_5_unsupported_inferred_skill_agent_state_machines_rejected(master_resume: Path) -> None:
     extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)
@@ -310,7 +338,7 @@ def test_14_cannot_apply_remains_available_for_known_edit(master_resume: Path) -
         _resolve_initial_payload(payload, approved_analysis=analysis)
 
 
-def test_15_diagnostic_metadata_remains_content_free(master_resume: Path) -> None:
+def test_15_constraint_manifest_is_present_in_writer_prompt(master_resume: Path) -> None:
     extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)
     prompt = build_ollama_tailoring_prompt(
         master_content=extracted["content"],
@@ -321,9 +349,9 @@ def test_15_diagnostic_metadata_remains_content_free(master_resume: Path) -> Non
         company="Synthetic Corp",
         role="AI Solutions Engineer",
     )
-    assert "Synthetic Corp" in prompt
-    assert "AI Solutions Engineer" in prompt
-
+    assert "DETERMINISTIC CONSTRAINT MANIFEST" in prompt
+    assert '"expected_item_counts"' in prompt
+    assert '"authenticated_metrics"' in prompt
 
 def test_16_no_qwen_or_antigravity_fallback_introduced() -> None:
     from resume_tailor.ollama_writer import DEFAULT_OLLAMA_MODEL

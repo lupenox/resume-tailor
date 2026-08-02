@@ -296,7 +296,7 @@ AUTHORING RULES (STRICT PRIORITY HIERARCHY)
    - Do not make any unapproved edits to any part of the resume.
 3. PRESERVE ALL UNEDITED CONTENT EXACTLY.
    - Any paragraph or bullet that does not have an approved edit target MUST remain 100% identical to the master resume.
-4. PRESERVE LIST ITEM COUNTS EXACTLY UNLESS AN APPROVED EDIT AUTHORIZES A STRUCTURAL CHANGE.
+4. PRESERVE LIST ITEM COUNTS EXACTLY.
    - Maintain the exact number of skill groups ({constraint_manifest['expected_item_counts']['skill_groups']}),
      projects ({constraint_manifest['expected_item_counts']['projects']}),
      experience bullets ({constraint_manifest['expected_item_counts']['experience_bullets']}),
@@ -667,20 +667,11 @@ def _validate_gemma_structural_contract(
     orig_groups = master_content.get("skill_groups", [])
     tail_groups = tailored.get("skill_groups", [])
     if len(orig_groups) == len(tail_groups):
-        approved_label_targets = {
-            edit.get("target_source_id")
-            for edit in approved_analysis.get("recommended_edits", [])
-            if isinstance(edit, dict)
-            and isinstance(edit.get("target_source_id"), str)
-            and edit.get("target_source_id", "").endswith(".label")
-        }
-        for index, (orig, tail) in enumerate(zip(orig_groups, tail_groups)):
+        for index, (orig, tail) in enumerate(zip(orig_groups, tail_groups, strict=True)):
             if orig.get("label") != tail.get("label"):
-                label_target = f"skill_groups.{index}.label"
-                if label_target not in approved_label_targets:
-                    raise OllamaTailoringContractError(
-                        f"Gemma output modified immutable skill-group label at index {index}."
-                    )
+                raise OllamaTailoringContractError(
+                    f"Gemma output modified immutable skill-group label at index {index}."
+                )
 
     orig_projects = master_content.get("projects", [])
     tail_projects = tailored.get("projects", [])
@@ -689,17 +680,9 @@ def _validate_gemma_structural_contract(
             orig_bullets = orig_p.get("bullets", [])
             tail_bullets = tail_p.get("bullets", [])
             if len(orig_bullets) != len(tail_bullets):
-                project_target_id = f"projects.{index}"
-                structural_approved = any(
-                    edit.get("target_source_id") == project_target_id
-                    and edit.get("operation") in {"add_bullet", "remove_bullet", "structural_edit"}
-                    for edit in approved_analysis.get("recommended_edits", [])
-                    if isinstance(edit, dict)
+                raise OllamaTailoringContractError(
+                    f"Gemma output altered bullet count for project {index}."
                 )
-                if not structural_approved:
-                    raise OllamaTailoringContractError(
-                        f"Gemma output altered bullet count for project {index} without authorization."
-                    )
 
 
 def _resolve_initial_payload(
