@@ -1,0 +1,130 @@
+name: Evidence contract review correction
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  correct-and-test:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/gemma-evidence-contract'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out evidence-contract branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install document rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice poppler-utils
+
+      - name: Apply bounded review corrections
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_exact(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding='utf-8')
+              if old not in text:
+                  raise SystemExit(f'Expected patch target not found in {path}: {old[:80]!r}')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          evidence = Path('resume_tailor/evidence.py')
+          replace_exact(
+              evidence,
+              '''    else:\n        approved_label_targets = {\n            edit.get("target_source_id")\n            for edit in analysis.get("recommended_edits", [])\n            if isinstance(edit, dict)\n            and isinstance(edit.get("target_source_id"), str)\n            and edit.get("target_source_id", "").endswith(".label")\n        }\n        for index, (before, after) in enumerate(\n            zip(original["skill_groups"], tailored["skill_groups"], strict=True)\n        ):\n            target_id = f"skill_groups.{index}.label"\n            if target_id not in approved_label_targets:\n                _assert_exact(\n                    report,\n                    field_name=target_id,\n                    original=before["label"],\n                    tailored=after["label"],\n                )\n''',
+              '''    else:\n        for index, (before, after) in enumerate(\n            zip(original["skill_groups"], tailored["skill_groups"], strict=True)\n        ):\n            _assert_exact(\n                report,\n                field_name=f"skill_groups.{index}.label",\n                original=before["label"],\n                tailored=after["label"],\n            )\n''',
+          )
+          replace_exact(
+              evidence,
+              '''            if len(before["bullets"]) != len(after["bullets"]):\n                project_target_id = f"projects.{index}"\n                structural_edit_approved = any(\n                    edit.get("target_source_id") == project_target_id\n                    and edit.get("operation") in {"add_bullet", "remove_bullet", "structural_edit"}\n                    for edit in analysis.get("recommended_edits", [])\n                    if isinstance(edit, dict)\n                )\n                if not structural_edit_approved:\n                    report.issues.append(\n                        f"Project {before['name']!r} changed from "\n                        f"{len(before['bullets'])} to {len(after['bullets'])} bullets."\n                    )\n''',
+              '''            if len(before["bullets"]) != len(after["bullets"]):\n                report.issues.append(\n                    f"Project {before['name']!r} changed from "\n                    f"{len(before['bullets'])} to {len(after['bullets'])} bullets."\n                )\n''',
+          )
+
+          writer = Path('resume_tailor/ollama_writer.py')
+          replace_exact(
+              writer,
+              '4. PRESERVE LIST ITEM COUNTS EXACTLY UNLESS AN APPROVED EDIT AUTHORIZES A STRUCTURAL CHANGE.\n',
+              '4. PRESERVE LIST ITEM COUNTS EXACTLY.\n',
+          )
+          replace_exact(
+              writer,
+              '''    if len(orig_groups) == len(tail_groups):\n        approved_label_targets = {\n            edit.get("target_source_id")\n            for edit in approved_analysis.get("recommended_edits", [])\n            if isinstance(edit, dict)\n            and isinstance(edit.get("target_source_id"), str)\n            and edit.get("target_source_id", "").endswith(".label")\n        }\n        for index, (orig, tail) in enumerate(zip(orig_groups, tail_groups)):\n            if orig.get("label") != tail.get("label"):\n                label_target = f"skill_groups.{index}.label"\n                if label_target not in approved_label_targets:\n                    raise OllamaTailoringContractError(\n                        f"Gemma output modified immutable skill-group label at index {index}."\n                    )\n''',
+              '''    if len(orig_groups) == len(tail_groups):\n        for index, (orig, tail) in enumerate(zip(orig_groups, tail_groups, strict=True)):\n            if orig.get("label") != tail.get("label"):\n                raise OllamaTailoringContractError(\n                    f"Gemma output modified immutable skill-group label at index {index}."\n                )\n''',
+          )
+          replace_exact(
+              writer,
+              '''            if len(orig_bullets) != len(tail_bullets):\n                project_target_id = f"projects.{index}"\n                structural_approved = any(\n                    edit.get("target_source_id") == project_target_id\n                    and edit.get("operation") in {"add_bullet", "remove_bullet", "structural_edit"}\n                    for edit in approved_analysis.get("recommended_edits", [])\n                    if isinstance(edit, dict)\n                )\n                if not structural_approved:\n                    raise OllamaTailoringContractError(\n                        f"Gemma output altered bullet count for project {index} without authorization."\n                    )\n''',
+              '''            if len(orig_bullets) != len(tail_bullets):\n                raise OllamaTailoringContractError(\n                    f"Gemma output altered bullet count for project {index}."\n                )\n''',
+          )
+
+          tests = Path('tests/test_gemma_evidence_contract.py')
+          test_text = tests.read_text(encoding='utf-8')
+
+          def replace_test(name: str, replacement: str) -> None:
+              global test_text
+              pattern = rf'def {re.escape(name)}\(.*?(?=\n\ndef test_|\Z)'
+              updated, count = re.subn(pattern, replacement.rstrip(), test_text, count=1, flags=re.S)
+              if count != 1:
+                  raise SystemExit(f'Expected one test function named {name}, found {count}')
+              test_text = updated
+
+          replace_test(
+              'test_2_label_change_succeeds_only_when_explicitly_authorized',
+              '''def test_2_forged_label_target_cannot_override_immutable_policy(master_resume: Path) -> None:\n    extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)\n    master = extracted["content"]\n    analysis["recommended_edits"].append({\n        "target_source_id": "skill_groups.0.label",\n        "operation": "replace",\n        "proposed_text": "Renamed Skill Category",\n        "evidence_source_ids": ["skill_groups.0"],\n    })\n    tailored = copy.deepcopy(master)\n    tailored["skill_groups"][0]["label"] = "Renamed Skill Category"\n\n    report = validate_tailored_content(\n        original=master,\n        tailored=tailored,\n        extracted_resume=extracted,\n        analysis=analysis,\n        target_role="AI Engineer",\n    )\n    assert not report.passed\n    assert any(\n        "Immutable field changed at skill_groups.0.label" in issue\n        for issue in report.issues\n    )\n    with pytest.raises(\n        OllamaTailoringContractError, match="modified immutable skill-group label"\n    ):\n        _validate_gemma_structural_contract(\n            master_content=master,\n            tailored=tailored,\n            approved_analysis=analysis,\n        )''',
+          )
+          replace_test(
+              'test_4_explicitly_approved_bullet_removal_handled_by_policy',
+              '''def test_4_unsupported_structural_operation_cannot_authorize_bullet_removal(\n    master_resume: Path,\n) -> None:\n    extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)\n    master = extracted["content"]\n    analysis["recommended_edits"].append({\n        "target_source_id": "projects.0",\n        "operation": "remove_bullet",\n        "proposed_text": "forged structural operation",\n        "evidence_source_ids": ["projects.0.bullets.0"],\n    })\n    tailored = copy.deepcopy(master)\n    tailored["projects"][0]["bullets"].pop()\n\n    report = validate_tailored_content(\n        original=master,\n        tailored=tailored,\n        extracted_resume=extracted,\n        analysis=analysis,\n        target_role="AI Engineer",\n    )\n    assert not report.passed\n    assert any("changed from" in issue and "bullets" in issue for issue in report.issues)\n    with pytest.raises(OllamaTailoringContractError, match="altered bullet count"):\n        _validate_gemma_structural_contract(\n            master_content=master,\n            tailored=tailored,\n            approved_analysis=analysis,\n        )\n\n    schema = json.loads(\n        (Path(__file__).resolve().parents[1] / "schemas" / "codex_analysis.schema.json")\n        .read_text(encoding="utf-8")\n    )\n    operations = schema["properties"]["recommended_edits"]["items"]["properties"][\n        "operation"\n    ]["enum"]\n    assert operations == ["replace", "append"]''',
+          )
+          replace_test(
+              'test_15_diagnostic_metadata_remains_content_free',
+              '''def test_15_constraint_manifest_is_present_in_writer_prompt(master_resume: Path) -> None:\n    extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)\n    prompt = build_ollama_tailoring_prompt(\n        master_content=extracted["content"],\n        extracted_resume=extracted,\n        job_description="Synthetic Job Description for AI Solutions Engineer position requiring Python, FastAPI, and Linux.",\n        job_requirements=reqs,\n        approved_analysis=analysis,\n        company="Synthetic Corp",\n        role="AI Solutions Engineer",\n    )\n    assert "DETERMINISTIC CONSTRAINT MANIFEST" in prompt\n    assert '"expected_item_counts"' in prompt\n    assert '"authenticated_metrics"' in prompt''',
+          )
+          tests.write_text(test_text + ('\n' if not test_text.endswith('\n') else ''), encoding='utf-8')
+
+          workflow = Path('.github/workflows/evidence-contract-review.yml')
+          workflow.unlink()
+          PY
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+
+      - name: Compile source and tests
+        run: python -m compileall resume_tailor tests
+
+      - name: Run focused evidence-contract tests
+        run: python -m pytest tests/test_gemma_evidence_contract.py
+
+      - name: Run full offline test suite
+        run: python -m pytest
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Commit verified review corrections
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "4189822+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No review corrections were needed."
+          else
+            git commit -m "fix: align Gemma constraints with approved edit schema"
+            git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          fi
