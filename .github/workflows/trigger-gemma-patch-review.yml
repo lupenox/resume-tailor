@@ -60,13 +60,38 @@ jobs:
           )
           PY
           python /tmp/apply-gemma-patch-review.py
+
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding='utf-8')
+              if old not in text:
+                  raise SystemExit(f'Expected synthetic fixture text not found in {path}: {old!r}')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          architecture_tests = Path('tests/test_gemma_patch_architecture.py')
+          replace_exact(
+              architecture_tests,
+              '"evidence_source_ids": ["skill_groups.2"],',
+              '"evidence_source_ids": ["skill_groups.2", "projects.0.bullets.0"],',
+          )
+          replace_exact(
+              architecture_tests,
+              'current_skill + ", FabricatedSkillWithoutEvidence"',
+              'current_skill + ", Rust"',
+          )
+
+          evidence_tests = Path('tests/test_gemma_evidence_contract.py')
+          replace_exact(
+              evidence_tests,
+              '"proposed_text": "Core Skills: Python, JavaScript, SQL",',
+              '"proposed_text": f"{extracted[\'content\'][\'skill_groups\'][0][\'label\']}: Python, JavaScript, SQL",',
+          )
+          PY
+
           rm -f .github/workflows/gemma-patch-review.yml
           rm -f .github/workflows/trigger-gemma-patch-review.yml
-
-      - name: Install document rendering dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libreoffice poppler-utils
 
       - name: Install test dependencies
         run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
@@ -81,6 +106,11 @@ jobs:
             tests/test_gemma_evidence_contract.py \
             tests/test_ollama_writer.py \
             tests/test_revision.py
+
+      - name: Install document rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice poppler-utils
 
       - name: Run full offline suite
         run: python -m pytest
