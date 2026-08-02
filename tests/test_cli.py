@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from resume_tailor.cli import _validate_mode_arguments, build_parser, main
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.utilities import (
     ApprovalError,
     ExitCode,
@@ -66,26 +67,10 @@ def test_url_mode_derives_company_and_role() -> None:
     _validate_mode_arguments(parser, args)
     assert args.company is None
     assert args.role is None
-    assert args.linkedin_provider == "auto"
+    assert not hasattr(args, "linkedin_provider")
 
 
-def test_url_mode_accepts_explicit_linkedin_provider() -> None:
-    parser = build_parser()
-    args = parser.parse_args(
-        [
-            "--resume",
-            "resume.docx",
-            "--job-url",
-            "https://www.linkedin.com/jobs/view/4123456789/",
-            "--linkedin-provider",
-            "apify",
-        ]
-    )
-    _validate_mode_arguments(parser, args)
-    assert args.linkedin_provider == "apify"
-
-
-def test_non_url_mode_rejects_linkedin_provider() -> None:
+def test_local_qwen_is_the_default_writer() -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -97,12 +82,27 @@ def test_non_url_mode_rejects_linkedin_provider() -> None:
             "Example",
             "--role",
             "Developer",
-            "--linkedin-provider",
-            "apify",
         ]
     )
+
+    assert args.writer_provider == "ollama"
+    assert args.ollama_model == "resume-tailor-qwen"
+    assert args.analytics_db.name == "job-search-analytics.sqlite3"
+
+
+def test_removed_linkedin_provider_flag_is_rejected() -> None:
+    parser = build_parser()
     with pytest.raises(SystemExit):
-        _validate_mode_arguments(parser, args)
+        parser.parse_args(
+            [
+                "--resume",
+                "resume.docx",
+                "--job-url",
+                "https://www.linkedin.com/jobs/view/4123456789/",
+                "--linkedin-provider",
+                "apify",
+            ]
+        )
 
 
 def test_file_mode_still_requires_company_and_role() -> None:
@@ -153,6 +153,36 @@ def test_unsupported_resume_extension(job_file: Path, tmp_path: Path) -> None:
     assert code == ExitCode.INPUT
 
 
+def test_cli_job_file_over_limit_reports_actual_and_permitted(
+    master_resume: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+    job_file = tmp_path / "oversized-job.txt"
+    job_file.write_text("x" * actual, encoding="utf-8")
+
+    code = main(
+        [
+            "--resume",
+            str(master_resume),
+            "--job-file",
+            str(job_file),
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    assert code == ExitCode.INPUT
+    error = capsys.readouterr().err
+    assert f"{actual:,}" in error
+    assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in error
+
+
 def test_human_approval_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(builtins, "input", lambda _: "no")
     with pytest.raises(ApprovalError):
@@ -194,11 +224,17 @@ def test_existing_installation_refuses_overwrite(
     assert first.returncode == 0, first.stderr
     installed = fake_home / ".local" / "share" / "resume-tailor"
     assert (installed / "resume_tailor" / "linkedin_job.py").is_file()
+    assert (installed / "resume_tailor" / "apify_job.py").is_file()
+    assert (installed / "resume_tailor" / "ollama_transport.py").is_file()
+    assert (installed / "resume_tailor" / "ollama_writer.py").is_file()
+    assert (installed / "resume_tailor" / "headless_render.py").is_file()
+    assert not (installed / "resume_tailor" / "codex_linkedin.py").exists()
     assert (installed / "resume_tailor" / "smoke.py").is_file()
     assert (installed / "resume_tailor" / "ui.py").is_file()
     assert (installed / "resume_tailor" / "templates" / "dashboard.html").is_file()
     assert (installed / "resume_tailor" / "static" / "app.css").is_file()
     assert (installed / "schemas" / "linkedin_job.schema.json").is_file()
+    assert not (installed / "schemas" / "linkedin_job.openai.schema.json").exists()
     if (installer_source / ".venv" / "bin" / "python").is_file():
         assert (installed / ".venv").is_symlink()
         assert (installed / ".venv").resolve() == (installer_source / ".venv").resolve()

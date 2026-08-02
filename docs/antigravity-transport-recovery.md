@@ -18,8 +18,8 @@ Antigravity CLI 1.1.8 documents stdin prompts for print mode. Resume Tailor now:
 - uses `shell=False` and never transports prompt text through argv,
   environment variables, interpolation, or a shell;
 - retains sandbox restrictions, structured JSON output, process-group
-  cancellation, and bounded timeout behavior; passive LinkedIn retrieval keeps
-  plan mode, while post-approval tailoring deliberately does not;
+  cancellation, and bounded timeout behavior; step-6 tailoring deliberately
+  does not use generic plan mode;
 - rejects prompts above a 750,000-byte local resource bound before launch;
 - stores only output byte counts and hashes when provider output is malformed.
 
@@ -49,6 +49,7 @@ failures. Before a new run is created, local code verifies:
 - the Codex approval record and every hash it binds.
 
 Eligible recovery creates a separate run, copies only authenticated local
-artifacts, reuses the approved analysis, invokes neither LinkedIn nor Codex, and
-pauses at the normal validated-content-diff approval gate. The source run remains
-unchanged. A missing approval record or any hash mismatch requires a new run.
+artifacts, reuses the approved analysis, invokes neither Apify retrieval nor
+Codex analysis, and pauses at the normal validated-content-diff approval gate.
+The source run remains unchanged. A missing approval record or any hash mismatch
+requires a new run.

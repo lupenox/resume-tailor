@@ -36,12 +36,45 @@ def _envelope_error(
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise _envelope_error("json-candidate-not-canonical") from exc
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite(_value: str) -> None:
+    raise ValueError("non-finite JSON number")
+
+
+def _strict_json_loads(
+    text: str,
+    *,
+    envelope_type: str,
+    detail: str = "Antigravity returned malformed JSON output.",
+) -> Any:
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise _envelope_error(envelope_type, detail) from exc
 
 
 def _parse_exact_object(value: Any, *, field: str) -> dict[str, Any]:
@@ -49,10 +82,11 @@ def _parse_exact_object(value: Any, *, field: str) -> dict[str, Any]:
         return value
     if not isinstance(value, str):
         raise _envelope_error(f"json-wrapper-invalid-{field}")
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise _envelope_error(f"json-wrapper-unstructured-{field}") from exc
+    parsed = _strict_json_loads(
+        value,
+        envelope_type=f"json-wrapper-unstructured-{field}",
+        detail="Antigravity returned JSON in an unsupported response format.",
+    )
     if not isinstance(parsed, dict):
         raise _envelope_error(f"json-wrapper-invalid-{field}")
     return parsed
@@ -108,15 +142,18 @@ def locate_json_candidate(
                 for nested in ("structured_output", "result")
                 if nested in value
             ]
-            if len(nested_fields) > 1:
-                raise _envelope_error(
-                    "json-wrapper-response-multiple-structured-candidates",
-                    "Antigravity returned multiple ambiguous structured-output candidates.",
-                )
-            if len(nested_fields) == 1:
-                nested = nested_fields[0]
-                value = value[nested]
-                envelope_type = f"json-wrapper-response-{nested}"
+            if nested_fields:
+                for nested in nested_fields:
+                    candidates.append(
+                        AntigravityResponseCandidate(
+                            payload=_parse_exact_object(
+                                value[nested],
+                                field=f"response-{nested}",
+                            ),
+                            envelope_type=f"json-wrapper-response-{nested}",
+                        )
+                    )
+                continue
         try:
             candidate = _parse_exact_object(value, field=field)
         except AntigravityResponseEnvelopeError:
@@ -146,9 +183,9 @@ def locate_json_candidate(
             )
         preference = {
             "json-wrapper-structured_output": 0,
-            "stream-json-terminal-structured_output": 0,
+            "json-wrapper-response-structured_output": 0,
             "json-wrapper-result": 1,
-            "stream-json-terminal-result": 1,
+            "json-wrapper-response-result": 1,
             "json-wrapper-response": 2,
             "direct-root": 3,
         }
@@ -176,13 +213,10 @@ def parse_json_output(
     *,
     expected_schema: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], AntigravityResponseCandidate]:
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise _envelope_error(
-            "malformed-json-output",
-            "Antigravity returned malformed JSON output.",
-        ) from exc
+    payload = _strict_json_loads(
+        text,
+        envelope_type="malformed-json-output",
+    )
     if not isinstance(payload, dict):
         raise _envelope_error("json-root-not-object")
     return payload, locate_json_tailoring_candidate(
@@ -191,24 +225,27 @@ def parse_json_output(
     )
 
 
-def parse_stream_json_envelope(
-    text: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    """Parse one documented Antigravity NDJSON terminal envelope."""
+def parse_stream_json_events(text: str) -> list[dict[str, Any]]:
+    """Decode complete Antigravity stream-json records without joining fragments."""
     events: list[dict[str, Any]] = []
     for line in text.splitlines():
         if not line.strip():
             continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise _envelope_error(
-                "stream-json-malformed-event",
-                "Antigravity returned a malformed stream-json event.",
-            ) from exc
+        event = _strict_json_loads(
+            line,
+            envelope_type="stream-json-malformed-event",
+            detail="Antigravity returned malformed JSON in a stream-json event.",
+        )
         if not isinstance(event, dict):
             raise _envelope_error("stream-json-event-not-object")
         events.append(event)
+    return events
+
+
+def locate_stream_json_terminal(
+    events: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    """Select exactly one documented or retained legacy terminal result."""
     current_terminal = [event for event in events if event.get("event") == "result"]
     legacy_terminal = [
         event
@@ -229,8 +266,16 @@ def parse_stream_json_envelope(
         envelope = event.get("result")
         if not isinstance(envelope, dict):
             raise _envelope_error("stream-json-terminal-result-not-object")
-        return events, envelope, "stream-json-event-result"
-    return events, event, "stream-json-legacy-step-result"
+        return envelope, "stream-json-event-result"
+    return event, "stream-json-legacy-step-result"
+
+
+def parse_stream_json_envelope(
+    text: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    events = parse_stream_json_events(text)
+    envelope, stream_type = locate_stream_json_terminal(events)
+    return events, envelope, stream_type
 
 
 def parse_stream_json_output(
@@ -239,7 +284,7 @@ def parse_stream_json_output(
     expected_schema: dict[str, Any] | None = None,
     required_fields: frozenset[str] = _TAILORING_FIELDS,
 ) -> tuple[list[dict[str, Any]], AntigravityResponseCandidate]:
-    """Parse Antigravity 1.1.8's documented typed NDJSON terminal result."""
+    """Parse one complete tailoring payload from one terminal stream event."""
     events, envelope, stream_type = parse_stream_json_envelope(text)
     candidate = locate_json_candidate(
         envelope,

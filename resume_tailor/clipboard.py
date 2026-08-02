@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .job_text import validate_confirmed_job_description
 from .utilities import InputError
 
 
@@ -53,4 +54,5 @@ def read_clipboard(*, timeout_seconds: int = 10) -> tuple[str, str]:
         )
     if len(text.encode("utf-8")) > 500_000:
         raise InputError("Clipboard content exceeds the 500,000-byte safety limit.")
+    validate_confirmed_job_description(text)
     return text, backend

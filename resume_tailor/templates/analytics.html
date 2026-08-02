@@ -1,0 +1,292 @@
+{% extends "base.html" %}
+{% block title %}Analytics · resume-tailor{% endblock %}
+{% block content %}
+  <a class="back-link" href="/">← New tailoring run</a>
+  <section class="hero analytics-hero">
+    <div>
+      <p class="eyebrow">Private local source of truth</p>
+      <h1>Job-search analytics</h1>
+      <p class="hero-copy">
+        Deterministic statistics calculated from local SQLite data. A generated
+        résumé is tracked separately from an application you actually submitted.
+      </p>
+    </div>
+    <div class="hero-trust" aria-label="Analytics safeguards">
+      <span>Local only</span>
+      <span>No telemetry</span>
+      <span>UTC records</span>
+    </div>
+  </section>
+
+  {% if notice %}
+    <div class="alert alert-success" role="status">{{ notice }}</div>
+  {% endif %}
+  {% if analytics_error %}
+    <div class="alert alert-error" role="alert">
+      <strong>Analytics unavailable</strong>
+      <span>{{ analytics_error }}</span>
+    </div>
+  {% elif summary %}
+    <section class="metric-grid" aria-label="Analytics totals">
+      {% set totals = summary.totals %}
+      <article class="card metric-card">
+        <span>Unique jobs viewed</span>
+        <strong>{{ totals.unique_jobs_viewed }}</strong>
+      </article>
+      <article class="card metric-card">
+        <span>Jobs viewed this week</span>
+        <strong>{{ totals.jobs_viewed_this_week }}</strong>
+      </article>
+      <article class="card metric-card">
+        <span>Applications submitted</span>
+        <strong>{{ totals.applications_submitted }}</strong>
+      </article>
+      <article class="card metric-card">
+        <span>Applications this week</span>
+        <strong>{{ totals.applications_this_week }}</strong>
+      </article>
+      <article class="card metric-card">
+        <span>Active interviews</span>
+        <strong>{{ totals.active_interviews }}</strong>
+      </article>
+      <article class="card metric-card">
+        <span>Offers</span>
+        <strong>{{ totals.offers }}</strong>
+      </article>
+    </section>
+
+    <div class="analytics-boundary card">
+      <div>
+        <strong>{{ totals.unique_jobs_viewed }}</strong>
+        <span>viewed</span>
+      </div>
+      <span aria-hidden="true">→</span>
+      <div>
+        <strong>{{ totals.jobs_approved_for_tailoring }}</strong>
+        <span>approved for tailoring</span>
+      </div>
+      <span aria-hidden="true">→</span>
+      <div>
+        <strong>{{ totals.resume_versions }}</strong>
+        <span>résumé versions</span>
+      </div>
+      <span aria-hidden="true">≠</span>
+      <div>
+        <strong>{{ totals.applications_submitted }}</strong>
+        <span>submitted applications</span>
+      </div>
+    </div>
+
+    <section class="analytics-section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Conversion</p>
+          <h2>Rates with sample context</h2>
+        </div>
+        <small>Percentages require at least {{ summary.minimum_rate_sample_size }} denominator records.</small>
+      </div>
+      <div class="rate-grid">
+        {% for label, rate in [
+          ("Application → screening", summary.rates.application_to_screening),
+          ("Application → interview", summary.rates.application_to_interview),
+          ("Interview → offer", summary.rates.interview_to_offer)
+        ] %}
+          <article class="card rate-card">
+            <span>{{ label }}</span>
+            <strong class="{% if not rate.enough_data %}insufficient{% endif %}">{{ rate.display }}</strong>
+            <small>{{ rate.numerator }} of {{ rate.denominator }}</small>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="analytics-columns">
+      <article class="card analytics-list-card">
+        <div class="card-heading compact">
+          <div><p class="eyebrow">Demand</p><h2>Top requested skills</h2></div>
+        </div>
+        {% if summary.top_requested_skills %}
+          <ol class="ranked-list">
+            {% for item in summary.top_requested_skills %}
+              <li><span>{{ item.name }}</span><strong>{{ item.jobs }} job{% if item.jobs != 1 %}s{% endif %}</strong></li>
+            {% endfor %}
+          </ol>
+        {% else %}
+          <p class="analytics-empty">No validated skill catalogs yet.</p>
+        {% endif %}
+      </article>
+      <article class="card analytics-list-card">
+        <div class="card-heading compact">
+          <div><p class="eyebrow">Validated gaps</p><h2>Top missing skills</h2></div>
+        </div>
+        {% if summary.top_missing_skills %}
+          <ol class="ranked-list">
+            {% for item in summary.top_missing_skills %}
+              <li><span>{{ item.name }}</span><strong>{{ item.jobs }} job{% if item.jobs != 1 %}s{% endif %}</strong></li>
+            {% endfor %}
+          </ol>
+        {% else %}
+          <p class="analytics-empty">No validated gap data yet.</p>
+        {% endif %}
+      </article>
+    </section>
+
+    <section class="analytics-columns analytics-columns-three">
+      {% for heading, values in [
+        ("Title family", summary.roles_by_title_family),
+        ("Seniority", summary.roles_by_seniority),
+        ("Workplace type", summary.roles_by_workplace_type)
+      ] %}
+        <article class="card analytics-list-card">
+          <div class="card-heading compact"><h2>{{ heading }}</h2></div>
+          {% if values %}
+            <ul class="plain-stat-list">
+              {% for item in values %}
+                <li><span>{{ item.label }}</span><strong>{{ item.jobs }}</strong></li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <p class="analytics-empty">No data yet.</p>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </section>
+
+    <section class="analytics-section">
+      <div class="section-heading">
+        <div><p class="eyebrow">Competition</p><h2>Applicant-count distribution</h2></div>
+        <small>Missing values remain unknown; they are never converted to zero.</small>
+      </div>
+      <div class="distribution-grid">
+        {% for item in summary.applicant_count_distribution %}
+          <article class="card distribution-card">
+            <strong>{{ item.jobs }}</strong><span>{{ item.label }}</span>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="analytics-columns">
+      <article class="card analytics-list-card">
+        <div class="card-heading compact">
+          <div><p class="eyebrow">Follow-up</p><h2>Applications requiring an update</h2></div>
+          <span class="count-badge">{{ summary.applications_requiring_update|length }}</span>
+        </div>
+        {% if summary.applications_requiring_update %}
+          <ul class="plain-stat-list update-list">
+            {% for item in summary.applications_requiring_update %}
+              <li>
+                <span><strong>{{ item.title }}</strong><small>{{ item.company }} · {{ item.current_status|replace('_', ' ') }}</small></span>
+                <time>{{ item.updated_at[:10] }}</time>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="analytics-empty">No tracked application is stale.</p>
+        {% endif %}
+      </article>
+      <article class="card analytics-list-card privacy-card">
+        <div class="card-heading compact">
+          <div><p class="eyebrow">Storage boundary</p><h2>Private by construction</h2></div>
+        </div>
+        <p>
+          <code>{{ analytics_database_name }}</code> stores job metadata and tracking
+          events, never résumé body text, contact details, prompts, credentials, raw
+          Actor output, or private diagnostics. No export is transmitted.
+        </p>
+      </article>
+    </section>
+
+    <section class="analytics-section">
+      <div class="section-heading">
+        <div><p class="eyebrow">Local tracking</p><h2>Recently viewed jobs</h2></div>
+      </div>
+      {% if summary.recently_viewed_jobs %}
+        <div class="tracked-job-list">
+          {% for job in summary.recently_viewed_jobs %}
+            <article class="card tracked-job">
+              <div class="tracked-job-heading">
+                <div>
+                  <span class="status-pill">{{ job.current_status|replace('_', ' ') }}</span>
+                  <h3>{{ job.title }}</h3>
+                  <p>{{ job.company }}{% if job.location %} · {{ job.location }}{% endif %}</p>
+                </div>
+                <time>Seen {{ job.last_seen_at[:10] }}</time>
+              </div>
+
+              <div class="quick-actions" aria-label="Status actions for {{ job.title }}">
+                {% for action, label in [
+                  ("save", "Save job"),
+                  ("apply", "Mark applied"),
+                  ("screening", "Record screening"),
+                  ("reject", "Record rejection"),
+                  ("offer", "Record offer")
+                ] %}
+                  <form action="/analytics/applications/{{ job.application_id }}/status" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="action" value="{{ action }}">
+                    <button class="secondary-button compact-button" type="submit">{{ label }}</button>
+                  </form>
+                {% endfor %}
+                <form action="/analytics/applications/{{ job.application_id }}/status" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="withdraw">
+                  <button class="danger-button compact-button" type="submit">Withdraw application</button>
+                </form>
+              </div>
+
+              <div class="tracking-details">
+                <details>
+                  <summary>Record interview</summary>
+                  <form class="analytics-form" action="/analytics/applications/{{ job.application_id }}/interviews" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <div class="analytics-form-grid">
+                      <div><label>Interview type</label><select name="interview_type">
+                        {% for status in interview_types %}<option value="{{ status }}">{{ status|replace('_', ' ')|title }}</option>{% endfor %}
+                      </select></div>
+                      <div><label>Scheduled (local time)</label><input type="datetime-local" name="scheduled_at"></div>
+                      <div><label>Completed (local time)</label><input type="datetime-local" name="completed_at"></div>
+                      <div><label>Interviewer/contact label</label><input type="text" name="contact_label" maxlength="300"></div>
+                    </div>
+                    <label>Result</label><input type="text" name="result" maxlength="500">
+                    <label>Notes</label><textarea name="notes" rows="3" maxlength="2000"></textarea>
+                    <label class="confirmation-check"><input type="checkbox" name="confirm_interview" value="yes" required> I confirm this interview was explicitly scheduled or completed.</label>
+                    <button class="primary-button" type="submit">Record interview</button>
+                  </form>
+                </details>
+                <details>
+                  <summary>Correct status</summary>
+                  <form class="analytics-form" action="/analytics/applications/{{ job.application_id }}/correction" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <label>Correct status</label>
+                    <select name="new_status">
+                      {% for status in application_statuses %}<option value="{{ status }}">{{ status|replace('_', ' ')|title }}</option>{% endfor %}
+                    </select>
+                    <label>Correction note (optional)</label><input type="text" name="note" maxlength="2000">
+                    <label class="confirmation-check"><input type="checkbox" name="confirm_correction" value="yes" required> Append this correction without deleting or rewriting prior events.</label>
+                    <button class="danger-button" type="submit">Correct status</button>
+                  </form>
+                </details>
+                <details>
+                  <summary>Add note</summary>
+                  <form class="analytics-form" action="/analytics/applications/{{ job.application_id }}/notes" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <label>Non-sensitive note</label><textarea name="note" rows="3" maxlength="2000" required></textarea>
+                    <p class="field-help">Email addresses, phone numbers, and credentials are rejected.</p>
+                    <button class="secondary-button" type="submit">Add note</button>
+                  </form>
+                </details>
+              </div>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state card">
+          <span aria-hidden="true">◇</span>
+          <strong>No viewed jobs yet</strong>
+          <p>A job appears only after validated retrieval or local ingestion reaches its review boundary.</p>
+        </div>
+      {% endif %}
+    </section>
+  {% endif %}
+{% endblock %}

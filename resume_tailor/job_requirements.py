@@ -4,6 +4,10 @@ import hashlib
 import re
 from typing import Any
 
+from .job_text import (
+    MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS,
+    validate_confirmed_job_description,
+)
 from .utilities import InputError
 
 
@@ -42,7 +46,12 @@ def job_description_sha256(job_description: str) -> str:
     return hashlib.sha256(_description_bytes(job_description)).hexdigest()
 
 
-def _safe_requirement_text(value: Any, *, location: str) -> str:
+def _safe_requirement_text(
+    value: Any,
+    *,
+    location: str,
+    maximum_characters: int = MAX_REQUIREMENT_CHARACTERS,
+) -> str:
     if not isinstance(value, str):
         raise InputError(f"Job requirement {location} must be text.")
     normalized = " ".join(
@@ -50,10 +59,10 @@ def _safe_requirement_text(value: Any, *, location: str) -> str:
     )
     if not normalized:
         raise InputError(f"Job requirement {location} is empty.")
-    if len(normalized) > MAX_REQUIREMENT_CHARACTERS:
+    if len(normalized) > maximum_characters:
         raise InputError(
-            f"Job requirement {location} exceeds the {MAX_REQUIREMENT_CHARACTERS:,}-"
-            "character safety limit."
+            f"Job requirement {location} is {len(normalized):,} characters; the "
+            f"maximum permitted length is {maximum_characters:,} characters."
         )
     if any(
         (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
@@ -113,7 +122,11 @@ def _unstructured_requirements(job_description: str) -> list[tuple[str, str, str
         if not candidate:
             continue
         category, prefix = _category_for_heading(heading)
-        text = _safe_requirement_text(candidate, location="confirmed job text")
+        text = _safe_requirement_text(
+            candidate,
+            location="confirmed job text",
+            maximum_characters=MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS,
+        )
         counters[prefix] = counters.get(prefix, 0) + 1
         requirements.append((f"{prefix}.{counters[prefix]:03d}", category, text))
     return requirements
@@ -125,8 +138,7 @@ def build_job_requirement_catalog(
     structured_job: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an immutable, deterministic catalog from the confirmed job input."""
-    if not isinstance(job_description, str) or not job_description.strip():
-        raise InputError("The confirmed job description is empty.")
+    validate_confirmed_job_description(job_description)
     requirements = _structured_requirements(structured_job)
     source_kind = "confirmed_structured_posting"
     if not requirements:
@@ -165,6 +177,8 @@ def validate_job_requirement_catalog(
 ) -> list[dict[str, str]]:
     if not isinstance(catalog, dict) or catalog.get("version") != CATALOG_VERSION:
         raise InputError("The job-requirement catalog has an unsupported version.")
+    if job_description is not None:
+        validate_confirmed_job_description(job_description)
     expected_hash = catalog.get("job_description_sha256")
     if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
         raise InputError("The job-requirement catalog is missing its input hash.")
@@ -172,7 +186,8 @@ def validate_job_requirement_catalog(
         raise InputError(
             "The job-requirement catalog does not match the confirmed job description."
         )
-    if catalog.get("source_kind") not in {
+    source_kind = catalog.get("source_kind")
+    if source_kind not in {
         "confirmed_structured_posting",
         "confirmed_job_text",
     }:
@@ -207,7 +222,13 @@ def validate_job_requirement_catalog(
                 f"Job-requirement catalog entry {position} has an invalid category."
             )
         text = _safe_requirement_text(
-            item.get("exact_text"), location=f"catalog[{position}]"
+            item.get("exact_text"),
+            location=f"catalog[{position}]",
+            maximum_characters=(
+                MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+                if source_kind == "confirmed_job_text"
+                else MAX_REQUIREMENT_CHARACTERS
+            ),
         )
         if text != item.get("exact_text"):
             raise InputError(

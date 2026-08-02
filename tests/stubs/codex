@@ -11,11 +11,6 @@ if "--version" in sys.argv:
     print("codex-cli stub-0.0")
     raise SystemExit(0)
 
-mode = os.environ.get("STUB_CODEX_MODE", "ready")
-if mode == "process_error":
-    print("stub Codex failure", file=sys.stderr)
-    raise SystemExit(9)
-
 try:
     output_path = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
 except (ValueError, IndexError):
@@ -53,44 +48,162 @@ if schema_log:
         handle.write(f"{transport_schema_path}\n")
 
 prompt = sys.stdin.read()
+if not prompt:
+    print("missing UTF-8 stdin prompt", file=sys.stderr)
+    raise SystemExit(2)
 output_path.parent.mkdir(parents=True, exist_ok=True)
+
+if "Perform a fresh, read-only final QA review" in prompt:
+    role = "final_qa"
+else:
+    role = "resume_analysis"
+
+qa_generation = None
+if role == "final_qa":
+    qa_generation = "revision-1" if "generation revision-1" in prompt else "initial"
+
+invocation_log = os.environ.get("STUB_CODEX_INVOCATION_LOG")
+if invocation_log:
+    with Path(invocation_log).open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "role": role,
+                    "generation": qa_generation,
+                    "cwd": str(Path.cwd()),
+                    "ephemeral": "--ephemeral" in sys.argv,
+                    "sandbox": (
+                        sys.argv[sys.argv.index("--sandbox") + 1]
+                        if "--sandbox" in sys.argv
+                        else None
+                    ),
+                }
+            )
+            + "\n"
+        )
+
+mode = os.environ.get("STUB_CODEX_MODE", "ready")
+if "--search" in sys.argv:
+    print("live search is allowed only for LinkedIn retrieval", file=sys.stderr)
+    raise SystemExit(46)
+
+if mode == "process_error":
+    print("stub Codex failure", file=sys.stderr)
+    raise SystemExit(9)
 if mode == "bad_json":
     output_path.write_text("not-json", encoding="utf-8")
     raise SystemExit(0)
 
-if "Perform a fresh, read-only final QA review" in prompt:
-    if mode == "qa_fail":
+if role == "final_qa":
+    required_qa_flags = {"--ignore-user-config", "--ephemeral", "--sandbox"}
+    if not required_qa_flags.issubset(sys.argv):
+        print("final QA missing fresh read-only flags", file=sys.stderr)
+        raise SystemExit(49)
+    if sys.argv[sys.argv.index("--sandbox") + 1] != "read-only":
+        print("final QA sandbox must be read-only", file=sys.stderr)
+        raise SystemExit(50)
+    try:
+        preview_path = Path(sys.argv[sys.argv.index("--image") + 1])
+    except (ValueError, IndexError):
+        print("final QA is missing its rendered preview", file=sys.stderr)
+        raise SystemExit(47)
+    if not preview_path.is_file():
+        print("final QA started before the rendered preview existed", file=sys.stderr)
+        raise SystemExit(48)
+    qa_mode = os.environ.get(
+        "STUB_CODEX_QA_REVISION_MODE"
+        if qa_generation == "revision-1"
+        else "STUB_CODEX_QA_INITIAL_MODE",
+        mode,
+    )
+    if qa_mode == "qa_bad_json":
+        output_path.write_text("not-json", encoding="utf-8")
+        raise SystemExit(0)
+    if qa_mode == "qa_fail":
         payload = {
-            "status": "REVIEW_REQUIRED",
+            "status": "material_findings",
             "summary": "A material visual issue needs review.",
-            "checks": [
+            "issues": [
                 {
-                    "category": "visual layout",
-                    "status": "FAIL",
-                    "finding": "Stubbed clipping finding.",
+                    "category": "clarity",
+                    "severity": "medium",
+                    "description": "The synthetic summary needs a bounded clarity correction.",
+                    "affected_content_id": "professional_summary",
+                    "evidence_source_ids": ["professional_summary"],
+                    "correction_action": "improve_clarity",
+                    "correction_objective": "Improve clarity without adding or replacing facts.",
                 }
             ],
-            "material_issues": ["Stubbed clipping finding."],
-            "improvement_assessment": "Cannot approve until reviewed.",
+            "technical_failure": None,
+        }
+    elif qa_mode == "qa_technical_failure":
+        payload = {
+            "status": "technical_failure",
+            "summary": "Synthetic QA could not complete reliably.",
+            "issues": [],
+            "technical_failure": {
+                "reason_code": "image_unavailable",
+                "description": "Synthetic preview inspection failed.",
+            },
+        }
+    elif qa_mode == "qa_unknown_category":
+        payload = {
+            "status": "material_findings",
+            "summary": "Synthetic invalid category.",
+            "issues": [
+                {
+                    "category": "rewrite_everything",
+                    "severity": "medium",
+                    "description": "Synthetic invalid category.",
+                    "affected_content_id": "professional_summary",
+                    "evidence_source_ids": [],
+                    "correction_action": "improve_clarity",
+                    "correction_objective": "Synthetic objective.",
+                }
+            ],
+            "technical_failure": None,
+        }
+    elif qa_mode == "qa_unknown_content_id":
+        payload = {
+            "status": "material_findings",
+            "summary": "Synthetic unknown content ID.",
+            "issues": [
+                {
+                    "category": "clarity",
+                    "severity": "medium",
+                    "description": "Synthetic unknown content ID.",
+                    "affected_content_id": "unknown.content",
+                    "evidence_source_ids": [],
+                    "correction_action": "improve_clarity",
+                    "correction_objective": "Synthetic objective.",
+                }
+            ],
+            "technical_failure": None,
+        }
+    elif qa_mode == "qa_replacement_text":
+        payload = {
+            "status": "material_findings",
+            "summary": "Synthetic forbidden replacement wording.",
+            "issues": [
+                {
+                    "category": "clarity",
+                    "severity": "medium",
+                    "description": "Synthetic finding.",
+                    "affected_content_id": "professional_summary",
+                    "evidence_source_ids": [],
+                    "correction_action": "improve_clarity",
+                    "correction_objective": "Synthetic objective.",
+                    "replacement_resume_text": "Forbidden replacement wording.",
+                }
+            ],
+            "technical_failure": None,
         }
     else:
         payload = {
-            "status": "PASS",
+            "status": "pass",
             "summary": "Stubbed read-only QA passed.",
-            "checks": [
-                {
-                    "category": "truthfulness",
-                    "status": "PASS",
-                    "finding": "No unsupported claims detected.",
-                },
-                {
-                    "category": "visual layout",
-                    "status": "PASS",
-                    "finding": "One readable page with no clipping detected.",
-                },
-            ],
-            "material_issues": [],
-            "improvement_assessment": "Alignment is at least as strong as the source.",
+            "issues": [],
+            "technical_failure": None,
         }
 else:
     requirement_ids = transport_schema["properties"][
@@ -113,11 +226,7 @@ else:
         ),
         requirement_ids[0],
     )
-    questions = (
-        ["Please confirm a factual detail."]
-        if mode == "questions"
-        else []
-    )
+    questions = ["Please confirm a factual detail."] if mode == "questions" else []
     payload = {
         "role_summary": "Stubbed target role analysis.",
         "fit_assessment": {

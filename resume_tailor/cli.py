@@ -4,11 +4,20 @@ import argparse
 import importlib.metadata
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .apify_job import invoke_apify_job_extraction, resolve_linkedin_provider
+from .analytics import (
+    ANALYTICS_DATABASE_FILENAME,
+    ANALYTICS_SCHEMA_VERSION,
+    AnalyticsStore,
+    default_analytics_database_path,
+    observation_from_canonical_job,
+    observation_from_local_job,
+)
+from .apify_job import invoke_apify_linkedin_retrieval
 from .antigravity_writer import (
     ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
     invoke_antigravity,
@@ -23,13 +32,30 @@ from .evidence import (
     validate_tailored_content,
 )
 from .linkedin_job import (
-    invoke_linkedin_job_extraction,
     posting_confirmation_text,
     validate_linkedin_url,
 )
-from .job_requirements import build_job_requirement_catalog
+from .job_requirements import build_job_requirement_catalog, job_description_sha256
+from .job_text import validate_confirmed_job_description
 from .orchestration import PipelineHooks
+from .ollama_transport import ollama_dependency_versions
+from .ollama_writer import (
+    DEFAULT_OLLAMA_MODEL,
+    OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
+    invoke_ollama,
+    invoke_ollama_revision,
+    load_ollama_response_metadata,
+    validate_ollama_model_name,
+)
 from .qa import invoke_final_qa
+from .revision import (
+    REVISION_RESPONSE_METADATA_FILENAME,
+    REVISION_SCHEMA_NAME,
+    approved_revision_targets,
+    build_revision_diff,
+    invoke_antigravity_revision,
+    validate_revision_scope,
+)
 from .retry import (
     ANALYSIS_APPROVAL_FILENAME,
     AntigravityReprocessContext,
@@ -45,15 +71,19 @@ from .retry import (
 from .schemas import (
     CodexAnalysisTransportArtifact,
     prepare_codex_analysis_transport_schema,
+    schema_path,
     validate_codex_analysis_transport_artifact,
 )
 from .utilities import (
     ApifyConfigurationError,
-    ApifyProviderError,
+    ApifyLinkedInRetrievalError,
     ApprovalError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
     AntigravityResponseEnvelopeError,
+    AntigravityRevisionCannotApplyError,
+    AntigravityRevisionContractError,
+    AntigravityRevisionTechnicalFailureError,
     AntigravityTailoringContractError,
     AntigravityTailoringPreflightError,
     AntigravityTechnicalFailureError,
@@ -61,10 +91,18 @@ from .utilities import (
     ExitCode,
     InputError,
     IntegrityError,
-    LinkedInResponseEnvelopeError,
+    OllamaCannotApplyError,
+    OllamaConnectionError,
+    OllamaRevisionCannotApplyError,
+    OllamaRevisionContractError,
+    OllamaRevisionTechnicalFailureError,
+    OllamaTailoringContractError,
+    OllamaTechnicalFailureError,
     QAError,
+    RevisionValidationError,
     ResumeTailorError,
     SourceEvidenceError,
+    TailoringPreflightError,
     TruthfulnessError,
     WaitingError,
     atomic_write_bytes,
@@ -112,15 +150,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="public HTTPS LinkedIn /jobs/view/ URL to retrieve and validate",
     )
     parser.add_argument(
-        "--linkedin-provider",
-        choices=("auto", "apify", "antigravity"),
-        default="auto",
-        help=(
-            "URL retrieval provider: auto prefers Apify when APIFY_API_TOKEN is "
-            "configured, otherwise Antigravity (default: auto)"
-        ),
-    )
-    parser.add_argument(
         "--company",
         help="target company (required with --clipboard or --job-file)",
     )
@@ -133,6 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("~/Documents/Resumes/Tailored"),
         help="artifact parent directory (default: ~/Documents/Resumes/Tailored)",
+    )
+    parser.add_argument(
+        "--analytics-db",
+        type=Path,
+        default=default_analytics_database_path(),
+        help="private local SQLite analytics database (default: XDG application data)",
     )
     parser.add_argument(
         "--yes",
@@ -151,6 +186,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DURATION",
         help="model timeout such as 90s, 15m, or 1h (default: 15m)",
     )
+    parser.add_argument(
+        "--writer-provider",
+        choices=("ollama", "antigravity"),
+        default="ollama",
+        help=(
+            "résumé-writing provider (default: ollama; antigravity remains a "
+            "compatibility option)"
+        ),
+    )
+    parser.add_argument(
+        "--ollama-model",
+        default=DEFAULT_OLLAMA_MODEL,
+        help=f"local Ollama model/profile (default: {DEFAULT_OLLAMA_MODEL})",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -166,8 +215,6 @@ def _validate_mode_arguments(
                 "derived from the fetched posting"
             )
         return
-    if args.linkedin_provider != "auto":
-        parser.error("--linkedin-provider is only valid with --job-url")
     if args.company is None or args.role is None:
         parser.error(
             "--company and --role are required with --clipboard or --job-file"
@@ -233,23 +280,31 @@ def _analysis_dependency_versions(cwd: Path) -> dict[str, str]:
     }
 
 
-def _tailoring_dependency_versions(cwd: Path) -> dict[str, str]:
-    agy = require_executable("agy")
+def _tailoring_dependency_versions(
+    cwd: Path,
+    provider: str = "antigravity",
+    ollama_model: str = DEFAULT_OLLAMA_MODEL,
+) -> dict[str, str]:
     libreoffice = require_executable("libreoffice")
     require_executable("pdfinfo")
     require_executable("pdftotext")
     require_executable("pdftoppm")
-    return {
-        "antigravity": _tool_version(agy, ["--version"], cwd=cwd),
+    versions = {
         "libreoffice": _tool_version(libreoffice, ["--version"], cwd=cwd),
     }
-
-
-def _dependency_versions(cwd: Path) -> dict[str, str]:
-    return {
-        **_analysis_dependency_versions(cwd),
-        **_tailoring_dependency_versions(cwd),
-    }
+    if provider == "antigravity":
+        agy = require_executable("agy")
+        versions["antigravity"] = _tool_version(agy, ["--version"], cwd=cwd)
+        return versions
+    if provider == "ollama":
+        versions.update(
+            ollama_dependency_versions(
+                model=validate_ollama_model_name(ollama_model),
+                cwd=cwd,
+            )
+        )
+        return versions
+    raise InputError(f"Unsupported résumé writer provider: {provider!r}.")
 
 
 def _header_name(extracted: dict[str, Any]) -> str:
@@ -259,10 +314,17 @@ def _header_name(extracted: dict[str, Any]) -> str:
     raise InputError("Could not determine the resume owner's name from the template.")
 
 
-def _required_pdf_text(extracted: dict[str, Any]) -> list[str]:
-    from .docx_extract import SECTION_HEADINGS
+def _required_pdf_text(
+    extracted: dict[str, Any],
+    *,
+    document_format: str = "master-template",
+) -> list[str]:
+    if document_format == "headless":
+        from .headless_render import HEADLESS_SECTION_HEADINGS as headings
+    else:
+        from .docx_extract import SECTION_HEADINGS as headings
 
-    required = [_header_name(extracted), *SECTION_HEADINGS]
+    required = [_header_name(extracted), *headings]
     required.extend(
         link["text"]
         for link in extracted["document"]["hyperlinks"]
@@ -282,12 +344,109 @@ def _update_metadata(
     atomic_write_json(path, metadata)
 
 
+def _publish_authenticated_artifact(
+    source_path: Path,
+    destination_path: Path,
+) -> dict[str, str]:
+    if not source_path.is_file():
+        raise IntegrityError(
+            f"Cannot publish missing generated artifact {source_path.name}."
+        )
+    try:
+        payload = source_path.read_bytes()
+    except OSError as exc:
+        raise IntegrityError(
+            f"Cannot read generated artifact {source_path.name} for publication."
+        ) from exc
+    if not payload:
+        raise IntegrityError(
+            f"Cannot publish empty generated artifact {source_path.name}."
+        )
+    source_sha256 = sha256_file(source_path)
+    atomic_write_bytes(destination_path, payload)
+    published_sha256 = sha256_file(destination_path)
+    if published_sha256 != source_sha256:
+        raise IntegrityError(
+            f"Published artifact {destination_path.name} failed hash verification."
+        )
+    return {
+        "source_filename": source_path.name,
+        "filename": destination_path.name,
+        "sha256": published_sha256,
+    }
+
+
+def _publish_final_generation(
+    *,
+    run_directory: Path,
+    basename: str,
+    generation: str,
+) -> dict[str, Any]:
+    if generation not in {"initial", "revision-1"}:
+        raise IntegrityError("The final artifact generation is invalid.")
+    sources = {
+        "tailored_content": run_directory / f"tailored-content.{generation}.json",
+        "content_diff": run_directory / f"content-diff.{generation}.md",
+        "docx": run_directory / f"{basename}.{generation}.docx",
+        "pdf": run_directory / f"{basename}.{generation}.pdf",
+        "preview": run_directory / f"preview.{generation}.png",
+        "final_qa": run_directory / f"final-qa.{generation}.md",
+    }
+    destinations = {
+        "tailored_content": run_directory / "tailored-content.json",
+        "content_diff": run_directory / "content-diff.md",
+        "docx": run_directory / f"{basename}.docx",
+        "pdf": run_directory / f"{basename}.pdf",
+        "preview": run_directory / "preview.png",
+        "final_qa": run_directory / "final-qa.md",
+    }
+    published: dict[str, Any] = {"generation": generation}
+    for label, source_path in sources.items():
+        published[label] = _publish_authenticated_artifact(
+            source_path,
+            destinations[label],
+        )
+    warnings_path = (
+        run_directory / f"final-qa.{generation}.normalization-warnings.json"
+    )
+    if warnings_path.is_file():
+        published["final_qa_normalization_warnings"] = (
+            _publish_authenticated_artifact(
+                warnings_path,
+                run_directory / "final-qa-normalization-warnings.json",
+            )
+        )
+    return published
+
+
 def _elapsed_label(elapsed_seconds: float) -> str:
     total = max(0, int(elapsed_seconds))
     minutes, seconds = divmod(total, 60)
     if minutes:
         return f"{minutes}m {seconds:02d}s"
     return f"{seconds}s"
+
+
+def _apify_progress_message(
+    phase: str,
+    elapsed_seconds: float,
+    status: str | None,
+) -> str:
+    if phase == "starting_actor":
+        return "Starting Apify retrieval."
+    if phase == "waiting_for_actor":
+        status_text = f"; status {status}" if status else ""
+        return (
+            "Waiting for the Apify Actor "
+            f"— elapsed {_elapsed_label(elapsed_seconds)}{status_text}."
+        )
+    if phase == "reading_job_result":
+        return "Reading the matching job result from the Apify dataset."
+    if phase == "normalizing_job_posting":
+        return "Normalizing the Apify result into the canonical job posting."
+    if phase == "ready_for_review":
+        return "Canonical validation passed. The job posting is ready for review."
+    return "Apify LinkedIn retrieval is continuing."
 
 
 def run_pipeline(
@@ -304,6 +463,14 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     hooks.progress("validating_input", "Validating the résumé and job input.")
     resume_path = _validate_resume_path(args.resume)
     timeout_seconds, antigravity_duration = args.timeout
+    writer_provider = getattr(args, "writer_provider", "antigravity")
+    if writer_provider not in {"ollama", "antigravity"}:
+        raise InputError(
+            f"Unsupported résumé writer provider: {writer_provider!r}."
+        )
+    ollama_model = validate_ollama_model_name(
+        getattr(args, "ollama_model", DEFAULT_OLLAMA_MODEL)
+    )
     retry_context = getattr(args, "retry_context", None)
     retry_inputs = None
     antigravity_retry_context = getattr(
@@ -366,9 +533,13 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             current_resume=resume_path,
         )
         antigravity_retry_inputs = antigravity_reprocess_inputs.retry_inputs
+    if antigravity_retry_inputs is not None:
+        writer_provider = "antigravity"
+    writer_name = "Qwen" if writer_provider == "ollama" else "Antigravity"
+    document_format = (
+        "headless" if writer_provider == "ollama" else "master-template"
+    )
     requested_linkedin_url = None
-    linkedin_provider_requested = getattr(args, "linkedin_provider", "auto")
-    linkedin_provider_resolved: str | None = None
     fetched_job: dict[str, Any] | None = None
     if antigravity_retry_inputs is not None:
         company = _validate_label(
@@ -392,9 +563,6 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         job_source = "source-evidence-retry"
     elif args.job_url is not None:
         requested_linkedin_url = validate_linkedin_url(args.job_url)
-        linkedin_provider_resolved = resolve_linkedin_provider(
-            linkedin_provider_requested
-        )
         company: str | None = None
         role: str | None = None
         job_description: str | None = None
@@ -411,7 +579,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 args.job_file.expanduser(),
                 label="job description",
             )
-            job_source = "job-file"
+            job_source = getattr(args, "job_source_override", "job-file")
+            if job_source not in {"job-file", "file", "pasted", "pasted_text"}:
+                raise InputError("Invalid internal local job-source classification.")
+
+    if job_description is not None:
+        validate_confirmed_job_description(job_description)
 
     source_hash = sha256_file(resume_path)
     if (
@@ -434,8 +607,8 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     if requested_linkedin_url is not None:
         run_directory = create_unique_run_dir(
             output_dir,
-            "linkedin",
-            "job-fetch",
+            "apify-linkedin",
+            "retrieval",
         )
     else:
         assert company is not None and role is not None
@@ -451,6 +624,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         "company": company,
         "role": role,
         "job_source": job_source,
+        "writer": {
+            "provider": writer_provider,
+            "name": writer_name,
+            "model": ollama_model if writer_provider == "ollama" else None,
+            "document_format": document_format,
+        },
         "source_resume": {
             "filename": resume_path.name,
             "sha256_before": source_hash,
@@ -459,7 +638,76 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         },
         "tools": {},
         "artifacts": [],
+        "revision_cycle": {
+            "state": "initial_generation",
+            "maximum_attempts": 1,
+            "attempt_count": 0,
+            "authorization": None,
+            "initial": {},
+            "revision_1": None,
+            "final_generation": None,
+        },
     }
+    analytics_job_id: int | None = None
+    analytics_application_id: int | None = None
+    analytics_event_run_identifier = run_directory.name
+    metadata["analytics"] = {
+        "schema_version": ANALYTICS_SCHEMA_VERSION,
+        "database_filename": ANALYTICS_DATABASE_FILENAME,
+        "job_id": None,
+        "application_id": None,
+        "resume_version_id": None,
+        "warnings": [],
+    }
+    analytics_setup_error: Exception | None = None
+    try:
+        analytics_path = getattr(args, "analytics_db", None)
+        if analytics_path is None:
+            analytics_path = default_analytics_database_path()
+        analytics_store: AnalyticsStore | None = AnalyticsStore(
+            analytics_path
+        )
+    except Exception as exc:  # analytics configuration is failure-isolated too
+        analytics_store = None
+        analytics_setup_error = exc
+
+    def analytics_write(operation: str, callback: Any) -> Any:
+        try:
+            if analytics_store is None:
+                assert analytics_setup_error is not None
+                raise analytics_setup_error
+            result = callback()
+        except Exception as exc:  # analytics must never invalidate a résumé run
+            warning = {
+                "operation": operation,
+                "error_type": type(exc).__name__,
+                "retryable_from_preserved_artifacts": True,
+            }
+            warnings = metadata["analytics"]["warnings"]
+            if warning not in warnings:
+                warnings.append(warning)
+            hooks.warning(
+                "Local analytics could not record "
+                f"{operation}; the résumé pipeline will continue. Preserved run "
+                "artifacts support a safe local retry.",
+                analytics_operation=operation,
+                analytics_error_type=type(exc).__name__,
+            )
+            result = None
+        try:
+            _update_metadata(
+                metadata,
+                metadata_path,
+                run_directory=run_directory,
+            )
+        except Exception as exc:  # this extra analytics checkpoint is non-critical
+            hooks.warning(
+                "The local analytics checkpoint could not be added to run metadata; "
+                "the résumé pipeline will continue.",
+                analytics_operation=operation,
+                analytics_checkpoint_error_type=type(exc).__name__,
+            )
+        return result
     if retry_inputs is not None:
         metadata["retry_of"] = retry_inputs.context.source_directory.name
         metadata["retry_kind"] = "codex-source-evidence-analysis"
@@ -478,7 +726,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         metadata["approved_analysis_reused"] = True
     if antigravity_reprocess_inputs is not None:
         metadata["provider_calls_reused"] = {
-            "linkedin": False,
+            "apify_linkedin_retrieval": False,
             "codex_analysis": False,
             "antigravity_tailoring": False,
         }
@@ -522,24 +770,22 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         elif retry_inputs is not None:
             metadata["tools"] = _analysis_dependency_versions(run_directory)
         else:
-            metadata["tools"] = _dependency_versions(run_directory)
+            metadata["tools"] = _analysis_dependency_versions(run_directory)
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
         if requested_linkedin_url is not None:
-            metadata["stage"] = "linkedin-job-extraction"
-            assert linkedin_provider_resolved is not None
-            provider_label = (
-                "Apify"
-                if linkedin_provider_resolved == "apify"
-                else "Antigravity"
-            )
+            metadata["stage"] = "apify-linkedin-retrieval"
             hooks.progress(
                 "fetching_job",
-                f"{provider_label} is retrieving the public LinkedIn posting.",
+                "Validating the LinkedIn URL and locally extracted job ID.",
             )
-            metadata["linkedin_retrieval"] = {
-                "requested_provider": linkedin_provider_requested,
-                "resolved_provider": linkedin_provider_resolved,
+            metadata["apify_linkedin_retrieval"] = {
+                "provider": "apify",
+                "interface": "Apify API v2",
+                "actor_configuration": "APIFY_ACTOR_ID",
+                "actor_input_format": "searchUrls",
+                "authentication_transport": "bearer-header",
+                "retrieval_only": True,
                 "automatic_fallback": False,
             }
             metadata["linkedin_job"] = {
@@ -548,27 +794,21 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 "linkedin_job_id": requested_linkedin_url.job_id,
             }
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            if linkedin_provider_resolved == "apify":
-                fetched_job = invoke_apify_job_extraction(
-                    requested_url=requested_linkedin_url,
-                    run_directory=run_directory,
-                    timeout_seconds=timeout_seconds,
-                    progress_handler=lambda elapsed, status: hooks.progress(
-                        "fetching_job",
-                        (
-                            "Apify job-detail retrieval is still running "
-                            f"({_elapsed_label(elapsed)}; status {status})."
-                        ),
-                    ),
-                )
-            else:
-                fetched_job = invoke_linkedin_job_extraction(
-                    requested_url=requested_linkedin_url,
-                    run_directory=run_directory,
-                    timeout_seconds=timeout_seconds,
-                    antigravity_duration=antigravity_duration,
-                )
-            job_description = fetched_job["normalized_job_description"]
+            fetched_job = invoke_apify_linkedin_retrieval(
+                requested_url=requested_linkedin_url,
+                run_directory=run_directory,
+                timeout_seconds=timeout_seconds,
+                progress_handler=lambda phase, elapsed, status: hooks.progress(
+                    "fetching_job",
+                    _apify_progress_message(phase, elapsed, status),
+                    elapsed_seconds=max(0, int(elapsed)),
+                    apify_phase=phase,
+                    actor_status=status,
+                ),
+            )
+            job_description = validate_confirmed_job_description(
+                fetched_job["normalized_job_description"]
+            )
             atomic_write_text(
                 run_directory / "job-description.txt",
                 job_description.rstrip() + "\n",
@@ -582,15 +822,34 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
             hooks.progress(
                 "confirming_posting",
-                "The posting was extracted and is waiting for explicit confirmation.",
+                "The posting was retrieved and is waiting for explicit confirmation.",
             )
             if hooks.approval_handler is None:
                 print(posting_confirmation_text(fetched_job))
+
+            def record_canonical_view() -> None:
+                nonlocal analytics_job_id, analytics_application_id
+                result = analytics_write(
+                    "the validated viewed posting",
+                    lambda: analytics_store.record_job_viewed(
+                        observation_from_canonical_job(fetched_job),
+                        run_identifier=analytics_event_run_identifier,
+                    ),
+                )
+                if result is not None:
+                    analytics_job_id = result.job_id
+                    analytics_application_id = result.application_id
+                    metadata["analytics"]["job_id"] = analytics_job_id
+                    metadata["analytics"]["application_id"] = (
+                        analytics_application_id
+                    )
+
             posting_approval = hooks.approve(
                 kind="linkedin_posting",
                 title="LinkedIn posting",
                 payload=fetched_job,
                 assume_yes=args.yes,
+                on_presented=record_canonical_view,
             )
             if posting_approval.action == "use_pasted":
                 pasted_description = str(
@@ -601,12 +860,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                         "The pasted fallback description is empty; no résumé work "
                         "was started."
                     )
-                if len(pasted_description.encode("utf-8")) > 500_000:
-                    raise InputError(
-                        "The pasted fallback description exceeds the 500,000-byte "
-                        "safety limit."
-                    )
-                job_description = pasted_description
+                job_description = validate_confirmed_job_description(
+                    pasted_description
+                )
                 job_source = "pasted-fallback"
                 metadata["job_source"] = job_source
                 metadata["linkedin_job"]["used_pasted_fallback"] = True
@@ -614,6 +870,22 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     run_directory / "job-description.txt",
                     job_description.rstrip() + "\n",
                 )
+                if analytics_job_id is not None:
+                    pasted_observation = replace(
+                        observation_from_canonical_job(fetched_job),
+                        source="pasted_text",
+                        description_sha256=job_description_sha256(job_description),
+                    )
+                    pasted_result = analytics_write(
+                        "the explicitly pasted posting observation",
+                        lambda: analytics_store.record_job_viewed(
+                            pasted_observation,
+                            run_identifier=analytics_event_run_identifier,
+                        ),
+                    )
+                    if pasted_result is not None:
+                        analytics_job_id = pasted_result.job_id
+                        analytics_application_id = pasted_result.application_id
                 hooks.progress(
                     "confirming_posting",
                     "Using the explicitly supplied pasted description for this run.",
@@ -629,13 +901,37 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
             hooks.progress(
                 "confirming_posting",
-                "Posting confirmed. The run directory now uses the extracted identity.",
+                "Posting confirmed. The run directory now uses the retrieved identity.",
                 run_directory=str(run_directory),
                 company=company,
                 role=role,
             )
 
         assert company is not None and role is not None and job_description is not None
+        if (
+            requested_linkedin_url is None
+            and retry_inputs is None
+            and antigravity_retry_inputs is None
+        ):
+            local_result = analytics_write(
+                "the validated local viewed posting",
+                lambda: analytics_store.record_job_viewed(
+                    observation_from_local_job(
+                        company=company,
+                        title=role,
+                        description=job_description,
+                        source=job_source,
+                    ),
+                    run_identifier=analytics_event_run_identifier,
+                ),
+            )
+            if local_result is not None:
+                analytics_job_id = local_result.job_id
+                analytics_application_id = local_result.application_id
+                metadata["analytics"]["job_id"] = analytics_job_id
+                metadata["analytics"]["application_id"] = (
+                    analytics_application_id
+                )
         if antigravity_retry_inputs is not None:
             job_requirements = antigravity_retry_inputs.job_requirements
         elif retry_inputs is not None:
@@ -685,6 +981,15 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             "requirement_count": len(job_requirements["requirements"]),
             "source_kind": job_requirements["source_kind"],
         }
+        if analytics_job_id is not None:
+            analytics_write(
+                "the validated job-requirement catalog",
+                lambda: analytics_store.record_requirements(
+                    analytics_job_id,
+                    job_requirements,
+                    job_description=job_description,
+                ),
+            )
         from .docx_extract import extract_resume, source_blocks_from_paragraphs
 
         metadata["stage"] = "extracting-master"
@@ -746,7 +1051,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             hooks.progress(
                 "antigravity_tailoring",
                 "Verifying and reusing the previously approved Codex analysis. "
-                "LinkedIn and Codex are not being invoked.",
+                "Apify retrieval and Codex analysis are not being invoked.",
             )
             transport_bytes = antigravity_retry_inputs.artifact_bytes[
                 "codex-analysis-transport.schema.json"
@@ -976,26 +1281,50 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 )
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            if analytics_job_id is not None:
+                analytics_write(
+                    "validated requirement gap outcomes",
+                    lambda: analytics_store.record_gap_assessments(
+                        analytics_job_id,
+                        analysis,
+                    ),
+                )
+                planned_application_id = analytics_write(
+                    "the tailoring approval",
+                    lambda: analytics_store.record_tailoring_approval(
+                        analytics_job_id,
+                        run_identifier=run_directory.name,
+                        source="pipeline",
+                    ),
+                )
+                if planned_application_id is not None:
+                    analytics_application_id = planned_application_id
+                    metadata["analytics"]["application_id"] = (
+                        analytics_application_id
+                    )
 
-            if retry_inputs is not None:
-                metadata["stage"] = "tailoring-dependency-check"
-                hooks.progress(
-                    "antigravity_tailoring",
-                    "Checking downstream tools after the renewed analysis approval.",
+            metadata["stage"] = "tailoring-dependency-check"
+            hooks.progress(
+                "antigravity_tailoring",
+                "Checking downstream tools after the Codex analysis approval.",
+            )
+            metadata["tools"].update(
+                _tailoring_dependency_versions(
+                    run_directory,
+                    writer_provider,
+                    ollama_model,
                 )
-                metadata["tools"].update(
-                    _tailoring_dependency_versions(run_directory)
-                )
-                _update_metadata(
-                    metadata,
-                    metadata_path,
-                    run_directory=run_directory,
-                )
+            )
+            _update_metadata(
+                metadata,
+                metadata_path,
+                run_directory=run_directory,
+            )
 
-        metadata["stage"] = "antigravity-tailoring-preflight"
+        metadata["stage"] = f"{writer_provider}-tailoring-preflight"
         hooks.progress(
             "antigravity_tailoring",
-            "Authenticating the approved tailoring inputs before Antigravity.",
+            f"Authenticating the approved tailoring inputs before {writer_name}.",
         )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
         try:
@@ -1008,7 +1337,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 company=company,
                 role=role,
             )
-            metadata["antigravity_tailoring_preflight"] = (
+            metadata[f"{writer_provider}_tailoring_preflight"] = (
                 verify_tailoring_run_artifacts(
                     run_directory,
                     source_resume_sha256=source_hash,
@@ -1020,9 +1349,16 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     role=role,
                 )
             )
-        except AntigravityTailoringPreflightError:
+        except AntigravityTailoringPreflightError as exc:
+            if writer_provider == "ollama":
+                raise TailoringPreflightError(
+                    "Local Qwen tailoring preflight failed. No writer request "
+                    "was launched."
+                ) from exc
             raise
         except InputError as exc:
+            if writer_provider == "ollama":
+                raise TailoringPreflightError(str(exc)) from exc
             raise AntigravityTailoringPreflightError(str(exc)) from exc
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
@@ -1036,28 +1372,73 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
             tailored_content = antigravity_reprocess_inputs.tailored_content
         else:
-            metadata["stage"] = "antigravity-tailoring"
+            metadata["stage"] = f"{writer_provider}-tailoring"
             hooks.progress(
                 "antigravity_tailoring",
-                "Antigravity is applying the approved schema-constrained edits.",
+                f"{writer_name} is writing the complete tailored résumé content "
+                "from the approved schema-constrained edits.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            tailored_content = invoke_antigravity(
-                master_content=extracted["content"],
-                extracted_resume=extracted,
-                job_description=job_description,
-                job_requirements=job_requirements,
-                approved_analysis=analysis,
-                company=company,
-                role=role,
-                run_directory=run_directory,
-                timeout_seconds=timeout_seconds,
-                antigravity_duration=antigravity_duration,
-            )
-        atomic_write_json(
-            run_directory / "tailored-content.json",
-            tailored_content,
+            if writer_provider == "ollama":
+                tailored_content = invoke_ollama(
+                    master_content=extracted["content"],
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    approved_analysis=analysis,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    model=ollama_model,
+                    heartbeat_handler=lambda elapsed, alive: hooks.progress(
+                        "antigravity_tailoring",
+                        (
+                            "Qwen is still writing locally"
+                            if alive
+                            else "Qwen completed; local validation is continuing"
+                        )
+                        + f" — elapsed {_elapsed_label(elapsed)}.",
+                        elapsed_seconds=max(0, int(elapsed)),
+                    ),
+                )
+            else:
+                tailored_content = invoke_antigravity(
+                    master_content=extracted["content"],
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    approved_analysis=analysis,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    antigravity_duration=antigravity_duration,
+                )
+        initial_content_path = run_directory / "tailored-content.initial.json"
+        atomic_write_json(initial_content_path, tailored_content)
+        initial_response_metadata = (
+            load_ollama_response_metadata(run_directory)
+            if writer_provider == "ollama"
+            else load_antigravity_response_metadata(run_directory)
         )
+        if initial_response_metadata is None:
+            raise IntegrityError(
+                f"The initial {writer_name} response metadata is unavailable."
+            )
+        metadata["revision_cycle"]["initial"] = {
+            "provider": writer_provider,
+            "model": ollama_model if writer_provider == "ollama" else None,
+            "response": dict(initial_response_metadata["response"]),
+            "response_envelope_type": initial_response_metadata[
+                "response_envelope_type"
+            ],
+            "output_format": initial_response_metadata["output_format"],
+            "tailored_content": {
+                "filename": initial_content_path.name,
+                "sha256": sha256_file(initial_content_path),
+            },
+        }
 
         metadata["stage"] = "local-evidence-check"
         hooks.progress(
@@ -1076,7 +1457,28 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             tailored_content,
             report,
         )
-        atomic_write_text(run_directory / "content-diff.md", content_diff)
+        initial_diff_path = run_directory / "content-diff.initial.md"
+        atomic_write_text(initial_diff_path, content_diff)
+        approval_artifacts = {
+            "tailored_content": _publish_authenticated_artifact(
+                initial_content_path,
+                run_directory / "tailored-content.json",
+            ),
+            "content_diff": _publish_authenticated_artifact(
+                initial_diff_path,
+                run_directory / "content-diff.md",
+            ),
+        }
+        metadata["revision_cycle"]["initial"]["validation"] = {
+            "status": "PASS" if report.passed else "BLOCKED",
+            "issues": report.issues,
+            "diff": {
+                "filename": initial_diff_path.name,
+                "sha256": sha256_file(initial_diff_path),
+            },
+            "approval_artifacts": approval_artifacts,
+        }
+        _update_metadata(metadata, metadata_path, run_directory=run_directory)
         if hooks.approval_handler is None:
             print("\n" + content_diff)
         if not report.passed:
@@ -1110,6 +1512,15 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             "status": "PASS",
             "issues": [],
         }
+        metadata["revision_cycle"]["initial"]["content_approval"] = {
+            "decision": "approved",
+            "mode": "assume_yes" if args.yes else "explicit",
+            "timestamp": utc_now_iso(),
+            "diff": {
+                "filename": initial_diff_path.name,
+                "sha256": sha256_file(initial_diff_path),
+            },
+        }
 
         metadata["stage"] = "docx-render"
         hooks.progress(
@@ -1125,18 +1536,29 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 filename_component(role, fallback="Role"),
             )
         )
-        docx_path = run_directory / f"{basename}.docx"
-        pdf_path = run_directory / f"{basename}.pdf"
-        preview_path = run_directory / "preview.png"
+        docx_path = run_directory / f"{basename}.initial.docx"
+        pdf_path = run_directory / f"{basename}.initial.pdf"
+        preview_path = run_directory / "preview.initial.png"
 
         from .docx_render import export_and_validate_pdf, render_tailored_docx
 
-        render_tailored_docx(
-            source_path=resume_path,
-            destination_path=docx_path,
-            tailored_content=tailored_content,
-            expected_source_hash=source_hash,
-        )
+        if document_format == "headless":
+            from .headless_render import render_headless_docx
+
+            render_headless_docx(
+                source_path=resume_path,
+                destination_path=docx_path,
+                tailored_content=tailored_content,
+                extracted_resume=extracted,
+                expected_source_hash=source_hash,
+            )
+        else:
+            render_tailored_docx(
+                source_path=resume_path,
+                destination_path=docx_path,
+                tailored_content=tailored_content,
+                expected_source_hash=source_hash,
+            )
         metadata["stage"] = "pdf-export-validation"
         hooks.progress(
             "rendering",
@@ -1147,15 +1569,26 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             docx_path=docx_path,
             pdf_path=pdf_path,
             preview_path=preview_path,
-            working_directory=work_directory,
-            required_text=_required_pdf_text(extracted),
+            working_directory=work_directory / "initial",
+            required_text=_required_pdf_text(
+                extracted,
+                document_format=document_format,
+            ),
         )
-        metadata["layout_validation"] = {
+        initial_layout = {
             "status": "PASS",
             "pages": 1,
             "required_text_present": True,
             "bounding_boxes_valid": True,
+            "docx": {"filename": docx_path.name, "sha256": sha256_file(docx_path)},
+            "pdf": {"filename": pdf_path.name, "sha256": sha256_file(pdf_path)},
+            "preview": {
+                "filename": preview_path.name,
+                "sha256": sha256_file(preview_path),
+            },
         }
+        metadata["layout_validation"] = initial_layout
+        metadata["revision_cycle"]["initial"]["layout_validation"] = initial_layout
 
         metadata["stage"] = "final-codex-qa"
         hooks.progress(
@@ -1171,24 +1604,421 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             content_diff=content_diff,
             preview_path=preview_path,
             run_directory=run_directory,
-            work_directory=work_directory,
+            work_directory=work_directory / "initial-qa",
             timeout_seconds=timeout_seconds,
+            generation="initial",
         )
-        if qa_result["status"] != "PASS" or qa_result["material_issues"]:
-            issues = qa_result["material_issues"] or [
-                "Codex marked the final QA as requiring review."
-            ]
-            raise QAError(
-                "Final read-only QA found a material issue. Outputs were preserved:\n"
-                + "\n".join(f"- {issue}" for issue in issues)
-            )
-        metadata["final_qa"] = {
+        initial_qa_path = run_directory / "final-qa.initial.json"
+        initial_qa_metadata = {
+            "generation": "initial",
+            "provider": "codex",
+            "session": "fresh_ephemeral_read_only",
             "status": qa_result["status"],
             "summary": qa_result["summary"],
-            "material_issues": qa_result["material_issues"],
-            "improvement_assessment": qa_result["improvement_assessment"],
+            "issues": qa_result["issues"],
+            "technical_failure": qa_result["technical_failure"],
+            "result": {
+                "filename": initial_qa_path.name,
+                "sha256": sha256_file(initial_qa_path),
+            },
         }
+        metadata["final_qa"] = initial_qa_metadata
+        metadata["revision_cycle"]["initial"]["qa"] = initial_qa_metadata
+        _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
+        if qa_result["status"] == "technical_failure":
+            metadata["revision_cycle"]["state"] = "initial_qa_technical_failure"
+            raise QAError(
+                "The first fresh read-only Codex QA could not complete reliably. "
+                "All initial artifacts were preserved; no revision was invoked."
+            )
+        if qa_result["status"] == "pass":
+            metadata["revision_cycle"]["state"] = "initial_passed_qa"
+            metadata["revision_cycle"]["final_generation"] = "initial"
+        else:
+            metadata["revision_cycle"]["state"] = "awaiting_revision_authorization"
+            metadata["stage"] = "revision-authorization"
+            hooks.progress(
+                "revision_phase",
+                f"Codex found material issues. One optional {writer_name} revision "
+                "requires explicit authorization.",
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            if hooks.approval_handler is None:
+                print("\nCodex material findings:")
+                for issue in qa_result["issues"]:
+                    print(
+                        f"- {issue['issue_id']} ({issue['category']}): "
+                        f"{issue['description']}"
+                    )
+            revision_authorization = hooks.authorize_revision(
+                payload={
+                    "qa_result": qa_result,
+                    "maximum_attempts": 1,
+                    "initial_preview": preview_path.name,
+                    "writer_provider": writer_provider,
+                    "writer_name": writer_name,
+                },
+                provider_name=writer_name,
+            )
+            authorization_record = {
+                "decision": revision_authorization.action,
+                "mode": (
+                    "web" if hooks.approval_handler is not None else "interactive"
+                ),
+                "timestamp": utc_now_iso(),
+                "yes_flag_did_not_authorize": bool(args.yes),
+            }
+            metadata["revision_cycle"]["authorization"] = authorization_record
+            if revision_authorization.action != "revise_once":
+                metadata["revision_cycle"]["state"] = "stopped_after_initial_qa"
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                raise QAError(
+                    "Codex found material issues and the optional revision was not "
+                    "authorized. Initial artifacts were preserved."
+                )
+
+            if metadata["revision_cycle"]["attempt_count"] != 0:
+                raise RevisionValidationError(
+                    "The one-revision limit was already consumed."
+                )
+            metadata["revision_cycle"]["attempt_count"] = 1
+            metadata["revision_cycle"]["state"] = "revision_1_authorized"
+            allowed_targets = approved_revision_targets(
+                qa_result=qa_result,
+                approved_analysis=analysis,
+            )
+            revision_request_path = run_directory / "revision-request.json"
+            revision_input_manifest = {
+                "version": 1,
+                "attempt": 1,
+                "maximum_attempts": 1,
+                "authorization": authorization_record,
+                "qa_issues": qa_result["issues"],
+                "allowed_target_issue_map": allowed_targets,
+                "inputs": {
+                    "source_resume_sha256": source_hash,
+                    "extracted_resume_sha256": sha256_file(
+                        run_directory / "extracted-master-resume.json"
+                    ),
+                    "approved_analysis_sha256": sha256_file(
+                        run_directory / "codex-analysis-resolved.json"
+                    ),
+                    "initial_tailored_content_sha256": sha256_file(
+                        initial_content_path
+                    ),
+                    "initial_qa_sha256": sha256_file(initial_qa_path),
+                    "revision_schema_sha256": sha256_file(
+                        schema_path(REVISION_SCHEMA_NAME)
+                    ),
+                },
+            }
+            atomic_write_json(revision_request_path, revision_input_manifest)
+            revision_input_manifest["request"] = {
+                "filename": revision_request_path.name,
+                "sha256": sha256_file(revision_request_path),
+            }
+            metadata["revision_cycle"]["revision_1"] = {
+                "state": "provider_in_progress",
+                "input_manifest": revision_input_manifest,
+            }
+            metadata["stage"] = f"{writer_provider}-revision-1"
+            hooks.progress(
+                "revision_phase",
+                f"{writer_name} is applying the one authorized QA revision.",
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            if writer_provider == "ollama":
+                revised_content = invoke_ollama_revision(
+                    current_tailored_content=tailored_content,
+                    extracted_resume=extracted,
+                    approved_analysis=analysis,
+                    qa_result=qa_result,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    attempt_number=1,
+                    model=ollama_model,
+                )
+                revision_response_metadata = load_ollama_response_metadata(
+                    run_directory,
+                    filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
+                )
+            else:
+                revised_content = invoke_antigravity_revision(
+                    current_tailored_content=tailored_content,
+                    extracted_resume=extracted,
+                    approved_analysis=analysis,
+                    qa_result=qa_result,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    antigravity_duration=antigravity_duration,
+                    attempt_number=1,
+                )
+                revision_response_metadata = load_antigravity_response_metadata(
+                    run_directory,
+                    filename=REVISION_RESPONSE_METADATA_FILENAME,
+                )
+            if revision_response_metadata is None:
+                raise IntegrityError(
+                    f"The {writer_name} revision response metadata is unavailable."
+                )
+            revised_content_path = (
+                run_directory / "tailored-content.revision-1.json"
+            )
+            atomic_write_json(revised_content_path, revised_content)
+            metadata["revision_cycle"]["revision_1"].update(
+                {
+                    "state": "local_validation",
+                    "provider": writer_provider,
+                    "model": ollama_model if writer_provider == "ollama" else None,
+                    "response": dict(revision_response_metadata["response"]),
+                    "response_envelope_type": revision_response_metadata[
+                        "response_envelope_type"
+                    ],
+                    "output_format": revision_response_metadata["output_format"],
+                    "tailored_content": {
+                        "filename": revised_content_path.name,
+                        "sha256": sha256_file(revised_content_path),
+                    },
+                }
+            )
+            metadata["stage"] = "revision-1-local-evidence-check"
+            hooks.progress(
+                "revision_phase",
+                "Python is validating revision 1 against every original evidence "
+                "and QA authorization boundary.",
+            )
+            revision_report = validate_tailored_content(
+                original=extracted["content"],
+                tailored=revised_content,
+                extracted_resume=extracted,
+                analysis=analysis,
+                target_role=role,
+            )
+            issue_map = validate_revision_scope(
+                initial_content=tailored_content,
+                revised_content=revised_content,
+                qa_result=qa_result,
+                approved_analysis=analysis,
+            )
+            master_revision_diff = build_content_diff(
+                extracted["content"],
+                revised_content,
+                revision_report,
+            )
+            revision_diff = build_revision_diff(
+                initial_content=tailored_content,
+                revised_content=revised_content,
+                issue_map=issue_map,
+                master_to_revision_diff=master_revision_diff,
+            )
+            revision_diff_path = run_directory / "content-diff.revision-1.md"
+            atomic_write_text(revision_diff_path, revision_diff)
+            if not revision_report.passed:
+                raise RevisionValidationError(
+                    "Revision 1 failed local factual, structural, or content-budget "
+                    "validation. No provider content was promoted."
+                )
+            metadata["revision_cycle"]["revision_1"]["validation"] = {
+                "status": "PASS",
+                "changed_target_issue_map": issue_map,
+                "diff": {
+                    "filename": revision_diff_path.name,
+                    "sha256": sha256_file(revision_diff_path),
+                },
+            }
+            metadata["revision_cycle"]["revision_1"]["state"] = (
+                "awaiting_content_approval"
+            )
+            metadata["stage"] = "revision-1-content-approval"
+            hooks.progress(
+                "revision_phase",
+                "Revision 1 passed local validation and awaits explicit approval.",
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            if hooks.approval_handler is None:
+                print("\n" + revision_diff)
+            revised_approval = hooks.approve_revised_content(
+                payload={
+                    "content_diff": revision_diff,
+                    "tailored_content": revised_content,
+                    "issue_map": issue_map,
+                    "evidence": {
+                        "passed": revision_report.passed,
+                        "issues": revision_report.issues,
+                        "introduced_technologies": (
+                            revision_report.introduced_technologies
+                        ),
+                        "introduced_metrics": revision_report.introduced_metrics,
+                        "introduced_role_labels": (
+                            revision_report.introduced_role_labels
+                        ),
+                        "introduced_availability": (
+                            revision_report.introduced_availability
+                        ),
+                    },
+                }
+            )
+            revised_approval_record = {
+                "decision": revised_approval.action,
+                "mode": (
+                    "web" if hooks.approval_handler is not None else "interactive"
+                ),
+                "timestamp": utc_now_iso(),
+                "yes_flag_did_not_authorize": bool(args.yes),
+            }
+            metadata["revision_cycle"]["revision_1"]["content_approval"] = (
+                revised_approval_record
+            )
+            if revised_approval.action != "approve":
+                metadata["revision_cycle"]["revision_1"]["state"] = (
+                    "content_rejected"
+                )
+                metadata["revision_cycle"]["state"] = "revision_1_rejected"
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                raise ApprovalError(
+                    "Revision 1 was rejected. Initial and revised artifacts were "
+                    "preserved; no revised document was rendered."
+                )
+
+            revision_docx_path = run_directory / f"{basename}.revision-1.docx"
+            revision_pdf_path = run_directory / f"{basename}.revision-1.pdf"
+            revision_preview_path = run_directory / "preview.revision-1.png"
+            metadata["stage"] = "revision-1-docx-render"
+            hooks.progress(
+                "revision_phase",
+                "Python is rendering the approved revision 1 without overwriting "
+                "the initial generation.",
+            )
+            if document_format == "headless":
+                render_headless_docx(
+                    source_path=resume_path,
+                    destination_path=revision_docx_path,
+                    tailored_content=revised_content,
+                    extracted_resume=extracted,
+                    expected_source_hash=source_hash,
+                )
+            else:
+                render_tailored_docx(
+                    source_path=resume_path,
+                    destination_path=revision_docx_path,
+                    tailored_content=revised_content,
+                    expected_source_hash=source_hash,
+                )
+            revision_pdf_text = export_and_validate_pdf(
+                docx_path=revision_docx_path,
+                pdf_path=revision_pdf_path,
+                preview_path=revision_preview_path,
+                working_directory=work_directory / "revision-1",
+                required_text=_required_pdf_text(
+                    extracted,
+                    document_format=document_format,
+                ),
+            )
+            revision_layout = {
+                "status": "PASS",
+                "pages": 1,
+                "required_text_present": True,
+                "bounding_boxes_valid": True,
+                "docx": {
+                    "filename": revision_docx_path.name,
+                    "sha256": sha256_file(revision_docx_path),
+                },
+                "pdf": {
+                    "filename": revision_pdf_path.name,
+                    "sha256": sha256_file(revision_pdf_path),
+                },
+                "preview": {
+                    "filename": revision_preview_path.name,
+                    "sha256": sha256_file(revision_preview_path),
+                },
+            }
+            metadata["revision_cycle"]["revision_1"]["layout_validation"] = (
+                revision_layout
+            )
+            metadata["stage"] = "revision-1-final-codex-qa"
+            hooks.progress(
+                "revision_phase",
+                "A second fresh Codex session is reviewing revision 1. No further "
+                "revision is permitted.",
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            second_qa = invoke_final_qa(
+                original_extraction=extracted,
+                job_description=job_description,
+                analysis=analysis,
+                tailored_pdf_text=revision_pdf_text,
+                content_diff=revision_diff,
+                preview_path=revision_preview_path,
+                run_directory=run_directory,
+                work_directory=work_directory / "revision-1-qa",
+                timeout_seconds=timeout_seconds,
+                generation="revision-1",
+            )
+            second_qa_path = run_directory / "final-qa.revision-1.json"
+            second_qa_metadata = {
+                "generation": "revision-1",
+                "provider": "codex",
+                "session": "fresh_ephemeral_read_only",
+                "status": second_qa["status"],
+                "summary": second_qa["summary"],
+                "issues": second_qa["issues"],
+                "technical_failure": second_qa["technical_failure"],
+                "result": {
+                    "filename": second_qa_path.name,
+                    "sha256": sha256_file(second_qa_path),
+                },
+            }
+            metadata["revision_cycle"]["revision_1"]["qa"] = second_qa_metadata
+            metadata["final_qa"] = second_qa_metadata
+            metadata["layout_validation"] = revision_layout
+            if second_qa["status"] != "pass":
+                metadata["revision_cycle"]["revision_1"]["state"] = (
+                    "qa_not_passed"
+                )
+                metadata["revision_cycle"]["state"] = "one_revision_limit_reached"
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                raise QAError(
+                    "Revision 1 did not pass the second fresh Codex QA. The "
+                    "one-revision limit was reached; all artifacts were preserved."
+                )
+            metadata["revision_cycle"]["revision_1"]["state"] = "passed_qa"
+            metadata["revision_cycle"]["state"] = "revision_1_passed_qa"
+            metadata["revision_cycle"]["final_generation"] = "revision-1"
+
+        final_generation = metadata["revision_cycle"]["final_generation"]
+        metadata["revision_cycle"]["published_artifacts"] = (
+            _publish_final_generation(
+                run_directory=run_directory,
+                basename=basename,
+                generation=final_generation,
+            )
+        )
+        _update_metadata(metadata, metadata_path, run_directory=run_directory)
+        if analytics_application_id is not None:
+            published_docx = metadata["revision_cycle"]["published_artifacts"].get(
+                "docx",
+                {},
+            )
+            artifact_reference = published_docx.get("filename")
+            qa_outcome = metadata.get("final_qa", {}).get("status")
+            if isinstance(artifact_reference, str) and isinstance(qa_outcome, str):
+                resume_version_id = analytics_write(
+                    "the successfully published résumé version",
+                    lambda: analytics_store.record_resume_version(
+                        analytics_application_id,
+                        run_identifier=run_directory.name,
+                        artifact_reference=artifact_reference,
+                        writer_provider=writer_provider,
+                        qa_outcome=qa_outcome,
+                    ),
+                )
+                if resume_version_id is not None:
+                    metadata["analytics"]["resume_version_id"] = resume_version_id
         metadata["status"] = "COMPLETE"
         metadata["stage"] = "complete"
         metadata["completed_at"] = utc_now_iso()
@@ -1212,26 +2042,60 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
     except ResumeTailorError as exc:
         caught_error = exc
         metadata["status"] = "FAILED"
+        revision_stage = "revision" in str(metadata.get("stage", ""))
         if isinstance(exc, SourceEvidenceError):
             metadata["failure_class"] = "source-evidence-analysis"
         if isinstance(exc, ApifyConfigurationError):
             metadata["failure_class"] = "apify-configuration"
-        if isinstance(exc, ApifyProviderError):
-            metadata["failure_class"] = "apify-retrieval"
+            metadata["retrieval_classification"] = exc.classification
+        if isinstance(exc, ApifyLinkedInRetrievalError):
+            metadata["failure_class"] = "apify-linkedin-retrieval"
+            metadata["retrieval_classification"] = exc.classification
         if isinstance(exc, AntigravityLaunchSizeError):
             metadata["failure_class"] = "antigravity-launch-size"
-        if isinstance(exc, LinkedInResponseEnvelopeError):
-            metadata["failure_class"] = "linkedin-response-envelope"
-        elif isinstance(exc, AntigravityResponseEnvelopeError):
-            metadata["failure_class"] = "antigravity-response-envelope"
+        if isinstance(exc, AntigravityResponseEnvelopeError):
+            metadata["failure_class"] = (
+                "antigravity-revision-response-envelope"
+                if revision_stage
+                else "antigravity-response-envelope"
+            )
         if isinstance(exc, AntigravityTailoringContractError):
             metadata["failure_class"] = "antigravity-tailoring-contract"
         if isinstance(exc, AntigravityCannotApplyError):
             metadata["failure_class"] = "antigravity-cannot-apply"
         if isinstance(exc, AntigravityTechnicalFailureError):
             metadata["failure_class"] = "antigravity-technical-failure"
+        if isinstance(exc, AntigravityRevisionContractError):
+            metadata["failure_class"] = "antigravity-revision-contract"
+        if isinstance(exc, AntigravityRevisionCannotApplyError):
+            metadata["failure_class"] = "antigravity-revision-cannot-apply"
+        if isinstance(exc, AntigravityRevisionTechnicalFailureError):
+            metadata["failure_class"] = "antigravity-revision-technical-failure"
+        if isinstance(exc, OllamaConnectionError):
+            metadata["failure_class"] = "ollama-connection"
+        if isinstance(exc, OllamaTailoringContractError):
+            metadata["failure_class"] = "ollama-tailoring-contract"
+        if isinstance(exc, OllamaCannotApplyError):
+            metadata["failure_class"] = "ollama-cannot-apply"
+        if isinstance(exc, OllamaTechnicalFailureError):
+            metadata["failure_class"] = "ollama-technical-failure"
+        if isinstance(exc, OllamaRevisionContractError):
+            metadata["failure_class"] = "ollama-revision-contract"
+        if isinstance(exc, OllamaRevisionCannotApplyError):
+            metadata["failure_class"] = "ollama-revision-cannot-apply"
+        if isinstance(exc, OllamaRevisionTechnicalFailureError):
+            metadata["failure_class"] = "ollama-revision-technical-failure"
+        if isinstance(exc, RevisionValidationError):
+            metadata["failure_class"] = "revision-local-validation"
+        if isinstance(exc, QAError):
+            metadata["failure_class"] = "codex-final-qa"
         if isinstance(exc, AntigravityTailoringPreflightError):
             metadata["failure_class"] = "antigravity-tailoring-preflight"
+        if (
+            isinstance(exc, TailoringPreflightError)
+            and not isinstance(exc, AntigravityTailoringPreflightError)
+        ):
+            metadata["failure_class"] = "ollama-tailoring-preflight"
         metadata["error"] = {
             "type": type(exc).__name__,
             "message": str(exc),
@@ -1262,6 +2126,25 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 ),
             )
             metadata["antigravity_response"] = response_metadata
+        revision_response_metadata = load_antigravity_response_metadata(
+            run_directory,
+            filename=REVISION_RESPONSE_METADATA_FILENAME,
+        )
+        if revision_response_metadata is not None:
+            revision_state = metadata.get("revision_cycle", {}).get("revision_1")
+            if isinstance(revision_state, dict):
+                revision_state["response_metadata"] = revision_response_metadata
+        ollama_response_metadata = load_ollama_response_metadata(run_directory)
+        if ollama_response_metadata is not None:
+            metadata["ollama_response"] = ollama_response_metadata
+        ollama_revision_metadata = load_ollama_response_metadata(
+            run_directory,
+            filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
+        )
+        if ollama_revision_metadata is not None:
+            revision_state = metadata.get("revision_cycle", {}).get("revision_1")
+            if isinstance(revision_state, dict):
+                revision_state["response_metadata"] = ollama_revision_metadata
         actual_hash = sha256_file(resume_path) if resume_path.is_file() else None
         unchanged = actual_hash == source_hash
         metadata["source_resume"]["sha256_after"] = actual_hash

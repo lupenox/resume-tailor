@@ -54,16 +54,127 @@ class InputError(ResumeTailorError):
     exit_code = ExitCode.INPUT
 
 
-class ApifyConfigurationError(InputError):
-    """Apify URL retrieval was selected without a usable local configuration."""
-
-
 class ModelError(ResumeTailorError):
     exit_code = ExitCode.MODEL
 
 
-class ApifyProviderError(ModelError):
-    """Apify failed to return one locally verifiable job posting."""
+class OllamaConnectionError(ModelError):
+    """The localhost-only Ollama API could not complete a bounded request."""
+
+
+class OllamaTailoringContractError(ModelError):
+    """Qwen did not satisfy the post-approval tailoring contract."""
+
+
+class OllamaCannotApplyError(ModelError):
+    """Qwen could not apply one authenticated approved edit."""
+
+
+class OllamaTechnicalFailureError(ModelError):
+    """Qwen reported a bounded technical tailoring failure."""
+
+
+class OllamaRevisionContractError(ModelError):
+    """Qwen violated the bounded one-shot revision contract."""
+
+
+class OllamaRevisionCannotApplyError(ModelError):
+    """Qwen could not apply one authenticated QA correction."""
+
+
+class OllamaRevisionTechnicalFailureError(ModelError):
+    """Qwen reported a bounded revision execution failure."""
+
+
+_APIFY_CONFIGURATION_MESSAGES = {
+    "missing_token": (
+        "LinkedIn URL retrieval requires APIFY_API_TOKEN. Preserve the complete "
+        "token, including its apify_api_ prefix, in local configuration."
+    ),
+    "missing_actor_id": (
+        "LinkedIn URL retrieval requires APIFY_ACTOR_ID set to the Actor ID or "
+        "username/actor-name used in Apify."
+    ),
+    "invalid_token": (
+        "APIFY_API_TOKEN is malformed. Store the complete token exactly as issued, "
+        "including its apify_api_ prefix and without surrounding whitespace."
+    ),
+    "invalid_actor_id": (
+        "APIFY_ACTOR_ID must be an Apify Actor ID or username/actor-name value."
+    ),
+}
+
+
+class ApifyConfigurationError(InputError):
+    """Apify retrieval configuration is absent or locally invalid."""
+
+    def __init__(self, classification: str) -> None:
+        if classification not in _APIFY_CONFIGURATION_MESSAGES:
+            classification = "invalid_actor_id"
+        self.classification = classification
+        super().__init__(_APIFY_CONFIGURATION_MESSAGES[classification])
+
+
+_APIFY_RETRIEVAL_MESSAGES = {
+    "authentication_failure": (
+        "Apify rejected authentication. Verify APIFY_API_TOKEN and its full "
+        "apify_api_ prefix."
+    ),
+    "actor_not_found": (
+        "The configured Apify Actor was not found. Verify APIFY_ACTOR_ID and "
+        "account access."
+    ),
+    "actor_timeout": "The Apify Actor did not finish before the bounded timeout.",
+    "actor_failure": "The Apify Actor run stopped without succeeding.",
+    "empty_dataset": "The Apify Actor completed but returned an empty dataset.",
+    "no_matching_result": (
+        "Apify returned no unique result matching the requested LinkedIn job URL "
+        "or job ID."
+    ),
+    "malformed_output": (
+        "The Apify result could not be normalized into the canonical job-posting "
+        "contract."
+    ),
+    "insufficient_content": (
+        "The Apify result did not contain a meaningful job title and complete "
+        "job description."
+    ),
+    "network_error": "Resume Tailor could not complete the bounded Apify HTTPS request.",
+    "rate_limited": (
+        "Apify rate-limited this retrieval. Wait for the provider limit to reset "
+        "before retrying."
+    ),
+    "provider_failure": "Apify LinkedIn retrieval stopped with a provider failure.",
+}
+
+
+class ApifyLinkedInRetrievalError(ModelError):
+    """A structured, token-free failure from Apify LinkedIn retrieval."""
+
+    def __init__(
+        self,
+        classification: str,
+        *,
+        http_status: int | None = None,
+        provider_message: str | None = None,
+        run_id: str | None = None,
+        run_status: str | None = None,
+        dataset_id: str | None = None,
+        item_count: int | None = None,
+    ) -> None:
+        if classification not in _APIFY_RETRIEVAL_MESSAGES:
+            classification = "provider_failure"
+        self.classification = classification
+        self.http_status = http_status
+        self.provider_message = provider_message
+        self.run_id = run_id
+        self.run_status = run_status
+        self.dataset_id = dataset_id
+        self.item_count = item_count
+        super().__init__(
+            _APIFY_RETRIEVAL_MESSAGES[classification]
+            + " Use pasted text, --job-file, or --clipboard as a bounded fallback."
+        )
 
 
 class AntigravityTailoringContractError(ModelError):
@@ -78,10 +189,6 @@ class AntigravityResponseEnvelopeError(ModelError):
         self.envelope_type = envelope_type
 
 
-class LinkedInResponseEnvelopeError(AntigravityResponseEnvelopeError):
-    """LinkedIn retrieval returned no documented structured-output envelope."""
-
-
 class AntigravityCannotApplyError(ModelError):
     """Antigravity could not apply one authenticated approved edit."""
 
@@ -90,7 +197,27 @@ class AntigravityTechnicalFailureError(ModelError):
     """Antigravity reported a bounded technical tailoring failure."""
 
 
-class AntigravityTailoringPreflightError(InputError):
+class AntigravityRevisionContractError(ModelError):
+    """Antigravity violated the bounded one-shot revision contract."""
+
+
+class AntigravityRevisionCannotApplyError(ModelError):
+    """Antigravity could not apply one authenticated QA correction."""
+
+
+class AntigravityRevisionTechnicalFailureError(ModelError):
+    """Antigravity reported a bounded revision execution failure."""
+
+
+class RevisionValidationError(ModelError):
+    """A revision crossed a local authorization or integrity boundary."""
+
+
+class TailoringPreflightError(InputError):
+    """Local authenticated writer inputs are incomplete or inconsistent."""
+
+
+class AntigravityTailoringPreflightError(TailoringPreflightError):
     """Local authenticated tailoring inputs are incomplete or inconsistent."""
 
 
@@ -272,7 +399,7 @@ def rename_run_directory(
             continue
         except OSError as exc:
             raise InputError(
-                f"Could not rename URL run directory for the extracted posting: {exc}"
+                f"Could not rename URL run directory for the retrieved posting: {exc}"
             ) from exc
         return candidate
     raise InputError(f"Could not create a unique run directory under {parent}")

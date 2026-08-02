@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Locally resolved final resume QA",
+  "title": "Codex final resume QA provider response",
   "type": "object",
   "additionalProperties": false,
   "required": ["status", "summary", "issues", "technical_failure"],
@@ -14,7 +14,7 @@
       "type": "array",
       "maxItems": 12,
       "uniqueItems": true,
-      "items": {"$ref": "#/$defs/resolved_issue"}
+      "items": {"$ref": "#/$defs/provider_issue"}
     },
     "technical_failure": {
       "anyOf": [
@@ -24,11 +24,10 @@
     }
   },
   "$defs": {
-    "resolved_issue": {
+    "provider_issue": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "issue_id",
         "category",
         "severity",
         "description",
@@ -38,7 +37,6 @@
         "correction_objective"
       ],
       "properties": {
-        "issue_id": {"type": "string", "pattern": "^qa\\.[0-9]{3}$"},
         "category": {
           "type": "string",
           "enum": [

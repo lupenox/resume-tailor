@@ -1,6 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Locally resolved final resume QA",
   "type": "object",
   "additionalProperties": false,
   "required": ["status", "summary", "issues", "technical_failure"],
@@ -9,12 +7,11 @@
       "type": "string",
       "enum": ["pass", "material_findings", "technical_failure"]
     },
-    "summary": {"type": "string", "minLength": 1, "maxLength": 500},
+    "summary": {"type": "string"},
     "issues": {
       "type": "array",
       "maxItems": 12,
-      "uniqueItems": true,
-      "items": {"$ref": "#/$defs/resolved_issue"}
+      "items": {"$ref": "#/$defs/provider_issue"}
     },
     "technical_failure": {
       "anyOf": [
@@ -24,11 +21,10 @@
     }
   },
   "$defs": {
-    "resolved_issue": {
+    "provider_issue": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "issue_id",
         "category",
         "severity",
         "description",
@@ -38,7 +34,6 @@
         "correction_objective"
       ],
       "properties": {
-        "issue_id": {"type": "string", "pattern": "^qa\\.[0-9]{3}$"},
         "category": {
           "type": "string",
           "enum": [
@@ -56,26 +51,18 @@
           ]
         },
         "severity": {"type": "string", "enum": ["high", "medium"]},
-        "description": {"type": "string", "minLength": 1, "maxLength": 500},
+        "description": {"type": "string"},
         "affected_content_id": {
           "anyOf": [
-            {
-              "type": "string",
-              "minLength": 2,
-              "maxLength": 100,
-              "pattern": "^[a-z][a-z0-9_.-]+$"
-            },
+            {"type": "string", "pattern": "^[a-z][a-z0-9_.-]+$"},
             {"type": "null"}
           ]
         },
         "evidence_source_ids": {
           "type": "array",
           "maxItems": 8,
-          "uniqueItems": true,
           "items": {
             "type": "string",
-            "minLength": 2,
-            "maxLength": 100,
             "pattern": "^[a-z][a-z0-9_.-]+$"
           }
         },
@@ -95,11 +82,7 @@
             "meet_content_budget"
           ]
         },
-        "correction_objective": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
-        }
+        "correction_objective": {"type": "string"}
       }
     },
     "technical_failure": {
@@ -117,7 +100,7 @@
             "other_technical_failure"
           ]
         },
-        "description": {"type": "string", "minLength": 1, "maxLength": 500}
+        "description": {"type": "string"}
       }
     }
   }

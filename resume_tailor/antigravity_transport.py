@@ -34,32 +34,19 @@ def antigravity_print_args(
     executable: str,
     schema: Path,
     print_timeout: str,
-    agent_mode: str | None = None,
-    output_format: str = "json",
 ) -> list[str]:
-    """Return prompt-free argv for Antigravity's documented stdin print mode."""
-    if agent_mode not in {None, "plan"}:
-        raise DependencyError(
-            "Unsupported Antigravity execution mode for this adapter."
-        )
-    if output_format not in {"json", "stream-json"}:
-        raise DependencyError(
-            "Unsupported Antigravity output format for this adapter."
-        )
-    args = [
+    """Return prompt-free argv for schema-constrained Antigravity authorship."""
+    return [
         executable,
         "--prompt",
         "--sandbox",
         "--output-format",
-        output_format,
+        "stream-json",
         "--json-schema",
         str(schema),
         "--print-timeout",
         print_timeout,
     ]
-    if agent_mode is not None:
-        args.insert(2, f"--mode={agent_mode}")
-    return args
 
 
 def run_antigravity_prompt(
@@ -71,8 +58,6 @@ def run_antigravity_prompt(
     print_timeout: str,
     cwd: Path,
     timeout_seconds: int,
-    agent_mode: str | None = None,
-    output_format: str = "json",
 ) -> CommandResult:
     """Run Antigravity with UTF-8 prompt bytes on stdin, never in argv or env."""
     encoded = _validated_prompt(prompt, label=prompt_label)
@@ -80,8 +65,6 @@ def run_antigravity_prompt(
         executable=executable,
         schema=schema,
         print_timeout=print_timeout,
-        agent_mode=agent_mode,
-        output_format=output_format,
     )
     try:
         return run_command(

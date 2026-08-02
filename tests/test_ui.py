@@ -12,9 +12,11 @@ import httpx
 import pytest
 
 import resume_tailor.cli as cli_module
+from resume_tailor.analytics import observation_from_local_job
 from resume_tailor.cli import run_pipeline
 from resume_tailor.docx_extract import extract_resume
 from resume_tailor.job_requirements import build_job_requirement_catalog
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
 from resume_tailor.retry import analysis_input_manifest
 from resume_tailor.schemas import load_schema
@@ -22,7 +24,7 @@ from resume_tailor.ui import COOKIE_NAME, DEFAULT_HOST, create_app
 from resume_tailor.ui_cli import build_parser as build_ui_parser
 from resume_tailor.utilities import (
     ApifyConfigurationError,
-    ApifyProviderError,
+    ApifyLinkedInRetrievalError,
     CancellationError,
     CodexSchemaCompatibilityError,
     AntigravityLaunchSizeError,
@@ -34,6 +36,15 @@ from resume_tailor.utilities import (
 
 
 JOB_URL = "https://www.linkedin.com/jobs/view/platform-engineer-4123456789/"
+
+
+def _description_with_length(length: int) -> str:
+    fragment = "Build safe Python services and automated tests. "
+    value = (fragment * ((length // len(fragment)) + 1))[:length]
+    if value[-1].isspace():
+        value = value[:-1] + "x"
+    assert len(value) == length
+    return value
 
 
 def _posting(*, injection: bool = False) -> dict[str, Any]:
@@ -49,6 +60,10 @@ def _posting(*, injection: bool = False) -> dict[str, Any]:
         "workplace_type": "hybrid",
         "employment_type": "Full-time",
         "salary": None,
+        "seniority_level": None,
+        "date_posted": None,
+        "applicant_count": None,
+        "retrieval_source": "apify",
         "normalized_job_description": (
             "Build safe Python AI orchestration systems and evaluate language "
             "model behavior with a collaborative engineering team. "
@@ -175,7 +190,7 @@ class StubbedUIPipeline:
         role = args.role
         if args.job_url is not None:
             self.calls.append("fetching_job")
-            hooks.progress("fetching_job", "Stub is extracting the posting.")
+            hooks.progress("fetching_job", "Stub is retrieving the posting.")
             if self.fetch_failure is not None:
                 raise InputError(self.fetch_failure)
             posting = _posting(injection=self.injection)
@@ -608,6 +623,7 @@ def test_ui_cli_does_not_offer_remote_binding() -> None:
     parser = build_ui_parser()
     args = parser.parse_args(["--no-browser"])
     assert args.port == 8765
+    assert args.analytics_db.name == "job-search-analytics.sqlite3"
     with pytest.raises(SystemExit):
         parser.parse_args(["--host", "0.0.0.0"])
 
@@ -679,8 +695,92 @@ def test_file_and_clipboard_text_input_modes(
             run_id = await _start(client, token, mode=mode, files=files)
             await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
             assert pipeline.namespaces[0].job_url is None
+            assert pipeline.namespaces[0].writer_provider == "ollama"
+            assert pipeline.namespaces[0].ollama_model == "resume-tailor-qwen"
+            assert pipeline.namespaces[0].job_source_override == mode
+            assert pipeline.namespaces[0].analytics_db == (
+                app.state.settings.analytics_database
+            )
             assert pipeline.job_texts
             assert "Python" in pipeline.job_texts[0]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["pasted", "file"])
+def test_6318_character_local_text_modes_reach_the_pipeline(
+    mode: str,
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = StubbedUIPipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+    description = _description_with_length(6_318)
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            files = (
+                {"job_file": ("job.txt", description.encode(), "text/plain")}
+                if mode == "file"
+                else None
+            )
+            run_id = await _start(
+                client,
+                token,
+                mode=mode,
+                files=files,
+                extra={"pasted_description": description},
+            )
+            await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
+            assert len(pipeline.job_texts[0].strip()) == 6_318
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["pasted", "file"])
+def test_over_limit_local_text_modes_report_actual_and_permitted(
+    mode: str,
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = StubbedUIPipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+    description = _description_with_length(actual)
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            files = (
+                {"job_file": ("job.txt", description.encode(), "text/plain")}
+                if mode == "file"
+                else None
+            )
+            response = await client.post(
+                "/runs",
+                data={
+                    "csrf_token": token,
+                    "resume_mode": "master",
+                    "job_mode": mode,
+                    "company": "Example Company",
+                    "role": "AI Engineer",
+                    "pasted_description": description if mode == "pasted" else "",
+                },
+                files=files,
+            )
+            assert response.status_code == 422
+            assert f"{actual:,}" in response.text
+            assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in response.text
+            assert pipeline.namespaces == []
 
     asyncio.run(scenario())
 
@@ -715,7 +815,7 @@ def test_successful_job_confirmation_and_continuation(
     asyncio.run(scenario())
 
 
-def test_url_mode_preserves_explicit_apify_provider(
+def test_url_mode_has_apify_only_retrieval_surface(
     master_resume: Path,
     tmp_path: Path,
 ) -> None:
@@ -729,22 +829,19 @@ def test_url_mode_preserves_explicit_apify_provider(
     async def scenario() -> None:
         async with _client(app) as client:
             token = await _session(client)
-            run_id = await _start(
-                client,
-                token,
-                extra={"linkedin_provider": "apify"},
-            )
+            run_id = await _start(client, token)
             await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
-            assert pipeline.namespaces[0].linkedin_provider == "apify"
+            assert not hasattr(pipeline.namespaces[0], "linkedin_provider")
             page = await client.get("/")
-            assert "Automatic — Apify when configured" in page.text
-            assert "Apify job details" in page.text
-            assert "Antigravity fallback" in page.text
+            assert "Apify sends this exact public URL" in page.text
+            assert "Retrieval provider" not in page.text
+            assert "linkedin_provider" not in page.text
+            assert "Codex uses live search" not in page.text
 
     asyncio.run(scenario())
 
 
-def test_rejected_job_confirmation_stops_before_codex(
+def test_rejected_job_confirmation_stops_before_resume_analysis(
     master_resume: Path,
     tmp_path: Path,
 ) -> None:
@@ -762,8 +859,113 @@ def test_rejected_job_confirmation_stops_before_codex(
             await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
             await _approve(client, token, run_id, action="cancel")
             await _wait(app, run_id, "CANCELLED")
+            assert "fetching_job" in pipeline.calls
             assert "codex_analysis" not in pipeline.calls
             assert not list((tmp_path / "output").rglob("*.docx"))
+
+    asyncio.run(scenario())
+
+
+def test_real_pipeline_records_view_only_after_ui_posting_gate_is_presented(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posting = _posting()
+
+    def retrieve(**kwargs: object) -> dict[str, Any]:
+        run_directory = kwargs["run_directory"]
+        assert isinstance(run_directory, Path)
+        (run_directory / "job-source.json").write_text(
+            json.dumps(posting),
+            encoding="utf-8",
+        )
+        return dict(posting)
+
+    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", retrieve)
+    monkeypatch.setattr(
+        cli_module,
+        "_analysis_dependency_versions",
+        lambda _directory: {"resume_tailor": "synthetic", "codex": "synthetic"},
+    )
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token)
+            await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
+            snapshot = app.state.manager.snapshot(run_id)
+            assert snapshot["approval"]["kind"] == "linkedin_posting"
+            summary = app.state.analytics_store.summary()
+            assert summary["totals"]["unique_jobs_viewed"] == 1
+            assert summary["totals"]["jobs_approved_for_tailoring"] == 0
+            await _approve(client, token, run_id, action="cancel")
+            await _wait(app, run_id, "CANCELLED")
+
+    asyncio.run(scenario())
+
+
+def test_real_pipeline_failed_retrieval_is_not_counted_as_viewed(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_apify_linkedin_retrieval",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ApifyLinkedInRetrievalError("malformed_output")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_analysis_dependency_versions",
+        lambda _directory: {"resume_tailor": "synthetic", "codex": "synthetic"},
+    )
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token)
+            await _wait(app, run_id, "FAILED")
+            assert app.state.analytics_store.summary()["totals"]["unique_jobs_viewed"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_real_ui_pasted_input_keeps_pasted_analytics_source(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUB_CODEX_MODE", "questions")
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token, mode="pasted")
+            await _wait(app, run_id, "FAILED")
+            exported = app.state.analytics_store.sanitized_export()
+            assert exported["jobs"][0]["source"] == "pasted_text"
+            assert exported["aggregate_statistics"]["totals"]["unique_jobs_viewed"] == 1
 
     asyncio.run(scenario())
 
@@ -797,6 +999,39 @@ def test_use_pasted_description_from_confirmation_gate(
             assert (
                 Path(run["artifact_directory"]) / "job-description.txt"
             ).read_text(encoding="utf-8").startswith("Complete manually")
+
+    asyncio.run(scenario())
+
+
+def test_over_limit_confirmation_fallback_reports_actual_and_permitted(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = StubbedUIPipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token)
+            await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
+            response = await _approve(
+                client,
+                token,
+                run_id,
+                action="use_pasted",
+                fallback="x" * actual,
+            )
+            assert response.status_code == 409
+            detail = response.json()["detail"]
+            assert f"{actual:,}" in detail
+            assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in detail
+            assert app.state.manager.snapshot(run_id)["status"] == "AWAITING_APPROVAL"
 
     asyncio.run(scenario())
 
@@ -869,11 +1104,11 @@ def test_successful_completed_run_results(
 @pytest.mark.parametrize(
     "failure",
     [
-        "The LinkedIn posting requires login. Retry with --job-file.",
-        "Antigravity read_url(linkedin.com) permission was denied.",
+        "Apify authentication failed. Retry with --job-file.",
+        "The configured Apify Actor was unavailable.",
     ],
 )
-def test_failed_fetch_and_permission_denial(
+def test_failed_retrieval_messages_are_safe(
     failure: str,
     master_resume: Path,
     tmp_path: Path,
@@ -897,20 +1132,25 @@ def test_failed_fetch_and_permission_denial(
 
 
 @pytest.mark.parametrize(
-    ("error", "expected"),
+    ("classification", "expected"),
     [
-        (
-            ApifyConfigurationError("APIFY_API_TOKEN is missing."),
-            "Apify configuration required",
-        ),
-        (
-            ApifyProviderError("Provider response content was omitted."),
-            "Apify job-detail retrieval failed",
-        ),
+        ("missing_token", "Apify token configuration required"),
+        ("missing_actor_id", "Apify Actor configuration required"),
+        ("authentication_failure", "Apify authentication failed"),
+        ("actor_not_found", "Apify Actor not found"),
+        ("actor_timeout", "Apify Actor timed out"),
+        ("actor_failure", "Apify Actor run failed"),
+        ("empty_dataset", "Empty Apify dataset"),
+        ("no_matching_result", "LinkedIn result mismatch"),
+        ("insufficient_content", "Incomplete LinkedIn content"),
+        ("network_error", "Apify network failure"),
+        ("rate_limited", "Apify rate limit reached"),
+        ("provider_failure", "Apify retrieval provider failure"),
+        ("malformed_output", "Apify result format failure"),
     ],
 )
-def test_apify_failures_are_stage_specific_and_sanitized(
-    error: Exception,
+def test_apify_retrieval_failures_are_classified_and_sanitized(
+    classification: str,
     expected: str,
     master_resume: Path,
     tmp_path: Path,
@@ -920,14 +1160,21 @@ def test_apify_failures_are_stage_specific_and_sanitized(
         *,
         hooks: PipelineHooks,
     ) -> Path:
-        run_directory = args.output_dir / "apify-failure"
+        run_directory = args.output_dir / "apify-retrieval-failure"
         run_directory.mkdir(mode=0o700)
         hooks.progress(
             "fetching_job",
             "Retrieving the posting with Apify.",
             run_directory=str(run_directory),
         )
-        raise error
+        if classification in {
+            "missing_token",
+            "missing_actor_id",
+            "invalid_token",
+            "invalid_actor_id",
+        }:
+            raise ApifyConfigurationError(classification)
+        raise ApifyLinkedInRetrievalError(classification)
 
     app = create_app(
         output_directory=tmp_path / "output",
@@ -938,17 +1185,15 @@ def test_apify_failures_are_stage_specific_and_sanitized(
     async def scenario() -> None:
         async with _client(app) as client:
             token = await _session(client)
-            run_id = await _start(
-                client,
-                token,
-                extra={"linkedin_provider": "apify"},
-            )
+            run_id = await _start(client, token)
             failed = await _wait(app, run_id, "FAILED")
             assert "synthetic-secret-token" not in failed["message"]
             assert "PRIVATE POSTING" not in failed["message"]
+            assert failed["retrieval_classification"] == classification
             page = await client.get(f"/runs/{run_id}")
             assert expected in page.text
-            assert "does not silently call a second provider" in page.text
+            assert "does not invent missing content" in page.text
+            assert "No résumé content was sent" in page.text
             assert "synthetic-secret-token" not in page.text
             assert "PRIVATE POSTING" not in page.text
 
@@ -1094,9 +1339,9 @@ def test_antigravity_launch_failure_guidance_and_authenticated_recovery(
     )
     monkeypatch.setattr(
         cli_module,
-        "invoke_linkedin_job_extraction",
+        "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail(
-            "LinkedIn ran during Antigravity recovery"
+            "Apify retrieval ran during Antigravity recovery"
         ),
     )
     app = create_app(
@@ -1199,9 +1444,9 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
     )
     monkeypatch.setattr(
         cli_module,
-        "invoke_linkedin_job_extraction",
+        "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail(
-            "LinkedIn ran during Antigravity recovery"
+            "Apify retrieval ran during Antigravity recovery"
         ),
     )
     app = create_app(
@@ -1272,20 +1517,34 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
     }
 
 
-def test_linkedin_envelope_failure_shows_retrieval_only_recovery(
+def test_apify_result_format_failure_shows_safe_input_fallback(
     master_resume: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output_directory = tmp_path / "output"
-    monkeypatch.setenv("STUB_LINKEDIN_MODE", "print_response_prose")
+
+    def fail(**kwargs: object) -> dict[str, object]:
+        run_directory = kwargs["run_directory"]
+        assert isinstance(run_directory, Path)
+        atomic_write_json(
+            run_directory / "apify-linkedin-retrieval-diagnostic.json",
+            {
+                "provider": "apify",
+                "classification": "malformed_output",
+                "provider_output_omitted": True,
+                "api_token_omitted": True,
+            },
+        )
+        raise ApifyLinkedInRetrievalError("malformed_output")
+
+    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", fail)
     monkeypatch.setattr(
         cli_module,
-        "_dependency_versions",
+        "_analysis_dependency_versions",
         lambda _cwd: {
             "resume_tailor": "0.1.0",
             "codex": "stub",
-            "antigravity": "stub",
         },
     )
     code = cli_module.main(
@@ -1313,10 +1572,10 @@ def test_linkedin_envelope_failure_shows_retrieval_only_recovery(
             await _session(client)
             page = await client.get(f"/runs/history-{source_run.name}")
             assert page.status_code == 200
-            assert "LinkedIn response-format failure" in page.text
+            assert "Apify result format failure" in page.text
             assert "Use another job input" in page.text
-            assert "No résumé analysis or tailoring was started" in page.text
-            assert "linkedin-response-envelope.json" in page.text
+            assert "No résumé content was sent for analysis or tailoring" in page.text
+            assert "apify-linkedin-retrieval-diagnostic.json" in page.text
             assert "Retry Antigravity tailoring" not in page.text
             assert "Reprocess preserved Antigravity response" not in page.text
             assert "Offline reprocessing unavailable" not in page.text
@@ -1349,7 +1608,7 @@ def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(
     )
     monkeypatch.setattr(
         cli_module,
-        "invoke_linkedin_job_extraction",
+        "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail("LinkedIn ran during offline reprocessing"),
     )
     monkeypatch.setattr(
@@ -1400,7 +1659,7 @@ def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(
             )
             assert metadata["retry_kind"] == "antigravity-response-reprocess"
             assert metadata["provider_calls_reused"] == {
-                "linkedin": False,
+                "apify_linkedin_retrieval": False,
                 "codex_analysis": False,
                 "antigravity_tailoring": False,
             }
@@ -1790,5 +2049,147 @@ def test_artifact_download_and_path_traversal(
                 "/runs/history-unrelated/artifacts/private.pdf"
             )
             assert rejected_directory.status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_local_analytics_dashboard_and_explicit_tracking_actions(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    analytics_path = tmp_path / "private-data" / "job-search-analytics.sqlite3"
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=analytics_path,
+        pipeline_runner=StubbedUIPipeline(),
+    )
+    tracked = app.state.analytics_store.record_job_viewed(
+        observation_from_local_job(
+            company="Example Company",
+            title="Senior Platform Engineer",
+            description="Build safe PostgreSQL services with continuous integration.",
+            source="pasted_text",
+        )
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            page = await client.get("/analytics")
+            assert page.status_code == 200
+            assert "Job-search analytics" in page.text
+            assert "Unique jobs viewed" in page.text
+            assert "Applications submitted" in page.text
+            assert "Not enough data" in page.text
+            assert "Save job" in page.text
+            assert "Mark applied" in page.text
+            assert "Record screening" in page.text
+            assert "Record interview" in page.text
+            assert "Record rejection" in page.text
+            assert "Record offer" in page.text
+            assert "Withdraw application" in page.text
+            assert "Correct status" in page.text
+            assert "Add note" in page.text
+
+            saved = await client.post(
+                f"/analytics/applications/{tracked.application_id}/status",
+                data={"csrf_token": token, "action": "save"},
+            )
+            assert saved.status_code == 303
+            applied = await client.post(
+                f"/analytics/applications/{tracked.application_id}/status",
+                data={"csrf_token": token, "action": "apply"},
+            )
+            assert applied.status_code == 303
+
+            unconfirmed_correction = await client.post(
+                f"/analytics/applications/{tracked.application_id}/correction",
+                data={
+                    "csrf_token": token,
+                    "new_status": "saved",
+                    "note": "Correct the prior click",
+                },
+            )
+            assert unconfirmed_correction.status_code == 422
+            corrected = await client.post(
+                f"/analytics/applications/{tracked.application_id}/correction",
+                data={
+                    "csrf_token": token,
+                    "new_status": "saved",
+                    "note": "Correct the prior click",
+                    "confirm_correction": "yes",
+                },
+            )
+            assert corrected.status_code == 303
+
+            unconfirmed_interview = await client.post(
+                f"/analytics/applications/{tracked.application_id}/interviews",
+                data={
+                    "csrf_token": token,
+                    "interview_type": "technical_interview",
+                },
+            )
+            assert unconfirmed_interview.status_code == 422
+            interview = await client.post(
+                f"/analytics/applications/{tracked.application_id}/interviews",
+                data={
+                    "csrf_token": token,
+                    "interview_type": "technical_interview",
+                    "scheduled_at": "2026-08-10T09:30",
+                    "contact_label": "Engineering panel",
+                    "confirm_interview": "yes",
+                },
+            )
+            assert interview.status_code == 303
+            note = await client.post(
+                f"/analytics/applications/{tracked.application_id}/notes",
+                data={"csrf_token": token, "note": "Prepare system design examples"},
+            )
+            assert note.status_code == 303
+
+            history = app.state.analytics_store.application_history(
+                tracked.application_id
+            )
+            assert [item["event_kind"] for item in history].count("correction") == 1
+            assert history[-1]["new_status"] == "technical_interview"
+            refreshed = await client.get("/analytics")
+            assert refreshed.status_code == 200
+            assert "Active interviews" in refreshed.text
+            assert "technical interview" in refreshed.text.casefold()
+
+    asyncio.run(scenario())
+
+
+def test_analytics_routes_require_local_session_and_csrf(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=StubbedUIPipeline(),
+    )
+    tracked = app.state.analytics_store.record_job_viewed(
+        observation_from_local_job(
+            company="Example Company",
+            title="Platform Engineer",
+            description="Build safe local systems.",
+            source="file",
+        )
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as anonymous:
+            denied = await anonymous.get("/analytics")
+            assert denied.status_code == 403
+        async with _client(app) as client:
+            await _session(client)
+            denied = await client.post(
+                f"/analytics/applications/{tracked.application_id}/status",
+                data={"csrf_token": "wrong", "action": "apply"},
+            )
+            assert denied.status_code == 403
 
     asyncio.run(scenario())

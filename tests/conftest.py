@@ -47,22 +47,25 @@ def installer_source(repository_root: Path, tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def stubs_on_path(monkeypatch: pytest.MonkeyPatch, repository_root: Path) -> Path:
+def stubs_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+    repository_root: Path,
+    tmp_path: Path,
+) -> Path:
     stubs = repository_root / "tests" / "stubs"
     monkeypatch.setenv("PATH", f"{stubs}:{os.environ['PATH']}")
     monkeypatch.delenv("STUB_CODEX_MODE", raising=False)
     monkeypatch.delenv("STUB_AGY_MODE", raising=False)
     for name in (
-        "STUB_LINKEDIN_MODE",
-        "STUB_LINKEDIN_COMPANY",
-        "STUB_LINKEDIN_TITLE",
-        "STUB_LINKEDIN_LOCATION",
-        "STUB_LINKEDIN_WORKPLACE",
-        "STUB_LINKEDIN_FINAL_URL",
+        "STUB_CODEX_INVOCATION_LOG",
+        "APIFY_API_TOKEN",
+        "APIFY_ACTOR_ID",
     ):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("APIFY_API_TOKEN", raising=False)
-    monkeypatch.delenv("RESUME_TAILOR_APIFY_ACTOR", raising=False)
+    monkeypatch.setenv(
+        "RESUME_TAILOR_ANALYTICS_DB",
+        str(tmp_path / "application-data" / "job-search-analytics.sqlite3"),
+    )
     return stubs
 
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "LinkedIn job extraction",
+  "title": "Canonical LinkedIn job posting",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -25,15 +25,7 @@
   "properties": {
     "fetch_status": {
       "type": "string",
-      "enum": [
-        "success",
-        "login_required",
-        "expired",
-        "unavailable",
-        "insufficient_content",
-        "permission_denied",
-        "extraction_failed"
-      ]
+      "const": "success"
     },
     "requested_url": {
       "type": "string",
@@ -41,31 +33,31 @@
       "maxLength": 2048
     },
     "final_resolved_url": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {"type": "string", "minLength": 1, "maxLength": 2048}
       ]
     },
     "linkedin_job_id": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {"type": "string", "pattern": "^[0-9]{5,20}$"}
       ]
     },
     "job_title": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {"type": "string", "minLength": 1, "maxLength": 300}
       ]
     },
     "company": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {"type": "string", "minLength": 1, "maxLength": 300}
       ]
     },
     "location": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {"type": "string", "minLength": 1, "maxLength": 500}
       ]
@@ -75,20 +67,43 @@
       "enum": ["remote", "hybrid", "on-site", "unspecified"]
     },
     "employment_type": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {"type": "string", "minLength": 1, "maxLength": 200}
       ]
     },
     "salary": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {"type": "string", "minLength": 1, "maxLength": 500}
       ]
     },
+    "seniority_level": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 300}
+      ]
+    },
+    "date_posted": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 200}
+      ]
+    },
+    "applicant_count": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 0},
+        {"type": "string", "minLength": 1, "maxLength": 200}
+      ]
+    },
+    "retrieval_source": {
+      "type": "string",
+      "const": "apify"
+    },
     "normalized_job_description": {
       "type": "string",
-      "maxLength": 200000
+      "maxLength": 25000
     },
     "responsibilities": {
       "type": "array",

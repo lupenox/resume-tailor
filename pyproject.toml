@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "resume-tailor"
 version = "0.1.0"
-description = "Truthful, human-gated resume tailoring with Codex and Antigravity"
+description = "Truthful, human-gated resume tailoring with Codex and local Qwen"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}

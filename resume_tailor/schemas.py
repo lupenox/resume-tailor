@@ -19,7 +19,7 @@ SCHEMA_DIRECTORY = Path(__file__).resolve().parent.parent / "schemas"
 
 CODEX_TRANSPORT_SCHEMAS = {
     "codex_analysis.schema.json": "codex_analysis.openai.schema.json",
-    "final_qa.schema.json": "final_qa.openai.schema.json",
+    "final_qa_provider.schema.json": "final_qa_provider.openai.schema.json",
 }
 CODEX_ANALYSIS_RUN_SCHEMA_NAME = "codex-analysis-transport.schema.json"
 
@@ -160,11 +160,28 @@ def validate_payload(payload: Any, schema_name: str, *, label: str) -> None:
 
 
 def parse_json_text(text: str, *, label: str) -> Any:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object key")
+            value[key] = item
+        return value
+
+    def reject_nonfinite(_value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
+        return json.loads(
+            text,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_nonfinite,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        line = exc.lineno if isinstance(exc, json.JSONDecodeError) else 1
+        column = exc.colno if isinstance(exc, json.JSONDecodeError) else 1
         raise ModelError(
-            f"{label} did not return valid JSON (line {exc.lineno}, column {exc.colno})."
+            f"{label} did not return valid JSON (line {line}, column {column})."
         ) from exc
 
 

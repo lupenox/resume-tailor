@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Resume writer tailored resume response",
+  "title": "Resume writer one-shot resume revision response",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,39 +15,28 @@
       "type": "string",
       "enum": ["complete", "cannot_apply", "technical_failure"]
     },
-    "message": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 500
-    },
+    "message": {"type": "string", "minLength": 1, "maxLength": 500},
     "cannot_apply": {
       "oneOf": [
         {"type": "null"},
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["edit_id", "reason_code", "reason"],
+          "required": ["issue_id", "reason_code", "reason"],
           "properties": {
-            "edit_id": {
-              "type": "string",
-              "pattern": "^edit\\.[0-9]{3}$"
-            },
+            "issue_id": {"type": "string", "pattern": "^qa\\.[0-9]{3}$"},
             "reason_code": {
               "type": "string",
               "enum": [
-                "target_not_applicable",
-                "evidence_conflict",
+                "correction_not_supported",
+                "approved_boundary_conflict",
                 "immutable_fact_conflict",
                 "content_budget_conflict",
-                "unsupported_claim_risk",
+                "structure_conflict",
                 "other_bounded_constraint"
               ]
             },
-            "reason": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 500
-            }
+            "reason": {"type": "string", "minLength": 1, "maxLength": 500}
           }
         }
       ]
@@ -70,11 +59,7 @@
                 "other_technical_failure"
               ]
             },
-            "reason": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 500
-            }
+            "reason": {"type": "string", "minLength": 1, "maxLength": 500}
           }
         }
       ]

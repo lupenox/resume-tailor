@@ -17,6 +17,7 @@ from typing import Callable
 import uvicorn
 
 from . import __version__
+from .analytics import default_analytics_database_path
 from .ui import DEFAULT_HOST, DEFAULT_PORT, create_app, default_output_directory
 from .utilities import parse_duration
 
@@ -64,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=default_output_directory(),
         help="local run-artifact parent directory",
+    )
+    parser.add_argument(
+        "--analytics-db",
+        type=Path,
+        default=default_analytics_database_path(),
+        help="private local SQLite analytics database (default: XDG application data)",
     )
     parser.add_argument(
         "--timeout",
@@ -241,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
 
     app = create_app(
         output_directory=args.output_dir,
+        analytics_database_path=args.analytics_db,
         timeout=args.timeout,
         port=args.port,
     )

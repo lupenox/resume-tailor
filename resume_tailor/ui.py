@@ -30,15 +30,26 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.datastructures import FormData, UploadFile
 
 from . import __version__
-from .apify_job import resolve_linkedin_provider
+from .analytics import (
+    APPLICATION_STATUSES,
+    INTERVIEW_TYPES,
+    AnalyticsError,
+    AnalyticsStore,
+    default_analytics_database_path,
+)
 from .cli import _validate_label, run_pipeline
 from .docx_extract import validate_template
 from .linkedin_job import validate_linkedin_url
+from .job_text import (
+    MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS,
+    validate_confirmed_job_description,
+)
 from .orchestration import (
     ApprovalRequest,
     ApprovalResponse,
     PipelineHooks,
 )
+from .ollama_writer import DEFAULT_OLLAMA_MODEL
 from .retry import (
     antigravity_retry_failure_kind,
     build_antigravity_reprocess_context,
@@ -47,7 +58,7 @@ from .retry import (
 )
 from .utilities import (
     ApifyConfigurationError,
-    ApifyProviderError,
+    ApifyLinkedInRetrievalError,
     ApprovalError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
@@ -58,10 +69,17 @@ from .utilities import (
     CancellationError,
     CodexSchemaCompatibilityError,
     InputError,
-    LinkedInResponseEnvelopeError,
     ModelError,
+    OllamaCannotApplyError,
+    OllamaConnectionError,
+    OllamaRevisionCannotApplyError,
+    OllamaRevisionContractError,
+    OllamaRevisionTechnicalFailureError,
+    OllamaTailoringContractError,
+    OllamaTechnicalFailureError,
     ResumeTailorError,
     SourceEvidenceError,
+    TailoringPreflightError,
     atomic_write_text,
     parse_duration,
     utc_now_iso,
@@ -77,22 +95,22 @@ COOKIE_NAME = "resume_tailor_session"
 
 WORKFLOW_STAGES: tuple[tuple[str, str], ...] = (
     ("validating_input", "Validating input"),
-    ("fetching_job", "Fetching job posting"),
+    ("fetching_job", "Apify job retrieval"),
     ("confirming_posting", "Confirming posting"),
     ("codex_analysis", "Codex analysis"),
     ("reviewing_changes", "Reviewing proposed changes"),
-    ("antigravity_tailoring", "Antigravity tailoring"),
+    ("antigravity_tailoring", "Qwen résumé writing"),
     ("evidence_validation", "Evidence validation"),
     ("rendering", "Rendering DOCX/PDF"),
-    ("final_qa", "Final Codex QA"),
+    ("final_qa", "Initial Codex QA"),
+    ("revision_phase", "Optional one-shot revision"),
     ("complete", "Complete"),
 )
 _STAGE_INDEX = {name: index for index, (name, _) in enumerate(WORKFLOW_STAGES)}
 _TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
 _DOWNLOAD_EXACT = {
     "job-source.json",
-    "apify-job-response.json",
-    "linkedin-response-envelope.json",
+    "apify-linkedin-retrieval-diagnostic.json",
     "job-description.txt",
     "job-requirements.json",
     "extracted-master-resume.json",
@@ -101,11 +119,33 @@ _DOWNLOAD_EXACT = {
     "codex-analysis-normalization-warnings.json",
     "codex-analysis-transport.schema.json",
     "antigravity-response.json",
+    "antigravity-response-envelope.json",
+    "antigravity-revision-response.json",
+    "antigravity-revision-response-envelope.json",
+    "ollama-response.json",
+    "ollama-response-envelope.json",
+    "ollama-tailoring-transport.schema.json",
+    "ollama-revision-response.json",
+    "ollama-revision-response-envelope.json",
+    "ollama-revision-transport.schema.json",
+    "revision-request.json",
     "tailored-content.json",
+    "tailored-content.initial.json",
+    "tailored-content.revision-1.json",
     "content-diff.md",
+    "content-diff.initial.md",
+    "content-diff.revision-1.md",
     "preview.png",
+    "preview.initial.png",
+    "preview.revision-1.png",
     "final-qa.md",
+    "final-qa.initial.json",
+    "final-qa.initial.md",
+    "final-qa.revision-1.json",
+    "final-qa.revision-1.md",
     "final-qa-normalization-warnings.json",
+    "final-qa.initial.normalization-warnings.json",
+    "final-qa.revision-1.normalization-warnings.json",
     "run-metadata.json",
 }
 
@@ -125,6 +165,7 @@ class UISettings:
     master_resume: Path
     launch_token: str
     timeout: tuple[int, str]
+    analytics_database: Path
 
 
 @dataclass
@@ -142,6 +183,7 @@ class RunRecord:
     artifact_directory: Path | None = None
     error: str | None = None
     failure_kind: str | None = None
+    retrieval_classification: str | None = None
     events: list[dict[str, str]] = field(default_factory=list)
     approval: ApprovalRequest | None = None
     approval_response: ApprovalResponse | None = None
@@ -352,6 +394,12 @@ class RunManager:
                 payload,
             ),
             approval_handler=lambda request: self._await_approval(run_id, request),
+            approval_handler_presents=True,
+            warning_handler=lambda message, payload: self._warning(
+                run_id,
+                message,
+                payload,
+            ),
             cancel_event=record.cancel_event,
         )
         try:
@@ -376,6 +424,11 @@ class RunManager:
                 record.status = "FAILED"
                 record.error = _sanitized_technical_details(exc)
                 record.failure_kind = _failure_kind_for_error(exc, record.stage)
+                if isinstance(
+                    exc,
+                    (ApifyConfigurationError, ApifyLinkedInRetrievalError),
+                ):
+                    record.retrieval_classification = exc.classification
                 record.message = _safe_error_message(exc)
                 record.approval = None
                 record.events.append(
@@ -464,6 +517,27 @@ class RunManager:
             record.revision += 1
             self._condition.notify_all()
 
+    def _warning(
+        self,
+        run_id: str,
+        message: str,
+        _payload: Mapping[str, Any],
+    ) -> None:
+        with self._condition:
+            record = self._records[run_id]
+            safe_message = message[:500]
+            record.message = safe_message
+            record.events.append(
+                {
+                    "time": _clock_text(),
+                    "stage": record.stage,
+                    "message": safe_message,
+                }
+            )
+            record.events[:] = record.events[-100:]
+            record.revision += 1
+            self._condition.notify_all()
+
     def _await_approval(
         self,
         run_id: str,
@@ -490,6 +564,8 @@ class RunManager:
                 }
             )
             record.revision += 1
+            if request.on_presented is not None:
+                request.on_presented()
             self._condition.notify_all()
             while record.approval_response is None:
                 if record.cancel_event.is_set():
@@ -501,7 +577,13 @@ class RunManager:
             response = record.approval_response
             record.approval = None
             record.approval_response = None
-            if response.action in {"approve", "use_pasted"}:
+            if response.action in {
+                "approve",
+                "use_pasted",
+                "revise_once",
+                "stop",
+                "reject",
+            }:
                 record.status = "RUNNING"
                 record.message = f"{request.title} approved."
                 record.events.append(
@@ -527,11 +609,14 @@ class RunManager:
             if record.status != "AWAITING_APPROVAL" or record.approval is None:
                 raise InputError("This run is not currently waiting for approval.")
             kind = record.approval.kind
-            allowed = (
-                {"approve", "cancel", "use_pasted"}
-                if kind == "linkedin_posting"
-                else {"approve", "cancel"}
-            )
+            if kind == "linkedin_posting":
+                allowed = {"approve", "cancel", "use_pasted"}
+            elif kind == "qa_revision":
+                allowed = {"revise_once", "stop", "cancel"}
+            elif kind == "revised_content":
+                allowed = {"approve", "reject", "cancel"}
+            else:
+                allowed = {"approve", "cancel"}
             if action not in allowed:
                 raise InputError("That approval action is not valid for this gate.")
             data: dict[str, Any] = {}
@@ -539,10 +624,7 @@ class RunManager:
                 description = job_description.strip()
                 if not description:
                     raise InputError("Paste a complete job description first.")
-                if len(description.encode("utf-8")) > MAX_JOB_BYTES:
-                    raise InputError(
-                        "The pasted job description exceeds the 500,000-byte limit."
-                    )
+                validate_confirmed_job_description(description)
                 data["job_description"] = description
             if action == "cancel":
                 record.cancel_event.set()
@@ -595,8 +677,30 @@ class RunManager:
         company = record.company or metadata.get("company")
         role = record.role or metadata.get("role")
         artifacts = _artifact_entries(record.artifact_directory)
-        pdf = next((item["name"] for item in artifacts if item["kind"] == "PDF"), None)
+        final_generation = (
+            metadata.get("revision_cycle", {}).get("final_generation")
+            if isinstance(metadata.get("revision_cycle"), dict)
+            else None
+        )
+        generation_marker = (
+            ".revision-1." if final_generation == "revision-1" else ".initial."
+        )
+        pdf = next(
+            (
+                item["name"]
+                for item in artifacts
+                if item["kind"] == "PDF" and generation_marker in item["name"]
+            ),
+            next(
+                (item["name"] for item in artifacts if item["kind"] == "PDF"),
+                None,
+            ),
+        )
         failure_kind = record.failure_kind or _failure_kind_from_metadata(metadata)
+        retrieval_classification = (
+            record.retrieval_classification
+            or _retrieval_classification_from_metadata(metadata)
+        )
         retry_eligible, retry_reason = self._retry_state(
             record.artifact_directory,
             failure_kind=failure_kind,
@@ -632,6 +736,7 @@ class RunManager:
             ),
             "error": record.error,
             "failure_kind": failure_kind,
+            "retrieval_classification": retrieval_classification,
             "retry_eligible": retry_eligible,
             "retry_reason": retry_reason,
             "antigravity_retry_eligible": antigravity_retry_eligible,
@@ -643,6 +748,7 @@ class RunManager:
             "revision": record.revision,
             "artifacts": artifacts,
             "pdf_name": pdf,
+            "final_generation": final_generation,
             "metadata": metadata,
         }
 
@@ -754,6 +860,7 @@ class RunManager:
         status = str(metadata.get("status", "UNKNOWN"))
         stage = _ui_stage_from_metadata(str(metadata.get("stage", "")))
         failure_kind = _failure_kind_from_metadata(metadata)
+        retrieval_classification = _retrieval_classification_from_metadata(metadata)
         artifacts = _artifact_entries(run_directory)
         pdf = next((item["name"] for item in artifacts if item["kind"] == "PDF"), None)
         retry_eligible, retry_reason = self._retry_state(
@@ -794,25 +901,17 @@ class RunManager:
                 "argument vector before provider startup. Prompt content is omitted."
             )
             message = _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
-        elif failure_kind == "linkedin_response_envelope":
+        elif failure_kind == "apify_linkedin_retrieval":
             technical = (
-                "Antigravity's terminal LinkedIn retrieval event did not contain "
-                "one schema-valid structured result. Provider prose and posting "
+                "Apify LinkedIn retrieval was rejected with the bounded local "
+                f"classification {retrieval_classification or 'provider_failure'}. "
+                "The API token, authorization header, raw Actor result, and posting "
                 "content are omitted."
             )
-            message = _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE
-        elif failure_kind == "apify_configuration":
-            technical = (
-                "Apify URL retrieval was selected without a usable local API-token "
-                "configuration. No token value is stored or displayed."
+            message = _APIFY_LINKEDIN_UI_MESSAGES.get(
+                retrieval_classification or "provider_failure",
+                _APIFY_LINKEDIN_UI_MESSAGES["provider_failure"],
             )
-            message = _APIFY_CONFIGURATION_UI_MESSAGE
-        elif failure_kind == "apify_retrieval":
-            technical = (
-                "Apify did not return exactly one locally verifiable, schema-valid "
-                "job-detail record. Provider response content is omitted."
-            )
-            message = _APIFY_RETRIEVAL_UI_MESSAGE
         elif failure_kind == "antigravity_response_envelope":
             technical = (
                 "Antigravity returned a documented print-mode JSON wrapper, but "
@@ -839,6 +938,36 @@ class RunManager:
                 "Provider prose is omitted."
             )
             message = _ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE
+        elif failure_kind == "ollama_preflight":
+            technical = (
+                "Local authentication of the approved inputs failed before any "
+                "Qwen or Ollama request. Résumé and job content are omitted."
+            )
+            message = _OLLAMA_PREFLIGHT_UI_MESSAGE
+        elif failure_kind == "ollama_connection":
+            technical = (
+                "The fixed localhost Ollama endpoint or configured model did not "
+                "complete the bounded request. Prompt and provider content are omitted."
+            )
+            message = _OLLAMA_CONNECTION_UI_MESSAGE
+        elif failure_kind == "ollama_contract":
+            technical = (
+                "The Qwen response failed strict JSON, canonical schema, edit-ID, "
+                "or revision validation. Provider content is omitted."
+            )
+            message = _OLLAMA_CONTRACT_UI_MESSAGE
+        elif failure_kind == "ollama_cannot_apply":
+            technical = (
+                "Qwen returned a bounded cannot_apply result for one authenticated "
+                "edit or QA issue. Provider prose is omitted."
+            )
+            message = _OLLAMA_CANNOT_APPLY_UI_MESSAGE
+        elif failure_kind == "ollama_technical_failure":
+            technical = (
+                "Qwen returned a structured technical_failure result. Provider "
+                "prose is omitted."
+            )
+            message = _OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE
         else:
             technical = (
                 _sanitized_technical_details(RuntimeError(error_message))
@@ -863,6 +992,7 @@ class RunManager:
             "artifact_directory": str(run_directory),
             "error": technical,
             "failure_kind": failure_kind,
+            "retrieval_classification": retrieval_classification,
             "retry_eligible": retry_eligible,
             "retry_reason": retry_reason,
             "antigravity_retry_eligible": antigravity_retry_eligible,
@@ -910,6 +1040,8 @@ class RunManager:
             keep_workdir=False,
             timeout=self.settings.timeout,
             retry_context=context,
+            writer_provider="ollama",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         try:
             return self.start(
@@ -949,6 +1081,8 @@ class RunManager:
             keep_workdir=False,
             timeout=self.settings.timeout,
             antigravity_retry_context=context,
+            writer_provider="antigravity",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         try:
             return self.start(
@@ -988,6 +1122,8 @@ class RunManager:
             keep_workdir=False,
             timeout=self.settings.timeout,
             antigravity_reprocess_context=context,
+            writer_provider="antigravity",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         try:
             return self.start(
@@ -1136,18 +1272,47 @@ _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE = (
 _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE = (
     "Antigravity returned JSON in an unsupported response format."
 )
-_LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE = (
-    "Antigravity could not return the LinkedIn posting in its documented "
-    "structured-output envelope. No résumé analysis or tailoring was started."
-)
-_APIFY_CONFIGURATION_UI_MESSAGE = (
-    "Apify retrieval is not configured. Add APIFY_API_TOKEN to the local launch "
-    "environment or choose Antigravity, pasted text, or a UTF-8 job file."
-)
-_APIFY_RETRIEVAL_UI_MESSAGE = (
-    "Apify could not return one locally verified LinkedIn job-detail record. "
-    "No résumé analysis or tailoring was started."
-)
+_APIFY_LINKEDIN_UI_MESSAGES = {
+    "missing_token": (
+        "Apify is not configured. Set APIFY_API_TOKEN to the complete token, "
+        "including its apify_api_ prefix."
+    ),
+    "missing_actor_id": (
+        "Apify is not configured. Set APIFY_ACTOR_ID to the Actor ID or "
+        "username/actor-name used for LinkedIn job retrieval."
+    ),
+    "invalid_token": (
+        "APIFY_API_TOKEN is malformed. Preserve the complete token exactly as issued."
+    ),
+    "invalid_actor_id": (
+        "APIFY_ACTOR_ID is malformed. Use an Actor ID or username/actor-name."
+    ),
+    "authentication_failure": (
+        "Apify rejected authentication. Verify the locally configured API token."
+    ),
+    "actor_not_found": (
+        "Apify could not find the configured Actor. Verify APIFY_ACTOR_ID and access."
+    ),
+    "actor_timeout": "The Apify Actor exceeded the bounded retrieval timeout.",
+    "actor_failure": "The Apify Actor run stopped before retrieval succeeded.",
+    "empty_dataset": "The Apify Actor completed but returned no dataset items.",
+    "no_matching_result": (
+        "No unique Apify result matched the requested LinkedIn URL or job ID."
+    ),
+    "insufficient_content": (
+        "The Apify result lacked a meaningful title or complete job description."
+    ),
+    "network_error": (
+        "Resume Tailor could not complete the bounded Apify HTTPS request."
+    ),
+    "rate_limited": (
+        "Apify rate-limited this retrieval. Wait for the provider limit to reset."
+    ),
+    "provider_failure": "Apify LinkedIn retrieval stopped with a provider failure.",
+    "malformed_output": (
+        "The Apify result failed the local canonical job-posting contract."
+    ),
+}
 _ANTIGRAVITY_TAILORING_CONTRACT_UI_MESSAGE = (
     "Antigravity did not apply the approved tailoring plan and returned a "
     "non-actionable request for another task. All authenticated inputs were "
@@ -1161,6 +1326,26 @@ _ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE = (
     "Antigravity reported a bounded technical tailoring failure. The authenticated "
     "inputs and approved plan were preserved."
 )
+_OLLAMA_CONNECTION_UI_MESSAGE = (
+    "Resume Tailor could not reach the local Ollama service or load the configured "
+    "Qwen model at 127.0.0.1:11434. No remote fallback was attempted."
+)
+_OLLAMA_CONTRACT_UI_MESSAGE = (
+    "Qwen returned content that did not satisfy the local structured-output and "
+    "evidence contract. The response and sanitized validation envelope were preserved."
+)
+_OLLAMA_CANNOT_APPLY_UI_MESSAGE = (
+    "Qwen could not safely apply one authenticated approved edit. No unsupported "
+    "claim was substituted."
+)
+_OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE = (
+    "Qwen reported a bounded local writing failure. Authenticated inputs and "
+    "diagnostics were preserved."
+)
+_OLLAMA_PREFLIGHT_UI_MESSAGE = (
+    "The authenticated tailoring inputs failed local completeness preflight. "
+    "No Qwen or Ollama request was launched."
+)
 
 
 def _failure_kind_for_error(
@@ -1169,20 +1354,13 @@ def _failure_kind_for_error(
 ) -> str:
     if isinstance(error, SourceEvidenceError):
         return "source_evidence"
-    if isinstance(error, ApifyConfigurationError):
-        return "apify_configuration"
-    if isinstance(error, ApifyProviderError):
-        return "apify_retrieval"
+    if isinstance(error, (ApifyConfigurationError, ApifyLinkedInRetrievalError)):
+        return "apify_linkedin_retrieval"
     if isinstance(error, AntigravityLaunchSizeError) or (
         stage == "antigravity_tailoring"
         and "Argument list too long" in str(error)
     ):
         return "antigravity_launch_size"
-    if isinstance(error, LinkedInResponseEnvelopeError) or (
-        stage in {"fetching_job", "confirming_posting"}
-        and isinstance(error, AntigravityResponseEnvelopeError)
-    ):
-        return "linkedin_response_envelope"
     if isinstance(error, AntigravityResponseEnvelopeError):
         return "antigravity_response_envelope"
     if isinstance(error, AntigravityTailoringContractError):
@@ -1193,6 +1371,16 @@ def _failure_kind_for_error(
         return "antigravity_technical_failure"
     if isinstance(error, AntigravityTailoringPreflightError):
         return "antigravity_tailoring_preflight"
+    if isinstance(error, TailoringPreflightError):
+        return "ollama_preflight"
+    if isinstance(error, OllamaConnectionError):
+        return "ollama_connection"
+    if isinstance(error, (OllamaTailoringContractError, OllamaRevisionContractError)):
+        return "ollama_contract"
+    if isinstance(error, (OllamaCannotApplyError, OllamaRevisionCannotApplyError)):
+        return "ollama_cannot_apply"
+    if isinstance(error, (OllamaTechnicalFailureError, OllamaRevisionTechnicalFailureError)):
+        return "ollama_technical_failure"
     if isinstance(error, CodexSchemaCompatibilityError):
         return "schema"
     if stage in {"fetching_job", "confirming_posting"}:
@@ -1210,24 +1398,12 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
     error_message = error.get("message") if isinstance(error, Mapping) else None
     stage = str(metadata.get("stage", ""))
     if (
-        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
-        and (
-            metadata.get("failure_class") == "linkedin-response-envelope"
-            or error_type
-            in {"LinkedInResponseEnvelopeError", "AntigravityResponseEnvelopeError"}
-        )
+        metadata.get("failure_class")
+        in {"apify-configuration", "apify-linkedin-retrieval"}
+        or error_type
+        in {"ApifyConfigurationError", "ApifyLinkedInRetrievalError"}
     ):
-        return "linkedin_response_envelope"
-    if (
-        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
-        and error_type == "ApifyConfigurationError"
-    ):
-        return "apify_configuration"
-    if (
-        stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}
-        and error_type == "ApifyProviderError"
-    ):
-        return "apify_retrieval"
+        return "apify_linkedin_retrieval"
     antigravity_failure = antigravity_retry_failure_kind(dict(metadata))
     if antigravity_failure == "launch_size":
         return "antigravity_launch_size"
@@ -1242,6 +1418,17 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         return "antigravity_cannot_apply"
     if antigravity_failure == "technical_failure":
         return "antigravity_technical_failure"
+    ollama_failure = str(metadata.get("failure_class", ""))
+    if ollama_failure == "ollama-connection":
+        return "ollama_connection"
+    if ollama_failure == "ollama-tailoring-preflight":
+        return "ollama_preflight"
+    if ollama_failure in {"ollama-tailoring-contract", "ollama-revision-contract"}:
+        return "ollama_contract"
+    if ollama_failure in {"ollama-cannot-apply", "ollama-revision-cannot-apply"}:
+        return "ollama_cannot_apply"
+    if ollama_failure in {"ollama-technical-failure", "ollama-revision-technical-failure"}:
+        return "ollama_technical_failure"
     if (
         stage == "codex-analysis"
         and error_type in {"SourceEvidenceError", "TruthfulnessError"}
@@ -1251,8 +1438,17 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         )
     ):
         return "source_evidence"
-    if stage in {"linkedin-job-extraction", "linkedin-posting-confirmation"}:
+    if stage in {"apify-linkedin-retrieval", "linkedin-posting-confirmation"}:
         return "retrieval"
+    return None
+
+
+def _retrieval_classification_from_metadata(
+    metadata: Mapping[str, Any],
+) -> str | None:
+    value = metadata.get("retrieval_classification")
+    if isinstance(value, str) and value in _APIFY_LINKEDIN_UI_MESSAGES:
+        return value
     return None
 
 
@@ -1260,7 +1456,7 @@ def _ui_stage_from_metadata(stage: str) -> str:
     return {
         "initializing": "validating_input",
         "dependency-check": "validating_input",
-        "linkedin-job-extraction": "fetching_job",
+        "apify-linkedin-retrieval": "fetching_job",
         "linkedin-posting-confirmation": "confirming_posting",
         "extracting-master": "codex_analysis",
         "codex-analysis-schema-preflight": "codex_analysis",
@@ -1270,10 +1466,19 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "antigravity-tailoring-preflight": "antigravity_tailoring",
         "antigravity-tailoring": "antigravity_tailoring",
         "antigravity-response-reprocessing": "antigravity_tailoring",
+        "ollama-tailoring-preflight": "antigravity_tailoring",
+        "ollama-tailoring": "antigravity_tailoring",
         "local-evidence-check": "evidence_validation",
         "docx-render": "rendering",
         "pdf-export-validation": "rendering",
         "final-codex-qa": "final_qa",
+        "revision-authorization": "revision_phase",
+        "antigravity-revision-1": "revision_phase",
+        "ollama-revision-1": "revision_phase",
+        "revision-1-local-evidence-check": "revision_phase",
+        "revision-1-content-approval": "revision_phase",
+        "revision-1-docx-render": "revision_phase",
+        "revision-1-final-codex-qa": "revision_phase",
         "complete": "complete",
     }.get(stage, "validating_input")
 
@@ -1281,17 +1486,13 @@ def _ui_stage_from_metadata(stage: str) -> str:
 def _safe_error_message(error: ResumeTailorError) -> str:
     if isinstance(error, SourceEvidenceError):
         return _SOURCE_EVIDENCE_UI_MESSAGE
-    if isinstance(error, ApifyConfigurationError):
-        return _APIFY_CONFIGURATION_UI_MESSAGE
-    if isinstance(error, ApifyProviderError):
-        return _APIFY_RETRIEVAL_UI_MESSAGE
+    if isinstance(error, (ApifyConfigurationError, ApifyLinkedInRetrievalError)):
+        return _APIFY_LINKEDIN_UI_MESSAGES[error.classification]
     if isinstance(error, AntigravityLaunchSizeError) or (
         "Argument list too long" in str(error)
         and "agy" in str(error)
     ):
         return _ANTIGRAVITY_LAUNCH_SIZE_UI_MESSAGE
-    if isinstance(error, LinkedInResponseEnvelopeError):
-        return _LINKEDIN_RESPONSE_ENVELOPE_UI_MESSAGE
     if isinstance(error, AntigravityResponseEnvelopeError):
         return _ANTIGRAVITY_RESPONSE_ENVELOPE_UI_MESSAGE
     if isinstance(error, AntigravityTailoringContractError):
@@ -1303,8 +1504,18 @@ def _safe_error_message(error: ResumeTailorError) -> str:
     if isinstance(error, AntigravityTailoringPreflightError):
         return (
             "The authenticated tailoring inputs failed local completeness "
-            "preflight. No Antigravity request was launched."
+            "preflight. No résumé-writer request was launched."
         )
+    if isinstance(error, TailoringPreflightError):
+        return _OLLAMA_PREFLIGHT_UI_MESSAGE
+    if isinstance(error, OllamaConnectionError):
+        return _OLLAMA_CONNECTION_UI_MESSAGE
+    if isinstance(error, (OllamaTailoringContractError, OllamaRevisionContractError)):
+        return _OLLAMA_CONTRACT_UI_MESSAGE
+    if isinstance(error, (OllamaCannotApplyError, OllamaRevisionCannotApplyError)):
+        return _OLLAMA_CANNOT_APPLY_UI_MESSAGE
+    if isinstance(error, (OllamaTechnicalFailureError, OllamaRevisionTechnicalFailureError)):
+        return _OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE
     if isinstance(error, CodexSchemaCompatibilityError):
         return "Codex could not start because its output schema was incompatible."
     if isinstance(error, ModelError):
@@ -1313,6 +1524,8 @@ def _safe_error_message(error: ResumeTailorError) -> str:
             if "codex" in str(error).casefold()
             else "Antigravity"
             if "antigravity" in str(error).casefold()
+            else "Qwen"
+            if "qwen" in str(error).casefold() or "ollama" in str(error).casefold()
             else "The model stage"
         )
         return (
@@ -1343,7 +1556,7 @@ _TECHNICAL_BLOCK = re.compile(
     flags=re.DOTALL,
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY)_[A-Z0-9_]*(?:KEY|TOKEN)"
+    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY|APIFY)_[A-Z0-9_]*(?:KEY|TOKEN)"
     r"\s*=\s*[^\s]+"
 )
 
@@ -1378,6 +1591,9 @@ def _render(
         csrf_token=app.state.settings.launch_token,
         version=__version__,
         workflow_stages=WORKFLOW_STAGES,
+        max_job_description_characters=(
+            MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+        ),
         **context,
     )
     response = HTMLResponse(html, status_code=status_code)
@@ -1464,6 +1680,20 @@ def _form_text(form: FormData, name: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _form_local_timestamp(form: FormData, name: str) -> datetime | None:
+    value = _form_text(form, name)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise InputError(f"{name.replace('_', ' ').title()} is not a valid date/time.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        local_timezone = datetime.now().astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_timezone)
+    return parsed
+
+
 async def _prepare_namespace(
     *,
     request: Request,
@@ -1503,18 +1733,12 @@ async def _prepare_namespace(
         company: str | None = None
         role: str | None = None
         job_url: str | None = None
-        linkedin_provider = "auto"
         job_file: Path | None = None
         if source_mode == "url":
             job_url = _form_text(form, "job_url")
             if not job_url:
                 raise InputError("Enter a LinkedIn job URL.")
             job_url = validate_linkedin_url(job_url).normalized
-            linkedin_provider = _form_text(form, "linkedin_provider") or "auto"
-            resolve_linkedin_provider(
-                linkedin_provider,
-                environment={},
-            )
         else:
             company = _validate_label(_form_text(form, "company"), "Company")
             role = _validate_label(_form_text(form, "role"), "Role")
@@ -1522,10 +1746,7 @@ async def _prepare_namespace(
                 description = _form_text(form, "pasted_description")
                 if not description:
                     raise InputError("Paste a complete job description.")
-                if len(description.encode("utf-8")) > MAX_JOB_BYTES:
-                    raise InputError(
-                        "The pasted job description exceeds the 500,000-byte limit."
-                    )
+                validate_confirmed_job_description(description)
             else:
                 upload = form.get("job_file")
                 if not isinstance(upload, UploadFile) or not upload.filename:
@@ -1545,6 +1766,7 @@ async def _prepare_namespace(
                     ) from exc
                 if not description:
                     raise InputError("The job-description upload is empty.")
+                validate_confirmed_job_description(description)
             job_file = staging / "job-description.txt"
             atomic_write_text(job_file, description.rstrip() + "\n")
 
@@ -1552,14 +1774,17 @@ async def _prepare_namespace(
             resume=resume_path,
             clipboard=False,
             job_file=job_file,
+            job_source_override=source_mode,
             job_url=job_url,
-            linkedin_provider=linkedin_provider,
             company=company,
             role=role,
             output_dir=manager.settings.output_directory,
+            analytics_db=manager.settings.analytics_database,
             yes=False,
             keep_workdir=False,
             timeout=manager.settings.timeout,
+            writer_provider="ollama",
+            ollama_model=DEFAULT_OLLAMA_MODEL,
         )
         return namespace, staging, source_mode, company, role
     except Exception:
@@ -1573,6 +1798,7 @@ def create_app(
     master_resume: Path | None = None,
     launch_token: str | None = None,
     timeout: tuple[int, str] | None = None,
+    analytics_database_path: Path | None = None,
     port: int = DEFAULT_PORT,
     pipeline_runner: PipelineRunner = run_pipeline,
 ) -> FastAPI:
@@ -1588,6 +1814,9 @@ def create_app(
         master_resume=(master_resume or default_master_resume()).expanduser().resolve(),
         launch_token=launch_token or secrets.token_urlsafe(32),
         timeout=timeout or parse_duration("15m"),
+        analytics_database=(
+            analytics_database_path or default_analytics_database_path()
+        ).expanduser().resolve(),
     )
     settings.output_directory.mkdir(parents=True, exist_ok=True)
     manager = RunManager(settings=settings, pipeline_runner=pipeline_runner)
@@ -1606,6 +1835,7 @@ def create_app(
     )
     app.state.settings = settings
     app.state.manager = manager
+    app.state.analytics_store = AnalyticsStore(settings.analytics_database)
     app.state.templates = Environment(
         loader=FileSystemLoader(str(template_directory)),
         autoescape=select_autoescape(("html", "xml")),
@@ -1659,6 +1889,148 @@ def create_app(
                 "form_values": {},
             },
         )
+
+    @app.get("/analytics", response_class=HTMLResponse)
+    async def analytics_dashboard(request: Request) -> HTMLResponse:
+        _require_session(request)
+        notice_messages = {
+            "status": "Application status recorded locally.",
+            "correction": "Correction event appended; prior history was preserved.",
+            "interview": "Manually confirmed interview recorded locally.",
+            "note": "Application note recorded locally.",
+        }
+        analytics_error: str | None = None
+        summary: dict[str, Any] | None
+        try:
+            summary = app.state.analytics_store.summary()
+        except (AnalyticsError, InputError):
+            summary = None
+            analytics_error = (
+                "The local analytics database is unavailable. Tailoring runs remain "
+                "usable; check the private application-data directory and retry."
+            )
+        return _render(
+            app,
+            request,
+            "analytics.html",
+            {
+                "summary": summary,
+                "analytics_error": analytics_error,
+                "notice": notice_messages.get(request.query_params.get("notice", "")),
+                "application_statuses": APPLICATION_STATUSES,
+                "interview_types": INTERVIEW_TYPES,
+                "analytics_database_name": settings.analytics_database.name,
+            },
+            status_code=503 if analytics_error else 200,
+        )
+
+    @app.post("/analytics/applications/{application_id}/status")
+    async def analytics_status(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        actions = {
+            "save": "saved",
+            "apply": "applied",
+            "screening": "screening",
+            "reject": "rejected",
+            "offer": "offer",
+            "withdraw": "withdrawn",
+        }
+        new_status = actions.get(_form_text(form, "action"))
+        if new_status is None:
+            raise HTTPException(status_code=422, detail="Choose a supported status action.")
+        try:
+            app.state.analytics_store.set_application_status(
+                application_id,
+                new_status,
+                source="manual_ui",
+                note=_form_text(form, "note") or None,
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not record this status.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=status", status_code=303)
+
+    @app.post("/analytics/applications/{application_id}/correction")
+    async def analytics_correction(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            app.state.analytics_store.correct_application_status(
+                application_id,
+                _form_text(form, "new_status"),
+                confirmed=_form_text(form, "confirm_correction") == "yes",
+                source="manual_ui",
+                note=_form_text(form, "note") or None,
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not append this correction.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=correction", status_code=303)
+
+    @app.post("/analytics/applications/{application_id}/interviews")
+    async def analytics_interview(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            app.state.analytics_store.record_interview(
+                application_id,
+                _form_text(form, "interview_type"),
+                confirmed=_form_text(form, "confirm_interview") == "yes",
+                scheduled_at=_form_local_timestamp(form, "scheduled_at"),
+                completed_at=_form_local_timestamp(form, "completed_at"),
+                contact_label=_form_text(form, "contact_label") or None,
+                result=_form_text(form, "result") or None,
+                notes=_form_text(form, "notes") or None,
+                source="manual_ui",
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not record this interview.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=interview", status_code=303)
+
+    @app.post("/analytics/applications/{application_id}/notes")
+    async def analytics_note(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            app.state.analytics_store.add_note(
+                application_id,
+                _form_text(form, "note"),
+                source="manual_ui",
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not record this note.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=note", status_code=303)
 
     @app.post("/runs", response_class=HTMLResponse)
     async def start_run(request: Request):
@@ -1846,13 +2218,12 @@ def _safe_form_values(form: FormData) -> dict[str, str]:
         "resume_mode",
         "job_mode",
         "job_url",
-        "linkedin_provider",
         "company",
         "role",
         "pasted_description",
     }
     return {
-        name: value[:10_000]
+        name: value
         for name in allowed
         if isinstance((value := form.get(name)), str)
     }

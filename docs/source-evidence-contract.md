@@ -39,6 +39,13 @@ catalog is saved as `job-requirements.json`, bound to the confirmed job-descript
 hash, included in the retry manifest, and never reconstructed from model-authored
 labels.
 
+Confirmed descriptions are bounded at 25,000 characters for canonical Apify,
+pasted, clipboard, and file inputs alike. Individual canonical structured fields
+retain their narrower field bounds. A plain-text posting represented as one long
+line may therefore produce one requirement block longer than 5,000 characters,
+but neither the block nor its complete source posting can exceed the shared
+confirmed-description maximum.
+
 ## Codex analysis output
 
 Codex returns source references, not copied source prose:
@@ -65,6 +72,11 @@ editable IDs. Required evidence arrays contain at least one item. The generated
 schema is checked against the supported Structured Outputs subset, bounded for
 size and complexity, written into the isolated run, hashed in run metadata, and
 revalidated immediately before Codex starts. There is no unconstrained fallback.
+Requirement exact text is not copied into the output transport schema, so the
+larger confirmed-posting allowance does not relax its existing byte, node, enum,
+or property ceilings. Codex receives the bounded prompt through stdin; the job
+posting remains inside unique untrusted-data delimiters with an explicit command
+to ignore instructions embedded in it.
 
 Local cross-field validation remains authoritative after schema validation. It
 requires every requirement ID to appear exactly once across the supported and
@@ -124,7 +136,7 @@ job-requirement catalog. A retry:
 - cannot reach Antigravity unless the new analysis passes local resolution and
   a human separately approves it.
 
-Legacy LinkedIn runs without the new hash manifest are eligible only when the
+Legacy URL-mode runs without the new hash manifest are eligible only when the
 metadata and extracted source hashes agree with the unchanged current master
 and every stored extraction field matches a fresh deterministic read-only
 extraction of that master. The independently stored structured job description

@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+
 import resume_tailor.codex_analysis as codex_analysis_module
 from resume_tailor.codex_analysis import invoke_codex_analysis
 from resume_tailor.job_requirements import build_job_requirement_catalog
@@ -66,7 +68,10 @@ def _job_catalog() -> dict[str, Any]:
 
 @pytest.mark.parametrize(
     "canonical_name",
-    ["codex_analysis.schema.json", "final_qa.schema.json"],
+    [
+        "codex_analysis.schema.json",
+        "final_qa_provider.schema.json",
+    ],
 )
 def test_codex_transport_schemas_contain_no_unique_items(
     canonical_name: str,
@@ -106,6 +111,7 @@ def test_nested_unsupported_transport_keyword_is_detected() -> None:
 def test_canonical_schema_retains_local_uniqueness_constraints() -> None:
     canonical = load_schema("codex_analysis.schema.json")
     final_qa = load_schema("final_qa.schema.json")
+    linkedin_job = load_schema("linkedin_job.schema.json")
     keywords = set(_walk_keywords(canonical))
     assert "uniqueItems" in keywords
     assert "minLength" in keywords
@@ -115,7 +121,14 @@ def test_canonical_schema_retains_local_uniqueness_constraints() -> None:
         ]
         is True
     )
-    assert final_qa["properties"]["material_issues"]["uniqueItems"] is True
+    assert final_qa["properties"]["issues"]["uniqueItems"] is True
+    assert final_qa["$defs"]["resolved_issue"]["properties"]["issue_id"][
+        "pattern"
+    ] == r"^qa\.[0-9]{3}$"
+    assert linkedin_job["properties"]["responsibilities"]["uniqueItems"] is True
+    assert linkedin_job["properties"]["normalized_job_description"][
+        "maxLength"
+    ] == MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 
 
 def test_transport_preserves_supported_bounds_and_references() -> None:
