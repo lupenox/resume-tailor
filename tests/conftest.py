@@ -47,7 +47,11 @@ def installer_source(repository_root: Path, tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def stubs_on_path(monkeypatch: pytest.MonkeyPatch, repository_root: Path) -> Path:
+def stubs_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+    repository_root: Path,
+    tmp_path: Path,
+) -> Path:
     stubs = repository_root / "tests" / "stubs"
     monkeypatch.setenv("PATH", f"{stubs}:{os.environ['PATH']}")
     monkeypatch.delenv("STUB_CODEX_MODE", raising=False)
@@ -58,6 +62,10 @@ def stubs_on_path(monkeypatch: pytest.MonkeyPatch, repository_root: Path) -> Pat
         "APIFY_ACTOR_ID",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(
+        "RESUME_TAILOR_ANALYTICS_DB",
+        str(tmp_path / "application-data" / "job-search-analytics.sqlite3"),
+    )
     return stubs
 
 

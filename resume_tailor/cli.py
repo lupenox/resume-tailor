@@ -4,10 +4,19 @@ import argparse
 import importlib.metadata
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .analytics import (
+    ANALYTICS_DATABASE_FILENAME,
+    ANALYTICS_SCHEMA_VERSION,
+    AnalyticsStore,
+    default_analytics_database_path,
+    observation_from_canonical_job,
+    observation_from_local_job,
+)
 from .apify_job import invoke_apify_linkedin_retrieval
 from .antigravity_writer import (
     ANTIGRAVITY_RESPONSE_METADATA_FILENAME,
@@ -26,7 +35,7 @@ from .linkedin_job import (
     posting_confirmation_text,
     validate_linkedin_url,
 )
-from .job_requirements import build_job_requirement_catalog
+from .job_requirements import build_job_requirement_catalog, job_description_sha256
 from .job_text import validate_confirmed_job_description
 from .orchestration import PipelineHooks
 from .ollama_transport import ollama_dependency_versions
@@ -153,6 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("~/Documents/Resumes/Tailored"),
         help="artifact parent directory (default: ~/Documents/Resumes/Tailored)",
+    )
+    parser.add_argument(
+        "--analytics-db",
+        type=Path,
+        default=default_analytics_database_path(),
+        help="private local SQLite analytics database (default: XDG application data)",
     )
     parser.add_argument(
         "--yes",
@@ -564,7 +579,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 args.job_file.expanduser(),
                 label="job description",
             )
-            job_source = "job-file"
+            job_source = getattr(args, "job_source_override", "job-file")
+            if job_source not in {"job-file", "file", "pasted", "pasted_text"}:
+                raise InputError("Invalid internal local job-source classification.")
 
     if job_description is not None:
         validate_confirmed_job_description(job_description)
@@ -631,6 +648,66 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             "final_generation": None,
         },
     }
+    analytics_job_id: int | None = None
+    analytics_application_id: int | None = None
+    analytics_event_run_identifier = run_directory.name
+    metadata["analytics"] = {
+        "schema_version": ANALYTICS_SCHEMA_VERSION,
+        "database_filename": ANALYTICS_DATABASE_FILENAME,
+        "job_id": None,
+        "application_id": None,
+        "resume_version_id": None,
+        "warnings": [],
+    }
+    analytics_setup_error: Exception | None = None
+    try:
+        analytics_path = getattr(args, "analytics_db", None)
+        if analytics_path is None:
+            analytics_path = default_analytics_database_path()
+        analytics_store: AnalyticsStore | None = AnalyticsStore(
+            analytics_path
+        )
+    except Exception as exc:  # analytics configuration is failure-isolated too
+        analytics_store = None
+        analytics_setup_error = exc
+
+    def analytics_write(operation: str, callback: Any) -> Any:
+        try:
+            if analytics_store is None:
+                assert analytics_setup_error is not None
+                raise analytics_setup_error
+            result = callback()
+        except Exception as exc:  # analytics must never invalidate a résumé run
+            warning = {
+                "operation": operation,
+                "error_type": type(exc).__name__,
+                "retryable_from_preserved_artifacts": True,
+            }
+            warnings = metadata["analytics"]["warnings"]
+            if warning not in warnings:
+                warnings.append(warning)
+            hooks.warning(
+                "Local analytics could not record "
+                f"{operation}; the résumé pipeline will continue. Preserved run "
+                "artifacts support a safe local retry.",
+                analytics_operation=operation,
+                analytics_error_type=type(exc).__name__,
+            )
+            result = None
+        try:
+            _update_metadata(
+                metadata,
+                metadata_path,
+                run_directory=run_directory,
+            )
+        except Exception as exc:  # this extra analytics checkpoint is non-critical
+            hooks.warning(
+                "The local analytics checkpoint could not be added to run metadata; "
+                "the résumé pipeline will continue.",
+                analytics_operation=operation,
+                analytics_checkpoint_error_type=type(exc).__name__,
+            )
+        return result
     if retry_inputs is not None:
         metadata["retry_of"] = retry_inputs.context.source_directory.name
         metadata["retry_kind"] = "codex-source-evidence-analysis"
@@ -749,11 +826,30 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             )
             if hooks.approval_handler is None:
                 print(posting_confirmation_text(fetched_job))
+
+            def record_canonical_view() -> None:
+                nonlocal analytics_job_id, analytics_application_id
+                result = analytics_write(
+                    "the validated viewed posting",
+                    lambda: analytics_store.record_job_viewed(
+                        observation_from_canonical_job(fetched_job),
+                        run_identifier=analytics_event_run_identifier,
+                    ),
+                )
+                if result is not None:
+                    analytics_job_id = result.job_id
+                    analytics_application_id = result.application_id
+                    metadata["analytics"]["job_id"] = analytics_job_id
+                    metadata["analytics"]["application_id"] = (
+                        analytics_application_id
+                    )
+
             posting_approval = hooks.approve(
                 kind="linkedin_posting",
                 title="LinkedIn posting",
                 payload=fetched_job,
                 assume_yes=args.yes,
+                on_presented=record_canonical_view,
             )
             if posting_approval.action == "use_pasted":
                 pasted_description = str(
@@ -774,6 +870,22 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     run_directory / "job-description.txt",
                     job_description.rstrip() + "\n",
                 )
+                if analytics_job_id is not None:
+                    pasted_observation = replace(
+                        observation_from_canonical_job(fetched_job),
+                        source="pasted_text",
+                        description_sha256=job_description_sha256(job_description),
+                    )
+                    pasted_result = analytics_write(
+                        "the explicitly pasted posting observation",
+                        lambda: analytics_store.record_job_viewed(
+                            pasted_observation,
+                            run_identifier=analytics_event_run_identifier,
+                        ),
+                    )
+                    if pasted_result is not None:
+                        analytics_job_id = pasted_result.job_id
+                        analytics_application_id = pasted_result.application_id
                 hooks.progress(
                     "confirming_posting",
                     "Using the explicitly supplied pasted description for this run.",
@@ -796,6 +908,30 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             )
 
         assert company is not None and role is not None and job_description is not None
+        if (
+            requested_linkedin_url is None
+            and retry_inputs is None
+            and antigravity_retry_inputs is None
+        ):
+            local_result = analytics_write(
+                "the validated local viewed posting",
+                lambda: analytics_store.record_job_viewed(
+                    observation_from_local_job(
+                        company=company,
+                        title=role,
+                        description=job_description,
+                        source=job_source,
+                    ),
+                    run_identifier=analytics_event_run_identifier,
+                ),
+            )
+            if local_result is not None:
+                analytics_job_id = local_result.job_id
+                analytics_application_id = local_result.application_id
+                metadata["analytics"]["job_id"] = analytics_job_id
+                metadata["analytics"]["application_id"] = (
+                    analytics_application_id
+                )
         if antigravity_retry_inputs is not None:
             job_requirements = antigravity_retry_inputs.job_requirements
         elif retry_inputs is not None:
@@ -845,6 +981,15 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             "requirement_count": len(job_requirements["requirements"]),
             "source_kind": job_requirements["source_kind"],
         }
+        if analytics_job_id is not None:
+            analytics_write(
+                "the validated job-requirement catalog",
+                lambda: analytics_store.record_requirements(
+                    analytics_job_id,
+                    job_requirements,
+                    job_description=job_description,
+                ),
+            )
         from .docx_extract import extract_resume, source_blocks_from_paragraphs
 
         metadata["stage"] = "extracting-master"
@@ -1136,6 +1281,27 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 )
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            if analytics_job_id is not None:
+                analytics_write(
+                    "validated requirement gap outcomes",
+                    lambda: analytics_store.record_gap_assessments(
+                        analytics_job_id,
+                        analysis,
+                    ),
+                )
+                planned_application_id = analytics_write(
+                    "the tailoring approval",
+                    lambda: analytics_store.record_tailoring_approval(
+                        analytics_job_id,
+                        run_identifier=run_directory.name,
+                        source="pipeline",
+                    ),
+                )
+                if planned_application_id is not None:
+                    analytics_application_id = planned_application_id
+                    metadata["analytics"]["application_id"] = (
+                        analytics_application_id
+                    )
 
             metadata["stage"] = "tailoring-dependency-check"
             hooks.progress(
@@ -1833,6 +1999,26 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             )
         )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
+        if analytics_application_id is not None:
+            published_docx = metadata["revision_cycle"]["published_artifacts"].get(
+                "docx",
+                {},
+            )
+            artifact_reference = published_docx.get("filename")
+            qa_outcome = metadata.get("final_qa", {}).get("status")
+            if isinstance(artifact_reference, str) and isinstance(qa_outcome, str):
+                resume_version_id = analytics_write(
+                    "the successfully published résumé version",
+                    lambda: analytics_store.record_resume_version(
+                        analytics_application_id,
+                        run_identifier=run_directory.name,
+                        artifact_reference=artifact_reference,
+                        writer_provider=writer_provider,
+                        qa_outcome=qa_outcome,
+                    ),
+                )
+                if resume_version_id is not None:
+                    metadata["analytics"]["resume_version_id"] = resume_version_id
         metadata["status"] = "COMPLETE"
         metadata["stage"] = "complete"
         metadata["completed_at"] = utc_now_iso()

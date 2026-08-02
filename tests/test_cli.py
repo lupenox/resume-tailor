@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from resume_tailor.cli import _validate_mode_arguments, build_parser, main
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.utilities import (
     ApprovalError,
     ExitCode,
@@ -86,6 +87,7 @@ def test_local_qwen_is_the_default_writer() -> None:
 
     assert args.writer_provider == "ollama"
     assert args.ollama_model == "resume-tailor-qwen"
+    assert args.analytics_db.name == "job-search-analytics.sqlite3"
 
 
 def test_removed_linkedin_provider_flag_is_rejected() -> None:
@@ -149,6 +151,36 @@ def test_unsupported_resume_extension(job_file: Path, tmp_path: Path) -> None:
         ]
     )
     assert code == ExitCode.INPUT
+
+
+def test_cli_job_file_over_limit_reports_actual_and_permitted(
+    master_resume: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+    job_file = tmp_path / "oversized-job.txt"
+    job_file.write_text("x" * actual, encoding="utf-8")
+
+    code = main(
+        [
+            "--resume",
+            str(master_resume),
+            "--job-file",
+            str(job_file),
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    assert code == ExitCode.INPUT
+    error = capsys.readouterr().err
+    assert f"{actual:,}" in error
+    assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in error
 
 
 def test_human_approval_refusal(monkeypatch: pytest.MonkeyPatch) -> None:

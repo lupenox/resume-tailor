@@ -23,6 +23,12 @@ dist/
 *.db-shm
 *.bak
 *.backup
+job-search-analytics.sqlite3
+job-search-analytics.sqlite3-wal
+job-search-analytics.sqlite3-shm
+job-search-analytics.sqlite3-journal
+job-search-analytics-export*.json
+.job-search-analytics-export*.tmp-*
 
 # Local pipeline output if a developer points --output-dir into the repository.
 tailored-output/

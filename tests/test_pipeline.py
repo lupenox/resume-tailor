@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import resume_tailor.cli as cli_module
+from resume_tailor.analytics import ANALYTICS_DATABASE_FILENAME, AnalyticsStore
 from resume_tailor.cli import build_parser, main, run_pipeline
 from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
 from resume_tailor.utilities import (
@@ -22,7 +23,25 @@ LINKEDIN_JOB_URL = (
 )
 
 
-def _canonical_apify_posting() -> dict[str, object]:
+def _analytics_store(tmp_path: Path) -> AnalyticsStore:
+    return AnalyticsStore(
+        tmp_path / "application-data" / ANALYTICS_DATABASE_FILENAME
+    )
+
+
+def _description_with_length(length: int) -> str:
+    fragment = "Build safe Python services and automated tests. "
+    value = (fragment * ((length // len(fragment)) + 1))[:length]
+    if value[-1].isspace():
+        value = value[:-1] + "x"
+    assert len(value) == length
+    return value
+
+
+def _canonical_apify_posting(
+    *,
+    description: str | None = None,
+) -> dict[str, object]:
     return {
         "fetch_status": "success",
         "requested_url": LINKEDIN_JOB_URL,
@@ -38,7 +57,7 @@ def _canonical_apify_posting() -> dict[str, object]:
         "date_posted": None,
         "applicant_count": None,
         "retrieval_source": "apify",
-        "normalized_job_description": (
+        "normalized_job_description": description or (
             "Build safe Python services for synthetic evidence workflows. "
             "Collaborate with engineers, validate structured inputs, write tests, "
             "document decisions, maintain APIs, review failures, and improve "
@@ -59,8 +78,9 @@ def _stub_apify_retrieval(
     monkeypatch: pytest.MonkeyPatch,
     *,
     calls: list[str] | None = None,
+    description: str | None = None,
 ) -> None:
-    posting = _canonical_apify_posting()
+    posting = _canonical_apify_posting(description=description)
 
     def retrieve(**kwargs: object) -> dict[str, object]:
         if calls is not None:
@@ -175,6 +195,13 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
     assert metadata["status"] == "COMPLETE"
     assert metadata["source_resume"]["unchanged"] is True
     assert metadata["analysis_inputs"]["version"] == 2
+    assert metadata["analytics"]["database_filename"] == ANALYTICS_DATABASE_FILENAME
+    assert metadata["analytics"]["resume_version_id"] is not None
+    assert "database_path" not in metadata["analytics"]
+    analytics = _analytics_store(tmp_path)
+    assert analytics.summary()["totals"]["unique_jobs_viewed"] == 1
+    assert analytics.summary()["totals"]["applications_submitted"] == 0
+    assert len(analytics.sanitized_export()["resume_versions"]) == 1
     assert len(metadata["analysis_inputs"]["job_description_sha256"]) == 64
     assert len(metadata["analysis_inputs"]["extracted_resume_sha256"]) == 64
     assert len(metadata["analysis_inputs"]["job_requirements_sha256"]) == 64
@@ -368,6 +395,40 @@ def test_failure_preserves_useful_artifacts(
     assert metadata["source_resume"]["unchanged"] is True
 
 
+def test_analytics_failure_warns_but_does_not_corrupt_resume_pipeline(
+    master_resume: Path,
+    job_file: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del stubs_on_path
+    monkeypatch.setenv("STUB_CODEX_MODE", "questions")
+    monkeypatch.setattr(
+        cli_module.AnalyticsStore,
+        "record_job_viewed",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic analytics outage with private detail")
+        ),
+    )
+    output_dir = tmp_path / "analytics-warning-output"
+
+    code = main(_arguments(master_resume, job_file, output_dir))
+
+    assert code == ExitCode.WAITING
+    run = next(output_dir.iterdir())
+    assert (run / "codex-analysis-resolved.json").is_file()
+    metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["analytics"]["warnings"] == [
+        {
+            "operation": "the validated local viewed posting",
+            "error_type": "RuntimeError",
+            "retryable_from_preserved_artifacts": True,
+        }
+    ]
+    assert "private detail" not in json.dumps(metadata["analytics"])
+
+
 @pytest.mark.parametrize("source_mode", ["job-file", "clipboard"])
 def test_local_text_modes_never_enable_apify_retrieval(
     source_mode: str,
@@ -424,6 +485,12 @@ def test_local_text_modes_never_enable_apify_retrieval(
     run = next(output_dir.iterdir())
     assert not (run / "job-source.json").exists()
     assert not (run / "apify-linkedin-retrieval-diagnostic.json").exists()
+    summary = _analytics_store(tmp_path).summary()
+    assert summary["totals"]["unique_jobs_viewed"] == 1
+    assert summary["recently_viewed_jobs"][0]["current_status"] == "viewed"
+    assert _analytics_store(tmp_path).sanitized_export()["jobs"][0]["source"] == (
+        "file" if source_mode == "job-file" else "clipboard"
+    )
 
 
 def test_unstructured_print_wrapper_is_classified_without_prose_extraction(
@@ -527,6 +594,31 @@ def test_user_rejecting_linkedin_confirmation_stops_before_resume_analysis(
     assert not (run / "antigravity-response.json").exists()
     assert not list(run.glob("*.docx"))
     assert prompts == ['LinkedIn posting: type "approve" to continue: ']
+    summary = _analytics_store(tmp_path).summary()
+    assert summary["totals"]["unique_jobs_viewed"] == 1
+    assert summary["totals"]["jobs_approved_for_tailoring"] == 0
+
+
+def test_6318_character_canonical_posting_reaches_review_gate(
+    master_resume: Path,
+    tmp_path: Path,
+    stubs_on_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    description = _description_with_length(6_318)
+    _stub_apify_retrieval(monkeypatch, description=description)
+    monkeypatch.setattr("builtins.input", lambda _: "reject")
+    output_dir = tmp_path / "url-output"
+
+    code = main(_url_arguments(master_resume, output_dir))
+
+    assert code == ExitCode.APPROVAL
+    run = next(output_dir.iterdir())
+    preserved = (run / "job-description.txt").read_text(encoding="utf-8").rstrip()
+    assert len(preserved) == 6_318
+    assert not (run / "extracted-master-resume.json").exists()
+    assert not (run / "codex-analysis.json").exists()
+    assert _analytics_store(tmp_path).summary()["totals"]["unique_jobs_viewed"] == 1
 
 
 def test_apify_is_the_only_step_2_retrieval_provider(
@@ -631,6 +723,7 @@ def test_malformed_apify_result_is_stage_specific_and_stops_before_analysis(
     assert not (run / "extracted-master-resume.json").exists()
     assert not (run / "antigravity-response.json").exists()
     assert not list(run.glob("*.docx"))
+    assert _analytics_store(tmp_path).summary()["totals"]["unique_jobs_viewed"] == 0
 
 
 def test_url_pipeline_continues_after_explicit_confirmation(
@@ -676,6 +769,10 @@ def test_url_pipeline_continues_after_explicit_confirmation(
     assert metadata["company"] == "Example AI Systems"
     assert metadata["role"] == "Machine Learning Engineer"
     assert metadata["source_resume"]["unchanged"] is True
+    analytics = _analytics_store(tmp_path)
+    assert analytics.summary()["totals"]["jobs_approved_for_tailoring"] == 1
+    assert analytics.summary()["totals"]["applications_submitted"] == 0
+    assert len(analytics.sanitized_export()["resume_versions"]) == 1
     assert prompts == [
         'LinkedIn posting: type "approve" to continue: ',
         'Codex analysis: type "approve" to continue: ',

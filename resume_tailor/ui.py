@@ -30,6 +30,13 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.datastructures import FormData, UploadFile
 
 from . import __version__
+from .analytics import (
+    APPLICATION_STATUSES,
+    INTERVIEW_TYPES,
+    AnalyticsError,
+    AnalyticsStore,
+    default_analytics_database_path,
+)
 from .cli import _validate_label, run_pipeline
 from .docx_extract import validate_template
 from .linkedin_job import validate_linkedin_url
@@ -158,6 +165,7 @@ class UISettings:
     master_resume: Path
     launch_token: str
     timeout: tuple[int, str]
+    analytics_database: Path
 
 
 @dataclass
@@ -386,6 +394,12 @@ class RunManager:
                 payload,
             ),
             approval_handler=lambda request: self._await_approval(run_id, request),
+            approval_handler_presents=True,
+            warning_handler=lambda message, payload: self._warning(
+                run_id,
+                message,
+                payload,
+            ),
             cancel_event=record.cancel_event,
         )
         try:
@@ -503,6 +517,27 @@ class RunManager:
             record.revision += 1
             self._condition.notify_all()
 
+    def _warning(
+        self,
+        run_id: str,
+        message: str,
+        _payload: Mapping[str, Any],
+    ) -> None:
+        with self._condition:
+            record = self._records[run_id]
+            safe_message = message[:500]
+            record.message = safe_message
+            record.events.append(
+                {
+                    "time": _clock_text(),
+                    "stage": record.stage,
+                    "message": safe_message,
+                }
+            )
+            record.events[:] = record.events[-100:]
+            record.revision += 1
+            self._condition.notify_all()
+
     def _await_approval(
         self,
         run_id: str,
@@ -529,6 +564,8 @@ class RunManager:
                 }
             )
             record.revision += 1
+            if request.on_presented is not None:
+                request.on_presented()
             self._condition.notify_all()
             while record.approval_response is None:
                 if record.cancel_event.is_set():
@@ -1643,6 +1680,20 @@ def _form_text(form: FormData, name: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _form_local_timestamp(form: FormData, name: str) -> datetime | None:
+    value = _form_text(form, name)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise InputError(f"{name.replace('_', ' ').title()} is not a valid date/time.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        local_timezone = datetime.now().astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_timezone)
+    return parsed
+
+
 async def _prepare_namespace(
     *,
     request: Request,
@@ -1723,10 +1774,12 @@ async def _prepare_namespace(
             resume=resume_path,
             clipboard=False,
             job_file=job_file,
+            job_source_override=source_mode,
             job_url=job_url,
             company=company,
             role=role,
             output_dir=manager.settings.output_directory,
+            analytics_db=manager.settings.analytics_database,
             yes=False,
             keep_workdir=False,
             timeout=manager.settings.timeout,
@@ -1745,6 +1798,7 @@ def create_app(
     master_resume: Path | None = None,
     launch_token: str | None = None,
     timeout: tuple[int, str] | None = None,
+    analytics_database_path: Path | None = None,
     port: int = DEFAULT_PORT,
     pipeline_runner: PipelineRunner = run_pipeline,
 ) -> FastAPI:
@@ -1760,6 +1814,9 @@ def create_app(
         master_resume=(master_resume or default_master_resume()).expanduser().resolve(),
         launch_token=launch_token or secrets.token_urlsafe(32),
         timeout=timeout or parse_duration("15m"),
+        analytics_database=(
+            analytics_database_path or default_analytics_database_path()
+        ).expanduser().resolve(),
     )
     settings.output_directory.mkdir(parents=True, exist_ok=True)
     manager = RunManager(settings=settings, pipeline_runner=pipeline_runner)
@@ -1778,6 +1835,7 @@ def create_app(
     )
     app.state.settings = settings
     app.state.manager = manager
+    app.state.analytics_store = AnalyticsStore(settings.analytics_database)
     app.state.templates = Environment(
         loader=FileSystemLoader(str(template_directory)),
         autoescape=select_autoescape(("html", "xml")),
@@ -1831,6 +1889,148 @@ def create_app(
                 "form_values": {},
             },
         )
+
+    @app.get("/analytics", response_class=HTMLResponse)
+    async def analytics_dashboard(request: Request) -> HTMLResponse:
+        _require_session(request)
+        notice_messages = {
+            "status": "Application status recorded locally.",
+            "correction": "Correction event appended; prior history was preserved.",
+            "interview": "Manually confirmed interview recorded locally.",
+            "note": "Application note recorded locally.",
+        }
+        analytics_error: str | None = None
+        summary: dict[str, Any] | None
+        try:
+            summary = app.state.analytics_store.summary()
+        except (AnalyticsError, InputError):
+            summary = None
+            analytics_error = (
+                "The local analytics database is unavailable. Tailoring runs remain "
+                "usable; check the private application-data directory and retry."
+            )
+        return _render(
+            app,
+            request,
+            "analytics.html",
+            {
+                "summary": summary,
+                "analytics_error": analytics_error,
+                "notice": notice_messages.get(request.query_params.get("notice", "")),
+                "application_statuses": APPLICATION_STATUSES,
+                "interview_types": INTERVIEW_TYPES,
+                "analytics_database_name": settings.analytics_database.name,
+            },
+            status_code=503 if analytics_error else 200,
+        )
+
+    @app.post("/analytics/applications/{application_id}/status")
+    async def analytics_status(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        actions = {
+            "save": "saved",
+            "apply": "applied",
+            "screening": "screening",
+            "reject": "rejected",
+            "offer": "offer",
+            "withdraw": "withdrawn",
+        }
+        new_status = actions.get(_form_text(form, "action"))
+        if new_status is None:
+            raise HTTPException(status_code=422, detail="Choose a supported status action.")
+        try:
+            app.state.analytics_store.set_application_status(
+                application_id,
+                new_status,
+                source="manual_ui",
+                note=_form_text(form, "note") or None,
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not record this status.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=status", status_code=303)
+
+    @app.post("/analytics/applications/{application_id}/correction")
+    async def analytics_correction(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            app.state.analytics_store.correct_application_status(
+                application_id,
+                _form_text(form, "new_status"),
+                confirmed=_form_text(form, "confirm_correction") == "yes",
+                source="manual_ui",
+                note=_form_text(form, "note") or None,
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not append this correction.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=correction", status_code=303)
+
+    @app.post("/analytics/applications/{application_id}/interviews")
+    async def analytics_interview(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            app.state.analytics_store.record_interview(
+                application_id,
+                _form_text(form, "interview_type"),
+                confirmed=_form_text(form, "confirm_interview") == "yes",
+                scheduled_at=_form_local_timestamp(form, "scheduled_at"),
+                completed_at=_form_local_timestamp(form, "completed_at"),
+                contact_label=_form_text(form, "contact_label") or None,
+                result=_form_text(form, "result") or None,
+                notes=_form_text(form, "notes") or None,
+                source="manual_ui",
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not record this interview.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=interview", status_code=303)
+
+    @app.post("/analytics/applications/{application_id}/notes")
+    async def analytics_note(
+        request: Request,
+        application_id: int,
+    ) -> RedirectResponse:
+        form = await _limited_form(request, max_files=0)
+        _require_csrf(request, form)
+        try:
+            app.state.analytics_store.add_note(
+                application_id,
+                _form_text(form, "note"),
+                source="manual_ui",
+            )
+        except InputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AnalyticsError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The local analytics database could not record this note.",
+            ) from exc
+        return RedirectResponse("/analytics?notice=note", status_code=303)
 
     @app.post("/runs", response_class=HTMLResponse)
     async def start_run(request: Request):

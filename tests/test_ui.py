@@ -12,9 +12,11 @@ import httpx
 import pytest
 
 import resume_tailor.cli as cli_module
+from resume_tailor.analytics import observation_from_local_job
 from resume_tailor.cli import run_pipeline
 from resume_tailor.docx_extract import extract_resume
 from resume_tailor.job_requirements import build_job_requirement_catalog
+from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
 from resume_tailor.retry import analysis_input_manifest
 from resume_tailor.schemas import load_schema
@@ -34,6 +36,15 @@ from resume_tailor.utilities import (
 
 
 JOB_URL = "https://www.linkedin.com/jobs/view/platform-engineer-4123456789/"
+
+
+def _description_with_length(length: int) -> str:
+    fragment = "Build safe Python services and automated tests. "
+    value = (fragment * ((length // len(fragment)) + 1))[:length]
+    if value[-1].isspace():
+        value = value[:-1] + "x"
+    assert len(value) == length
+    return value
 
 
 def _posting(*, injection: bool = False) -> dict[str, Any]:
@@ -612,6 +623,7 @@ def test_ui_cli_does_not_offer_remote_binding() -> None:
     parser = build_ui_parser()
     args = parser.parse_args(["--no-browser"])
     assert args.port == 8765
+    assert args.analytics_db.name == "job-search-analytics.sqlite3"
     with pytest.raises(SystemExit):
         parser.parse_args(["--host", "0.0.0.0"])
 
@@ -685,8 +697,90 @@ def test_file_and_clipboard_text_input_modes(
             assert pipeline.namespaces[0].job_url is None
             assert pipeline.namespaces[0].writer_provider == "ollama"
             assert pipeline.namespaces[0].ollama_model == "resume-tailor-qwen"
+            assert pipeline.namespaces[0].job_source_override == mode
+            assert pipeline.namespaces[0].analytics_db == (
+                app.state.settings.analytics_database
+            )
             assert pipeline.job_texts
             assert "Python" in pipeline.job_texts[0]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["pasted", "file"])
+def test_6318_character_local_text_modes_reach_the_pipeline(
+    mode: str,
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = StubbedUIPipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+    description = _description_with_length(6_318)
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            files = (
+                {"job_file": ("job.txt", description.encode(), "text/plain")}
+                if mode == "file"
+                else None
+            )
+            run_id = await _start(
+                client,
+                token,
+                mode=mode,
+                files=files,
+                extra={"pasted_description": description},
+            )
+            await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
+            assert len(pipeline.job_texts[0].strip()) == 6_318
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["pasted", "file"])
+def test_over_limit_local_text_modes_report_actual_and_permitted(
+    mode: str,
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = StubbedUIPipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+    description = _description_with_length(actual)
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            files = (
+                {"job_file": ("job.txt", description.encode(), "text/plain")}
+                if mode == "file"
+                else None
+            )
+            response = await client.post(
+                "/runs",
+                data={
+                    "csrf_token": token,
+                    "resume_mode": "master",
+                    "job_mode": mode,
+                    "company": "Example Company",
+                    "role": "AI Engineer",
+                    "pasted_description": description if mode == "pasted" else "",
+                },
+                files=files,
+            )
+            assert response.status_code == 422
+            assert f"{actual:,}" in response.text
+            assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in response.text
+            assert pipeline.namespaces == []
 
     asyncio.run(scenario())
 
@@ -772,6 +866,110 @@ def test_rejected_job_confirmation_stops_before_resume_analysis(
     asyncio.run(scenario())
 
 
+def test_real_pipeline_records_view_only_after_ui_posting_gate_is_presented(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posting = _posting()
+
+    def retrieve(**kwargs: object) -> dict[str, Any]:
+        run_directory = kwargs["run_directory"]
+        assert isinstance(run_directory, Path)
+        (run_directory / "job-source.json").write_text(
+            json.dumps(posting),
+            encoding="utf-8",
+        )
+        return dict(posting)
+
+    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", retrieve)
+    monkeypatch.setattr(
+        cli_module,
+        "_analysis_dependency_versions",
+        lambda _directory: {"resume_tailor": "synthetic", "codex": "synthetic"},
+    )
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token)
+            await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
+            snapshot = app.state.manager.snapshot(run_id)
+            assert snapshot["approval"]["kind"] == "linkedin_posting"
+            summary = app.state.analytics_store.summary()
+            assert summary["totals"]["unique_jobs_viewed"] == 1
+            assert summary["totals"]["jobs_approved_for_tailoring"] == 0
+            await _approve(client, token, run_id, action="cancel")
+            await _wait(app, run_id, "CANCELLED")
+
+    asyncio.run(scenario())
+
+
+def test_real_pipeline_failed_retrieval_is_not_counted_as_viewed(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_apify_linkedin_retrieval",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ApifyLinkedInRetrievalError("malformed_output")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_analysis_dependency_versions",
+        lambda _directory: {"resume_tailor": "synthetic", "codex": "synthetic"},
+    )
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token)
+            await _wait(app, run_id, "FAILED")
+            assert app.state.analytics_store.summary()["totals"]["unique_jobs_viewed"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_real_ui_pasted_input_keeps_pasted_analytics_source(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUB_CODEX_MODE", "questions")
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=run_pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token, mode="pasted")
+            await _wait(app, run_id, "FAILED")
+            exported = app.state.analytics_store.sanitized_export()
+            assert exported["jobs"][0]["source"] == "pasted_text"
+            assert exported["aggregate_statistics"]["totals"]["unique_jobs_viewed"] == 1
+
+    asyncio.run(scenario())
+
+
 def test_use_pasted_description_from_confirmation_gate(
     master_resume: Path,
     tmp_path: Path,
@@ -801,6 +999,39 @@ def test_use_pasted_description_from_confirmation_gate(
             assert (
                 Path(run["artifact_directory"]) / "job-description.txt"
             ).read_text(encoding="utf-8").startswith("Complete manually")
+
+    asyncio.run(scenario())
+
+
+def test_over_limit_confirmation_fallback_reports_actual_and_permitted(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = StubbedUIPipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+    actual = MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS + 1
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token)
+            await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
+            response = await _approve(
+                client,
+                token,
+                run_id,
+                action="use_pasted",
+                fallback="x" * actual,
+            )
+            assert response.status_code == 409
+            detail = response.json()["detail"]
+            assert f"{actual:,}" in detail
+            assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in detail
+            assert app.state.manager.snapshot(run_id)["status"] == "AWAITING_APPROVAL"
 
     asyncio.run(scenario())
 
@@ -1818,5 +2049,147 @@ def test_artifact_download_and_path_traversal(
                 "/runs/history-unrelated/artifacts/private.pdf"
             )
             assert rejected_directory.status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_local_analytics_dashboard_and_explicit_tracking_actions(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    analytics_path = tmp_path / "private-data" / "job-search-analytics.sqlite3"
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=analytics_path,
+        pipeline_runner=StubbedUIPipeline(),
+    )
+    tracked = app.state.analytics_store.record_job_viewed(
+        observation_from_local_job(
+            company="Example Company",
+            title="Senior Platform Engineer",
+            description="Build safe PostgreSQL services with continuous integration.",
+            source="pasted_text",
+        )
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            page = await client.get("/analytics")
+            assert page.status_code == 200
+            assert "Job-search analytics" in page.text
+            assert "Unique jobs viewed" in page.text
+            assert "Applications submitted" in page.text
+            assert "Not enough data" in page.text
+            assert "Save job" in page.text
+            assert "Mark applied" in page.text
+            assert "Record screening" in page.text
+            assert "Record interview" in page.text
+            assert "Record rejection" in page.text
+            assert "Record offer" in page.text
+            assert "Withdraw application" in page.text
+            assert "Correct status" in page.text
+            assert "Add note" in page.text
+
+            saved = await client.post(
+                f"/analytics/applications/{tracked.application_id}/status",
+                data={"csrf_token": token, "action": "save"},
+            )
+            assert saved.status_code == 303
+            applied = await client.post(
+                f"/analytics/applications/{tracked.application_id}/status",
+                data={"csrf_token": token, "action": "apply"},
+            )
+            assert applied.status_code == 303
+
+            unconfirmed_correction = await client.post(
+                f"/analytics/applications/{tracked.application_id}/correction",
+                data={
+                    "csrf_token": token,
+                    "new_status": "saved",
+                    "note": "Correct the prior click",
+                },
+            )
+            assert unconfirmed_correction.status_code == 422
+            corrected = await client.post(
+                f"/analytics/applications/{tracked.application_id}/correction",
+                data={
+                    "csrf_token": token,
+                    "new_status": "saved",
+                    "note": "Correct the prior click",
+                    "confirm_correction": "yes",
+                },
+            )
+            assert corrected.status_code == 303
+
+            unconfirmed_interview = await client.post(
+                f"/analytics/applications/{tracked.application_id}/interviews",
+                data={
+                    "csrf_token": token,
+                    "interview_type": "technical_interview",
+                },
+            )
+            assert unconfirmed_interview.status_code == 422
+            interview = await client.post(
+                f"/analytics/applications/{tracked.application_id}/interviews",
+                data={
+                    "csrf_token": token,
+                    "interview_type": "technical_interview",
+                    "scheduled_at": "2026-08-10T09:30",
+                    "contact_label": "Engineering panel",
+                    "confirm_interview": "yes",
+                },
+            )
+            assert interview.status_code == 303
+            note = await client.post(
+                f"/analytics/applications/{tracked.application_id}/notes",
+                data={"csrf_token": token, "note": "Prepare system design examples"},
+            )
+            assert note.status_code == 303
+
+            history = app.state.analytics_store.application_history(
+                tracked.application_id
+            )
+            assert [item["event_kind"] for item in history].count("correction") == 1
+            assert history[-1]["new_status"] == "technical_interview"
+            refreshed = await client.get("/analytics")
+            assert refreshed.status_code == 200
+            assert "Active interviews" in refreshed.text
+            assert "technical interview" in refreshed.text.casefold()
+
+    asyncio.run(scenario())
+
+
+def test_analytics_routes_require_local_session_and_csrf(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "private-data" / "analytics.sqlite3",
+        pipeline_runner=StubbedUIPipeline(),
+    )
+    tracked = app.state.analytics_store.record_job_viewed(
+        observation_from_local_job(
+            company="Example Company",
+            title="Platform Engineer",
+            description="Build safe local systems.",
+            source="file",
+        )
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as anonymous:
+            denied = await anonymous.get("/analytics")
+            assert denied.status_code == 403
+        async with _client(app) as client:
+            await _session(client)
+            denied = await client.post(
+                f"/analytics/applications/{tracked.application_id}/status",
+                data={"csrf_token": "wrong", "action": "apply"},
+            )
+            assert denied.status_code == 403
 
     asyncio.run(scenario())

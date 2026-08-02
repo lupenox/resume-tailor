@@ -61,6 +61,9 @@ The web UI is optional. `tailor-resume` remains the complete terminal interface;
 
 The step-2 trust and transport boundary is documented in
 [docs/apify-linkedin-retrieval.md](docs/apify-linkedin-retrieval.md).
+The private SQLite job-search source of truth, deterministic statistics, and
+sanitized future-export boundary are documented in
+[docs/local-job-search-analytics.md](docs/local-job-search-analytics.md).
 
 Codex uses separate schemas and adapters for analysis and final QA.
 The full Draft 2020-12 schemas `linkedin_job.schema.json`,
@@ -111,8 +114,10 @@ copy-and-replace renderer and authenticated Antigravity recovery behavior.
 
 The UI uses FastAPI, server-rendered Jinja2 templates, local CSS, and a small
 amount of dependency-free JavaScript. There is no Node server, Electron runtime,
-external CDN, remote font, tracking, or analytics. A background worker calls the
-same `run_pipeline` function as the CLI through reusable progress, approval, and
+external CDN, remote font, third-party tracking, remote analytics, or telemetry.
+The optional Analytics section reads deterministic statistics from a private
+local SQLite database. A background worker calls the same `run_pipeline`
+function as the CLI through reusable progress, approval, warning, and
 cancellation hooks.
 
 The workflow page polls a small structured status endpoint. It displays concise
@@ -143,7 +148,9 @@ it is never offered for prose, fragments, or ambiguous output.
 The dashboard includes the protected bundled master or a validated DOCX upload;
 LinkedIn URL, pasted-text, and text-file inputs; a ten-stage live workflow; three
 approval gates; run history; validated downloads; final QA and factual-integrity
-results; and an in-browser PDF preview.
+results; and an in-browser PDF preview. `/analytics` separately shows viewed,
+tailoring-approved, generated-résumé, submitted-application, interview, offer,
+skill, role, seniority, workplace, applicant-count, and follow-up statistics.
 
 ### Synthetic UI preview
 
@@ -584,6 +591,12 @@ controls before use.
 
 Generated artifacts otherwise remain on the local filesystem unless you
 explicitly upload or share them. No keys or environment variables are logged.
+Phase 1 job-search analytics remains in
+`${XDG_DATA_HOME:-~/.local/share}/resume-tailor/data/job-search-analytics.sqlite3`;
+it stores structured job and application tracking data but never résumé body
+text, personal contact details, prompts, credentials, raw Actor output, or
+private diagnostics. Its sanitized export builder is local-only and does not
+transmit data.
 Ollama is contacted only at `127.0.0.1:11434`; Resume Tailor does not implement
 a remote Ollama endpoint or an automatic cloud-writer fallback. Raw prompt text
 is not stored. The sanitized envelope records prompt byte count/hash, selected
