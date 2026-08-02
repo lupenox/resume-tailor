@@ -554,6 +554,7 @@ def test_27_atomic_patch_application(master_resume: Path) -> None:
     extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume)
     catalog = writer.approved_edit_catalog(analysis)
     valid_digest = writer.canonical_digest(catalog)
+    master_before = copy.deepcopy(extracted["content"])
 
     # Patch 1 valid, Patch 2 invalid (numeric claim '9999')
     payload = {
@@ -584,6 +585,7 @@ def test_27_atomic_patch_application(master_resume: Path) -> None:
             extracted_resume=extracted,
             approved_analysis=analysis,
         )
+    assert extracted["content"] == master_before
 
 
 # 28, 29, 30. Changed-ID set equals approved target set; labels/names/dates/counts unchanged; passes Step 7.
@@ -624,6 +626,32 @@ def test_28_29_30_final_tailored_resume_validations(master_resume: Path) -> None
     changed = changed_content_ids(extracted["content"], tailored)
     approved_targets = {edit["target_source_id"] for edit in catalog}
     assert set(changed) == approved_targets
+
+    original = extracted["content"]
+    assert tailored["education"]["institution"] == original["education"]["institution"]
+    assert tailored["education"]["degree_details"] == original["education"]["degree_details"]
+    assert tailored["education"]["coursework"]["label"] == original["education"]["coursework"]["label"]
+    assert tailored["education"]["certifications"]["label"] == original["education"]["certifications"]["label"]
+    assert [group["label"] for group in tailored["skill_groups"]] == [
+        group["label"] for group in original["skill_groups"]
+    ]
+    assert [project["name"] for project in tailored["projects"]] == [
+        project["name"] for project in original["projects"]
+    ]
+    assert [project["technologies"] for project in tailored["projects"]] == [
+        project["technologies"] for project in original["projects"]
+    ]
+    assert tailored["open_source"]["name"] == original["open_source"]["name"]
+    assert tailored["open_source"]["technologies"] == original["open_source"]["technologies"]
+    assert tailored["experience"]["role"] == original["experience"]["role"]
+    assert tailored["experience"]["employer_location"] == original["experience"]["employer_location"]
+    assert tailored["experience"]["dates"] == original["experience"]["dates"]
+    assert len(tailored["skill_groups"]) == len(original["skill_groups"])
+    assert len(tailored["projects"]) == len(original["projects"])
+    assert [len(project["bullets"]) for project in tailored["projects"]] == [
+        len(project["bullets"]) for project in original["projects"]
+    ]
+    assert len(tailored["experience"]["bullets"]) == len(original["experience"]["bullets"])
 
     # Step 7 validation
     report = validate_tailored_content(
@@ -965,4 +993,131 @@ def test_43_revision_budget_and_digest_are_enforced(master_resume: Path) -> None
             master_content=extracted["content"],
             extracted_resume=extracted,
             approved_analysis=analysis,
+        )
+
+
+# Opus independent-audit follow-up regressions.
+def test_44_empty_catalog_is_an_explicit_atomic_noop(master_resume: Path) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    empty_analysis = copy.deepcopy(analysis)
+    empty_analysis["recommended_edits"] = []
+    payload = {
+        "status": "complete",
+        "message": "No approved edits.",
+        "catalog_sha256": writer.canonical_digest([]),
+        "cannot_apply": None,
+        "technical_failure": None,
+        "patches": [],
+    }
+    tailored = patch_engine.validate_and_apply_patches(
+        payload=payload,
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        approved_analysis=empty_analysis,
+    )
+    assert tailored == extracted["content"]
+    assert tailored is not extracted["content"]
+
+
+def _analysis_with_duplicate_summary_target(analysis: dict) -> dict:
+    duplicated = copy.deepcopy(analysis)
+    duplicated["recommended_edits"].append(
+        copy.deepcopy(duplicated["recommended_edits"][0])
+    )
+    return duplicated
+
+
+def test_45_duplicate_catalog_target_fails_before_writer(
+    master_resume: Path,
+) -> None:
+    extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume)
+    duplicated = _analysis_with_duplicate_summary_target(analysis)
+    with pytest.raises(writer.TailoringPreflightError, match="No writer request was launched"):
+        writer.build_ollama_tailoring_prompt(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=job_desc,
+            job_requirements=reqs,
+            approved_analysis=duplicated,
+            company="Synthetic Corp",
+            role="AI Engineer",
+        )
+
+
+def test_46_duplicate_catalog_target_fails_closed_in_applicator(
+    master_resume: Path,
+) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    duplicated = _analysis_with_duplicate_summary_target(analysis)
+    catalog = writer.approved_edit_catalog(duplicated)
+    payload = _valid_patch_payload(extracted, analysis)
+    payload["catalog_sha256"] = writer.canonical_digest(catalog)
+    payload["patches"].append(
+        {
+            "edit_id": "edit.003",
+            "target_source_id": "professional_summary",
+            "operation": "replace",
+            "replacement_text": "Another summary replacement.",
+        }
+    )
+    with pytest.raises(OllamaTailoringContractError, match="repeats target source IDs"):
+        patch_engine.validate_and_apply_patches(
+            payload=payload,
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            approved_analysis=duplicated,
+        )
+
+
+def test_47_short_forbidden_claims_use_token_boundaries(
+    master_resume: Path,
+) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    edit = writer.approved_edit_catalog(analysis)[0]
+    descriptor = patch_engine.resolve_target_descriptor(
+        edit, extracted["content"], extracted
+    )
+    evidence_texts = patch_engine.authorized_evidence_texts_for_edit(
+        edit, descriptor, extracted
+    )
+    with pytest.raises(OllamaTailoringContractError, match="forbidden claim"):
+        patch_engine._validate_replacement_text(
+            edit_id=descriptor.edit_id,
+            descriptor=descriptor,
+            replacement_text="AI engineer building Python workflows.",
+            evidence_texts=evidence_texts,
+            forbidden_claims=["AI"],
+        )
+
+    accepted = patch_engine._validate_replacement_text(
+        edit_id=descriptor.edit_id,
+        descriptor=descriptor,
+        replacement_text="Python training engineer building workflows.",
+        evidence_texts=evidence_texts,
+        forbidden_claims=["AI"],
+    )
+    assert accepted == "Python training engineer building workflows."
+
+
+def test_48_unicode_equivalent_replacement_is_rejected_as_noop() -> None:
+    descriptor = patch_engine.TargetDescriptor(
+        edit_id="edit.001",
+        target_source_id="professional_summary",
+        operation="replace",
+        kind="plain",
+        label=None,
+        current_mutable_text="Cafe\u0301 engineer",
+        exact_rendered_existing_text="Cafe\u0301 engineer",
+        maximum_rendered_characters=100,
+        proposed_text="Café engineer",
+        alignment_rationale="Synthetic",
+        evidence_source_ids=["professional_summary"],
+    )
+    with pytest.raises(OllamaTailoringContractError, match="no-op replacement"):
+        patch_engine._validate_replacement_text(
+            edit_id=descriptor.edit_id,
+            descriptor=descriptor,
+            replacement_text="Café engineer",
+            evidence_texts=[descriptor.exact_rendered_existing_text],
+            forbidden_claims=[],
         )
