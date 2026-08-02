@@ -114,18 +114,26 @@ def parse_target_source_id(
         if not isinstance(education, dict):
             raise TargetResolutionError("education missing")
         coursework = education.get("coursework")
-        if not isinstance(coursework, dict) or "label" not in coursework or "text" not in coursework:
+        if not isinstance(coursework, dict):
             raise TargetResolutionError("education.coursework missing or invalid")
-        return "composite_labelled", coursework, "text", str(coursework["label"])
+        label = coursework.get("label")
+        text = coursework.get("text")
+        if not isinstance(label, str) or not label.strip() or not isinstance(text, str):
+            raise TargetResolutionError("education.coursework missing or invalid composite label/body")
+        return "composite_labelled", coursework, "text", label
 
     if target_source_id == "education.certifications":
         education = content.get("education")
         if not isinstance(education, dict):
             raise TargetResolutionError("education missing")
         certs = education.get("certifications")
-        if not isinstance(certs, dict) or "label" not in certs or "text" not in certs:
+        if not isinstance(certs, dict):
             raise TargetResolutionError("education.certifications missing or invalid")
-        return "composite_labelled", certs, "text", str(certs["label"])
+        label = certs.get("label")
+        text = certs.get("text")
+        if not isinstance(label, str) or not label.strip() or not isinstance(text, str):
+            raise TargetResolutionError("education.certifications missing or invalid composite label/body")
+        return "composite_labelled", certs, "text", label
 
     m_sg = re.fullmatch(r"skill_groups\.(\d+)", target_source_id)
     if m_sg:
@@ -134,9 +142,13 @@ def parse_target_source_id(
         if not isinstance(groups, list) or index < 0 or index >= len(groups):
             raise TargetResolutionError(f"skill_groups index {index} out of bounds")
         group = groups[index]
-        if not isinstance(group, dict) or "label" not in group or "text" not in group:
+        if not isinstance(group, dict):
             raise TargetResolutionError(f"skill_groups.{index} invalid")
-        return "composite_labelled", group, "text", str(group["label"])
+        label = group.get("label")
+        text = group.get("text")
+        if not isinstance(label, str) or not label.strip() or not isinstance(text, str):
+            raise TargetResolutionError(f"skill_groups.{index} missing or invalid composite label/body")
+        return "composite_labelled", group, "text", label
 
     m_exp = re.fullmatch(r"experience\.bullets\.(\d+)", target_source_id)
     if m_exp:
@@ -217,30 +229,41 @@ def mutable_proposed_text(
     edit: dict[str, Any],
     descriptor: TargetDescriptor,
 ) -> str:
-    """Return the approved proposed mutable body without an immutable label."""
+    """Return the approved proposed mutable body without an immutable label.
+
+    For composite-labelled targets only, strip the leading prefix when it
+    exactly matches the authenticated label (under canonical Unicode
+    normalization) followed by ``:``.  Any other text—including colons in
+    prose, URLs, version strings, or mismatched labels—is returned
+    unchanged.
+    """
     proposed = edit.get("proposed_text")
     if not isinstance(proposed, str) or not proposed.strip():
         return ""
-    if descriptor.kind != "composite_labelled" or descriptor.label is None:
+    if descriptor.kind != "composite_labelled":
         return proposed
 
+    if not isinstance(descriptor.label, str) or not descriptor.label.strip():
+        raise TargetResolutionError(
+            f"{descriptor.target_source_id!r} missing or invalid composite label/body"
+        )
+
     stripped = proposed.strip()
-    exact_prefix = f"{descriptor.label}:"
-    if stripped.startswith(exact_prefix):
-        body = stripped[len(exact_prefix):].lstrip()
+    colon_index = stripped.find(":")
+    if colon_index == -1:
+        return proposed
+
+    candidate_prefix = stripped[:colon_index]
+    if _canonical_unicode(candidate_prefix) == _canonical_unicode(descriptor.label):
+        body = stripped[colon_index + 1:].lstrip()
         if not body:
             raise TargetResolutionError(
-                f"Approved edit {descriptor.edit_id} contains no mutable text after its immutable label."
+                f"Approved edit {descriptor.edit_id} for"
+                f" {descriptor.target_source_id!r} contains no mutable"
+                f" text after its authenticated label prefix."
             )
         return body
 
-    if ":" in stripped:
-        possible_label, _body = stripped.split(":", 1)
-        if 0 < len(possible_label.strip()) <= 80:
-            raise TargetResolutionError(
-                f"Approved edit {descriptor.edit_id} attempts to rewrite the immutable label for "
-                f"{descriptor.target_source_id!r}."
-            )
     return proposed
 
 

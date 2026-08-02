@@ -114,6 +114,8 @@ ANALYSIS REQUIREMENTS
   occurs in the cited résumé blocks.
 - Every recommended edit must return one target_source_id, replace or append as
   its operation, proposed_text, alignment rationale, and evidence_source_ids.
+- For composite targets, proposed_text must represent the mutable body text only;
+  do not author, copy, or rewrite section or group labels.
 - Never return existing source text. Local code resolves existing_text, section
   context, and displayed evidence from the immutable source catalog.
 - Treat technologies used, employment, education, dates, metrics, certifications,
