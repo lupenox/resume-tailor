@@ -3,7 +3,7 @@ name: Trigger Gemma patch review
 on:
   pull_request:
     branches: [main]
-    types: [opened]
+    types: [opened, synchronize]
 
 permissions:
   contents: write
@@ -33,25 +33,20 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          from textwrap import dedent
 
           source = Path('.github/workflows/gemma-patch-review.yml').read_text(encoding='utf-8')
-          start_marker = "      - name: Apply bounded review corrections\n        run: |\n"
-          end_marker = "\n      - name: Install test dependencies"
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n"
           if start_marker not in source or end_marker not in source:
-              raise SystemExit('Could not locate the bounded correction block')
-          block = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
-          lines = []
-          for line in block.splitlines():
-              if line.startswith('          '):
-                  lines.append(line[10:])
-              else:
-                  lines.append(line)
-          script = '#!/usr/bin/env bash\nset -euo pipefail\n' + '\n'.join(lines) + '\n'
-          path = Path('/tmp/apply-gemma-patch-review.sh')
+              raise SystemExit('Could not locate the embedded correction Python block')
+          embedded = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
+          script = dedent(embedded).rstrip() + '\n'
+          path = Path('/tmp/apply-gemma-patch-review.py')
           path.write_text(script, encoding='utf-8')
-          path.chmod(0o700)
           PY
-          /tmp/apply-gemma-patch-review.sh
+          python /tmp/apply-gemma-patch-review.py
+          rm -f .github/workflows/gemma-patch-review.yml
           rm -f .github/workflows/trigger-gemma-patch-review.yml
 
       - name: Install test dependencies
