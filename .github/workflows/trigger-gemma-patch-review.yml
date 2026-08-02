@@ -51,37 +51,58 @@ jobs:
           from textwrap import dedent
           import re
 
-          def normalize_block(path: str, start_pattern: str, end_pattern: str | None = None) -> None:
+          def normalize_if_indented(
+              path: str,
+              function_name: str,
+              end_function_name: str | None = None,
+          ) -> None:
               file_path = Path(path)
               text = file_path.read_text(encoding='utf-8')
-              start = re.search(start_pattern, text, flags=re.M)
+              unindented = re.search(rf'^def {re.escape(function_name)}\(', text, flags=re.M)
+              if unindented is not None:
+                  return
+              start = re.search(
+                  rf'^[ \t]+def {re.escape(function_name)}\(',
+                  text,
+                  flags=re.M,
+              )
               if start is None:
-                  raise SystemExit(f'Generated block start not found in {path}: {start_pattern}')
+                  raise SystemExit(
+                      f'Generated function {function_name} was not found in {path}'
+                  )
               start_index = start.start()
-              if end_pattern is None:
+              if end_function_name is None:
                   end_index = len(text)
               else:
-                  end = re.search(end_pattern, text[start.end():], flags=re.M)
+                  end = re.search(
+                      rf'^def {re.escape(end_function_name)}\(',
+                      text[start.end():],
+                      flags=re.M,
+                  )
                   if end is None:
-                      raise SystemExit(f'Generated block end not found in {path}: {end_pattern}')
+                      raise SystemExit(
+                          f'Generated end function {end_function_name} was not found in {path}'
+                      )
                   end_index = start.end() + end.start()
               block = text[start_index:end_index]
-              normalized = dedent(block)
-              file_path.write_text(text[:start_index] + normalized + text[end_index:], encoding='utf-8')
+              file_path.write_text(
+                  text[:start_index] + dedent(block) + text[end_index:],
+                  encoding='utf-8',
+              )
 
-          normalize_block(
+          normalize_if_indented(
               'resume_tailor/patch_engine.py',
-              r'^[ \t]+def mutable_proposed_text\(',
+              'mutable_proposed_text',
           )
-          normalize_block(
+          normalize_if_indented(
               'resume_tailor/ollama_writer.py',
-              r'^[ \t]+def build_ollama_revision_prompt\(',
-              r'^def _validate_gemma_structural_contract\(',
+              'build_ollama_revision_prompt',
+              '_validate_gemma_structural_contract',
           )
-          normalize_block(
+          normalize_if_indented(
               'resume_tailor/ollama_probe.py',
-              r'^[ \t]+def _minimal_complete_instance\(',
-              r'^def probe_structured_output_support\(',
+              '_minimal_complete_instance',
+              'probe_structured_output_support',
           )
           PY
 
