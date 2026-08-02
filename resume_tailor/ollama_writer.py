@@ -17,7 +17,11 @@ from .ollama_capabilities import (
 from .ollama_probe import probe_structured_output_support
 from .ollama_transport import OLLAMA_BASE_URL, run_ollama_request
 from .patch_engine import (
+    TargetResolutionError,
+    authenticated_metrics_for_edit,
+    authorized_evidence_texts_for_edit,
     canonical_digest,
+    mutable_proposed_text,
     parse_target_source_id,
     resolve_target_descriptor,
     validate_and_apply_patches,
@@ -171,7 +175,7 @@ def _write_tailoring_patch_transport_schema(
     }
     edit_ids = [edit["edit_id"] for edit in catalog if isinstance(edit, dict) and "edit_id" in edit]
     target_ids = [edit["target_source_id"] for edit in catalog if isinstance(edit, dict) and "target_source_id" in edit]
-    ops = list({edit.get("operation", "replace") for edit in catalog if isinstance(edit, dict)})
+    ops = sorted({edit.get("operation", "replace") for edit in catalog if isinstance(edit, dict)})
 
     patches_schema = schema["properties"].get("patches")
     if isinstance(patches_schema, dict) and "oneOf" in patches_schema:
@@ -211,6 +215,8 @@ def _write_revision_patch_transport_schema(
     if isinstance(patches_schema, dict) and "oneOf" in patches_schema:
         for branch in patches_schema["oneOf"]:
             if isinstance(branch, dict) and branch.get("type") == "array" and "items" in branch:
+                branch["minItems"] = len(target_map)
+                branch["maxItems"] = len(target_map)
                 props = branch["items"].get("properties", {})
                 if all_issue_ids and "issue_id" in props:
                     props["issue_id"]["enum"] = all_issue_ids
@@ -320,26 +326,36 @@ def build_ollama_tailoring_prompt(
     catalog = approved_edit_catalog(approved_analysis)
     catalog_sha256 = canonical_digest(catalog)
 
-    target_descriptors = [
-        {
-            "edit_id": edit["edit_id"],
-            "target_source_id": edit["target_source_id"],
-            "operation": edit.get("operation", "replace"),
-            "current_mutable_text": resolve_target_descriptor(edit, master_content, extracted_resume).current_mutable_text,
-            "exact_rendered_existing_text": resolve_target_descriptor(edit, master_content, extracted_resume).exact_rendered_existing_text,
-            "label_if_composite": resolve_target_descriptor(edit, master_content, extracted_resume).label,
-            "maximum_rendered_characters": resolve_target_descriptor(edit, master_content, extracted_resume).maximum_rendered_characters,
-            "proposed_text": edit.get("proposed_text", ""),
-            "alignment_rationale": edit.get("alignment_rationale", ""),
-            "evidence_source_ids": edit.get("evidence_source_ids", []),
-        }
-        for edit in catalog
-    ]
+    target_descriptors: list[dict[str, Any]] = []
+    try:
+        for edit in catalog:
+            descriptor = resolve_target_descriptor(
+                edit, master_content, extracted_resume
+            )
+            target_descriptors.append(
+                {
+                    "edit_id": descriptor.edit_id,
+                    "target_source_id": descriptor.target_source_id,
+                    "operation": descriptor.operation,
+                    "current_mutable_text": descriptor.current_mutable_text,
+                    "exact_rendered_existing_text": descriptor.exact_rendered_existing_text,
+                    "label_if_composite": descriptor.label,
+                    "maximum_rendered_characters": descriptor.maximum_rendered_characters,
+                    "approved_proposed_mutable_text": mutable_proposed_text(edit, descriptor),
+                    "alignment_rationale": descriptor.alignment_rationale,
+                    "evidence_source_ids": descriptor.evidence_source_ids,
+                    "authenticated_metrics": authenticated_metrics_for_edit(
+                        edit, descriptor, extracted_resume
+                    ),
+                }
+            )
+    except TargetResolutionError as exc:
+        raise TailoringPreflightError(
+            "Local Ollama tailoring preflight failed: an approved edit target "
+            "cannot be resolved safely. No writer request was launched."
+        ) from exc
 
     source_catalog = _authorized_source_catalog(extracted_resume, edits)
-    constraint_manifest = _build_constraint_manifest(
-        master_content, extracted_resume, edits, approved_analysis
-    )
 
     return f"""Author target-only edits for the approved resume tailoring now. Return exactly one
 JSON object matching the supplied structured-output schema. Do not return
@@ -359,8 +375,8 @@ APPROVED EDIT CATALOG & TARGET DESCRIPTORS
 AUTHORIZED SOURCE EVIDENCE FOR THOSE EDITS
 {_canonical_json(source_catalog)}
 
-AUTHENTICATED METRICS
-{_canonical_json(constraint_manifest['authenticated_metrics'])}
+PER-TARGET AUTHENTICATED METRICS
+Each target descriptor contains only metrics authenticated by that target and its cited evidence.
 
 IMMUTABLE FACTS
 {_canonical_json(approved_analysis['immutable_facts'])}
@@ -379,7 +395,7 @@ AUTHORING RULES
 3. STAY WITHIN CHARACTER BUDGETS.
    - The rendered text (including label if composite) MUST NOT exceed maximum_rendered_characters.
 4. NO UNSUPPORTED CLAIMS OR NEW METRICS.
-   - Do not introduce any new numbers or metrics not present in AUTHENTICATED METRICS.
+   - Do not introduce any new numbers or metrics not present in that target descriptor's authenticated_metrics.
    - Do not introduce any unsupported technology or qualification lacking verbatim source evidence.
 5. REQUIRED STRUCTURED ENVELOPE.
    - Set "catalog_sha256" to "{catalog_sha256}".
@@ -736,27 +752,50 @@ def build_ollama_revision_prompt(
         qa_result=qa_result,
         approved_analysis=approved_analysis,
     )
+    if not target_map:
+        raise OllamaRevisionContractError(
+            "The supplied QA findings contain no authenticated revision target."
+        )
     authorization_sha256 = canonical_digest(target_map)
+    catalog_by_target = {
+        edit["target_source_id"]: edit
+        for edit in approved_edit_catalog(approved_analysis)
+    }
 
-    target_descriptors = []
-    for content_id, issue_ids in target_map.items():
-        kind, container, key, label = parse_target_source_id(content_id, current_tailored_content)
-        curr_text = str(container[key])
-        exact_rendered = f"{label}: {curr_text}" if kind == "composite_labelled" else curr_text
-        budgets = {
-            p["content_id"]: p["content_budget"]["maximum_characters"]
-            for p in extracted_resume.get("paragraphs", [])
-            if isinstance(p, dict) and "content_id" in p and "content_budget" in p
-        }
-        max_chars = budgets.get(content_id, 1000)
-        target_descriptors.append({
-            "target_source_id": content_id,
-            "authorized_issue_ids": issue_ids,
-            "current_mutable_text": curr_text,
-            "exact_rendered_existing_text": exact_rendered,
-            "label_if_composite": label,
-            "maximum_rendered_characters": max_chars,
-        })
+    target_descriptors: list[dict[str, Any]] = []
+    try:
+        for content_id, issue_ids in target_map.items():
+            edit = catalog_by_target.get(content_id)
+            if edit is None:
+                raise TargetResolutionError(
+                    f"Revision target {content_id!r} has no approved edit."
+                )
+            descriptor = resolve_target_descriptor(
+                edit,
+                current_tailored_content,
+                extracted_resume,
+            )
+            target_descriptors.append(
+                {
+                    "target_source_id": content_id,
+                    "authorized_issue_ids": issue_ids,
+                    "current_mutable_text": descriptor.current_mutable_text,
+                    "exact_rendered_existing_text": descriptor.exact_rendered_existing_text,
+                    "label_if_composite": descriptor.label,
+                    "maximum_rendered_characters": descriptor.maximum_rendered_characters,
+                    "approved_proposed_mutable_text": mutable_proposed_text(edit, descriptor),
+                    "authenticated_metrics": authenticated_metrics_for_edit(
+                        edit, descriptor, extracted_resume
+                    ),
+                    "authorized_source_evidence": authorized_evidence_texts_for_edit(
+                        edit, descriptor, extracted_resume
+                    ),
+                }
+            )
+    except TargetResolutionError as exc:
+        raise OllamaRevisionContractError(
+            "The revision target catalog cannot be resolved safely."
+        ) from exc
 
     return f"""Author target-only revision edits for the QA-identified resume issues now. Return exactly one
 JSON object matching the supplied structured-output schema. Do not return
@@ -773,7 +812,7 @@ AUTHORIZATION SHA256 DIGEST
 LOCALLY VALIDATED CODEX QA ISSUE CATALOG
 {_canonical_json(qa_result.get('issues', []))}
 
-REVISION TARGET AUTHORIZATION & DESCRIPTORS
+REVISION TARGET AUTHORIZATION, EVIDENCE, AND DESCRIPTORS
 {_canonical_json(target_descriptors)}
 
 IMMUTABLE FACTS
@@ -784,14 +823,18 @@ FORBIDDEN CLAIMS
 
 AUTHORING RULES
 1. AUTHOR ONLY MUTABLE REVISION TARGET VALUES.
-   - Author bounded replacement text for authorized targets to address specific QA issues.
-   - For composite targets with labels, return ONLY the mutable body text (NEVER include the label).
+   - Author exactly one bounded replacement for every authorized target.
+   - For composite targets with labels, return ONLY the mutable body text.
 2. ADDRESS ONLY AUTHORIZED QA ISSUES.
-   - Change only targets authorized in REVISION TARGET AUTHORIZATION.
-3. REQUIRED STRUCTURED ENVELOPE.
+   - Change only targets in REVISION TARGET AUTHORIZATION.
+3. PRESERVE EVIDENCE AND BUDGET BOUNDARIES.
+   - Do not add a number absent from the target's authenticated_metrics.
+   - Do not add an unsupported skill absent from authorized_source_evidence.
+   - Stay within maximum_rendered_characters, including immutable labels.
+4. REQUIRED STRUCTURED ENVELOPE.
    - Set "authorization_sha256" to "{authorization_sha256}".
-   - Return status "complete" with "patches" containing revision patches.
-   - Return status "cannot_apply" with issue_id and reason_code if an issue cannot be safely resolved.
+   - Return status "complete" with one patch per authorized target.
+   - Return status "cannot_apply" for an authorized issue if it cannot be safely resolved.
 """
 
 

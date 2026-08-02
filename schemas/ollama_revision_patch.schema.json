@@ -123,7 +123,7 @@
         "properties": {
           "patches": {
             "type": "array",
-            "minItems": 0
+            "minItems": 1
           },
           "cannot_apply": {"type": "null"},
           "technical_failure": {"type": "null"}

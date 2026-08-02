@@ -157,7 +157,11 @@ def resolve_target_descriptor(
         for p in extracted_resume.get("paragraphs", [])
         if isinstance(p, dict) and "content_id" in p and "content_budget" in p
     }
-    maximum_characters = budgets.get(target_id, 1000)
+    maximum_characters = budgets.get(target_id)
+    if not isinstance(maximum_characters, int) or maximum_characters <= 0:
+        raise TargetResolutionError(
+            f"Target source ID {target_id!r} has no authenticated content budget."
+        )
 
     return TargetDescriptor(
         edit_id=edit_id,
@@ -172,6 +176,163 @@ def resolve_target_descriptor(
         alignment_rationale=rationale,
         evidence_source_ids=list(evidence_ids) if isinstance(evidence_ids, list) else [],
     )
+
+
+def mutable_proposed_text(
+    edit: dict[str, Any],
+    descriptor: TargetDescriptor,
+) -> str:
+    """Return the approved proposed mutable body without an immutable label."""
+    proposed = edit.get("proposed_text")
+    if not isinstance(proposed, str) or not proposed.strip():
+        return ""
+    if descriptor.kind != "composite_labelled" or descriptor.label is None:
+        return proposed
+
+    stripped = proposed.strip()
+    exact_prefix = f"{descriptor.label}:"
+    if stripped.startswith(exact_prefix):
+        body = stripped[len(exact_prefix):].lstrip()
+        if not body:
+            raise TargetResolutionError(
+                f"Approved edit {descriptor.edit_id} contains no mutable text after its immutable label."
+            )
+        return body
+
+    if ":" in stripped:
+        possible_label, _body = stripped.split(":", 1)
+        if 0 < len(possible_label.strip()) <= 80:
+            raise TargetResolutionError(
+                f"Approved edit {descriptor.edit_id} attempts to rewrite the immutable label for "
+                f"{descriptor.target_source_id!r}."
+            )
+    return proposed
+
+
+def authorized_evidence_texts_for_edit(
+    edit: dict[str, Any],
+    descriptor: TargetDescriptor,
+    extracted_resume: dict[str, Any],
+) -> list[str]:
+    """Resolve only the target and evidence blocks authenticated for one edit."""
+    texts = [descriptor.exact_rendered_existing_text]
+    source_index = {
+        block.get("source_id"): block
+        for block in extracted_resume.get("source_blocks", [])
+        if isinstance(block, dict) and isinstance(block.get("source_id"), str)
+    }
+    source_ids: list[str] = [descriptor.target_source_id]
+    evidence_ids = edit.get("evidence_source_ids")
+    if isinstance(evidence_ids, list):
+        source_ids.extend(item for item in evidence_ids if isinstance(item, str))
+    for source_id in source_ids:
+        block = source_index.get(source_id)
+        exact_text = block.get("exact_text") if isinstance(block, dict) else None
+        if isinstance(exact_text, str) and exact_text not in texts:
+            texts.append(exact_text)
+    return texts
+
+
+def authenticated_metrics_for_edit(
+    edit: dict[str, Any],
+    descriptor: TargetDescriptor,
+    extracted_resume: dict[str, Any],
+) -> list[str]:
+    return sorted(
+        set(
+            _NUMBER_RE.findall(
+                " ".join(
+                    authorized_evidence_texts_for_edit(
+                        edit,
+                        descriptor,
+                        extracted_resume,
+                    )
+                )
+            )
+        )
+    )
+
+
+def _validate_replacement_text(
+    *,
+    edit_id: str,
+    descriptor: TargetDescriptor,
+    replacement_text: Any,
+    evidence_texts: list[str],
+    forbidden_claims: list[Any],
+    operation: str | None = None,
+) -> str:
+    if not isinstance(replacement_text, str) or not replacement_text.strip():
+        raise OllamaTailoringContractError(
+            f"Patch for {edit_id} has empty replacement_text."
+        )
+    if replacement_text == descriptor.current_mutable_text:
+        raise OllamaTailoringContractError(
+            f"Patch for {edit_id} is a no-op replacement."
+        )
+
+    if descriptor.kind == "composite_labelled" and descriptor.label is not None:
+        if normalized_text(replacement_text).startswith(normalized_text(descriptor.label)):
+            raise OllamaTailoringContractError(
+                f"Patch for {edit_id} illegally contains label {descriptor.label!r} "
+                "inside replacement text."
+            )
+
+    effective_operation = operation or descriptor.operation
+    if effective_operation == "append":
+        if not replacement_text.startswith(descriptor.current_mutable_text):
+            raise OllamaTailoringContractError(
+                f"Append patch for {edit_id} does not preserve the original prefix."
+            )
+        if len(replacement_text) <= len(descriptor.current_mutable_text):
+            raise OllamaTailoringContractError(
+                f"Append patch for {edit_id} did not add a nonempty suffix."
+            )
+    elif effective_operation != "replace":
+        raise OllamaTailoringContractError(
+            f"Patch for {edit_id} uses unsupported operation {effective_operation!r}."
+        )
+
+    rendered_text = (
+        f"{descriptor.label}: {replacement_text}"
+        if descriptor.kind == "composite_labelled" and descriptor.label is not None
+        else replacement_text
+    )
+    if len(rendered_text) > descriptor.maximum_rendered_characters:
+        raise OllamaTailoringContractError(
+            f"Patch for {edit_id} ({len(rendered_text)} chars) exceeds target budget "
+            f"of {descriptor.maximum_rendered_characters}."
+        )
+
+    authorized_text = " ".join(evidence_texts)
+    authenticated_metrics = set(_NUMBER_RE.findall(authorized_text))
+    new_metrics = set(_NUMBER_RE.findall(replacement_text)) - authenticated_metrics
+    if new_metrics:
+        raise OllamaTailoringContractError(
+            f"Patch for {edit_id} introduces unauthenticated numeric claims: "
+            f"{sorted(new_metrics)}."
+        )
+
+    if re.fullmatch(r"skill_groups\.\d+", descriptor.target_source_id):
+        normalized_evidence = normalized_text(authorized_text)
+        for item in re.split(r"\s*[,•]\s*", replacement_text):
+            candidate = item.strip().rstrip(".")
+            if candidate and normalized_text(candidate) not in normalized_evidence:
+                raise OllamaTailoringContractError(
+                    f"Patch for {edit_id} adds skill item {candidate!r} without "
+                    "authenticated source evidence."
+                )
+
+    normalized_replacement = normalized_text(replacement_text)
+    for forbidden in forbidden_claims:
+        if not isinstance(forbidden, str):
+            continue
+        normalized_forbidden = normalized_text(forbidden)
+        if len(normalized_forbidden) >= 8 and normalized_forbidden in normalized_replacement:
+            raise OllamaTailoringContractError(
+                f"Patch for {edit_id} contains a forbidden claim."
+            )
+    return replacement_text
 
 
 def apply_patch_to_target(
@@ -191,7 +352,7 @@ def validate_and_apply_patches(
     extracted_resume: dict[str, Any],
     approved_analysis: dict[str, Any],
 ) -> dict[str, Any]:
-    """Atomically validate returned patch payload and apply to master_content deep copy."""
+    """Atomically validate a complete patch transaction and merge it locally."""
     try:
         validate_payload(
             payload,
@@ -203,30 +364,6 @@ def validate_and_apply_patches(
             "Gemma 4 12B output failed canonical patch envelope validation."
         ) from exc
 
-    status = payload.get("status")
-    if status == "cannot_apply":
-        detail = payload.get("cannot_apply")
-        allowed_ids = {
-            edit["edit_id"] for edit in approved_edit_catalog(approved_analysis)
-        }
-        if not isinstance(detail, dict) or detail.get("edit_id") not in allowed_ids:
-            raise OllamaEvidenceRejectionError(
-                "The local writer returned an unknown approved edit ID in cannot_apply."
-            )
-        raise OllamaCannotApplyError(
-            f"The local writer could not apply approved {detail['edit_id']} ({detail['reason_code']})."
-        )
-
-    if status == "technical_failure":
-        detail = payload.get("technical_failure")
-        reason_code = detail.get("reason_code") if isinstance(detail, dict) else "unknown"
-        raise OllamaTechnicalFailureError(
-            f"The local writer reported technical failure {reason_code}. Provider prose was omitted."
-        )
-
-    if status != "complete":
-        raise OllamaTailoringContractError(f"Unexpected status {status!r} in patch envelope.")
-
     catalog = approved_edit_catalog(approved_analysis)
     expected_sha256 = canonical_digest(catalog)
     actual_sha256 = payload.get("catalog_sha256")
@@ -235,162 +372,149 @@ def validate_and_apply_patches(
             "The returned catalog_sha256 digest does not match the current approved edit catalog."
         )
 
+    status = payload.get("status")
+    if status == "cannot_apply":
+        detail = payload.get("cannot_apply")
+        allowed_ids = {edit["edit_id"] for edit in catalog}
+        if not isinstance(detail, dict) or detail.get("edit_id") not in allowed_ids:
+            raise OllamaEvidenceRejectionError(
+                "The local writer returned an unknown approved edit ID in cannot_apply."
+            )
+        raise OllamaCannotApplyError(
+            f"The local writer could not apply approved {detail['edit_id']} "
+            f"({detail['reason_code']})."
+        )
+    if status == "technical_failure":
+        detail = payload.get("technical_failure")
+        reason_code = detail.get("reason_code") if isinstance(detail, dict) else "unknown"
+        raise OllamaTechnicalFailureError(
+            f"The local writer reported technical failure {reason_code}. "
+            "Provider prose was omitted."
+        )
+    if status != "complete":
+        raise OllamaTailoringContractError(
+            f"Unexpected status {status!r} in patch envelope."
+        )
+
     patches = payload.get("patches")
     if not isinstance(patches, list):
-        raise OllamaTailoringContractError("Patch envelope 'patches' field must be an array.")
-
+        raise OllamaTailoringContractError(
+            "Patch envelope 'patches' field must be an array."
+        )
     if len(patches) != len(catalog):
         raise OllamaTailoringContractError(
-            f"Patch set size ({len(patches)}) does not match approved edit count ({len(catalog)})."
+            f"Patch set size ({len(patches)}) does not match approved edit count "
+            f"({len(catalog)})."
         )
 
     descriptors_by_edit_id: dict[str, TargetDescriptor] = {}
-    for edit in catalog:
-        descriptor = resolve_target_descriptor(edit, master_content, extracted_resume)
-        descriptors_by_edit_id[edit["edit_id"]] = descriptor
+    edits_by_edit_id: dict[str, dict[str, Any]] = {}
+    try:
+        for edit in catalog:
+            descriptor = resolve_target_descriptor(
+                edit,
+                master_content,
+                extracted_resume,
+            )
+            descriptors_by_edit_id[edit["edit_id"]] = descriptor
+            edits_by_edit_id[edit["edit_id"]] = edit
+    except TargetResolutionError as exc:
+        raise OllamaTailoringContractError(
+            "The approved patch target catalog cannot be resolved safely."
+        ) from exc
 
     seen_edit_ids: set[str] = set()
     seen_target_ids: set[str] = set()
-
-    # Authenticated metrics calculation for numeric claim verification
-    from .evidence import _resume_text
-    authorized_evidence_texts = [_resume_text(master_content)]
-    source_blocks = extracted_resume.get("source_blocks", [])
-    if isinstance(source_blocks, list):
-        for block in source_blocks:
-            if isinstance(block, dict) and isinstance(block.get("exact_text"), str):
-                authorized_evidence_texts.append(block["exact_text"])
-    for edit in approved_analysis.get("recommended_edits", []):
-        if isinstance(edit, dict):
-            for block in edit.get("resolved_evidence", []):
-                if isinstance(block, dict) and isinstance(block.get("exact_text"), str):
-                    authorized_evidence_texts.append(block["exact_text"])
-
-    authenticated_metrics = set(_NUMBER_RE.findall(" ".join(authorized_evidence_texts)))
     forbidden_claims = approved_analysis.get("forbidden_claims", [])
+    if not isinstance(forbidden_claims, list):
+        forbidden_claims = []
 
-    for idx, patch in enumerate(patches):
+    for index, patch in enumerate(patches):
         if not isinstance(patch, dict):
-            raise OllamaTailoringContractError(f"Patch {idx} is not an object.")
-
+            raise OllamaTailoringContractError(f"Patch {index} is not an object.")
         edit_id = patch.get("edit_id")
         target_id = patch.get("target_source_id")
         operation = patch.get("operation")
-        replacement_text = patch.get("replacement_text")
 
         if edit_id not in descriptors_by_edit_id:
-            raise OllamaTailoringContractError(f"Patch {idx} specifies unknown edit_id {edit_id!r}.")
-
+            raise OllamaTailoringContractError(
+                f"Patch {index} specifies unknown edit_id {edit_id!r}."
+            )
         if edit_id in seen_edit_ids:
-            raise OllamaTailoringContractError(f"Duplicate patch for edit_id {edit_id!r}.")
+            raise OllamaTailoringContractError(
+                f"Duplicate patch for edit_id {edit_id!r}."
+            )
         seen_edit_ids.add(edit_id)
+        descriptor = descriptors_by_edit_id[edit_id]
+        edit = edits_by_edit_id[edit_id]
 
-        desc = descriptors_by_edit_id[edit_id]
-
-        if target_id != desc.target_source_id:
+        if target_id != descriptor.target_source_id:
             raise OllamaTailoringContractError(
-                f"Patch for {edit_id} target_source_id {target_id!r} does not match approved target {desc.target_source_id!r}."
+                f"Patch for {edit_id} target_source_id {target_id!r} does not "
+                f"match approved target {descriptor.target_source_id!r}."
             )
-
         if target_id in seen_target_ids:
-            raise OllamaTailoringContractError(f"Duplicate patch targeting {target_id!r}.")
+            raise OllamaTailoringContractError(
+                f"Duplicate patch targeting {target_id!r}."
+            )
         seen_target_ids.add(target_id)
-
-        if operation != desc.operation:
+        if operation != descriptor.operation:
             raise OllamaTailoringContractError(
-                f"Patch for {edit_id} operation {operation!r} does not match approved operation {desc.operation!r}."
+                f"Patch for {edit_id} operation {operation!r} does not match "
+                f"approved operation {descriptor.operation!r}."
             )
 
-        if not isinstance(replacement_text, str) or not replacement_text.strip():
-            raise OllamaTailoringContractError(f"Patch for {edit_id} has empty replacement_text.")
+        _validate_replacement_text(
+            edit_id=edit_id,
+            descriptor=descriptor,
+            replacement_text=patch.get("replacement_text"),
+            evidence_texts=authorized_evidence_texts_for_edit(
+                edit,
+                descriptor,
+                extracted_resume,
+            ),
+            forbidden_claims=forbidden_claims,
+        )
 
-        # Check no-op replacement
-        if replacement_text == desc.current_mutable_text:
-            raise OllamaTailoringContractError(f"Patch for {edit_id} is a no-op replacement.")
+    if seen_edit_ids != set(descriptors_by_edit_id):
+        raise OllamaTailoringContractError(
+            "The returned patch set did not cover every approved edit exactly once."
+        )
 
-        # Label embedding check for composite fields
-        if desc.kind == "composite_labelled" and desc.label is not None:
-            label_norm = normalized_text(desc.label)
-            replacement_norm = normalized_text(replacement_text)
-            if replacement_norm.startswith(label_norm):
-                raise OllamaTailoringContractError(
-                    f"Patch for {edit_id} illegally contains label {desc.label!r} inside replacement text."
-                )
-
-        # Operation semantics check
-        if operation == "append":
-            if not replacement_text.startswith(desc.current_mutable_text):
-                raise OllamaTailoringContractError(
-                    f"Append patch for {edit_id} does not preserve the original prefix."
-                )
-            if len(replacement_text) <= len(desc.current_mutable_text):
-                raise OllamaTailoringContractError(
-                    f"Append patch for {edit_id} did not add a nonempty suffix."
-                )
-
-        # Rendered budget check
-        if desc.kind == "composite_labelled" and desc.label is not None:
-            rendered_text = f"{desc.label}: {replacement_text}"
-        else:
-            rendered_text = replacement_text
-
-        if len(rendered_text) > desc.maximum_rendered_characters:
-            raise OllamaTailoringContractError(
-                f"Patch for {edit_id} ({len(rendered_text)} chars) exceeds target budget of {desc.maximum_rendered_characters}."
-            )
-
-        # Numeric claims check
-        patch_metrics = set(_NUMBER_RE.findall(replacement_text))
-        new_metrics = patch_metrics - authenticated_metrics
-        if new_metrics:
-            raise OllamaTailoringContractError(
-                f"Patch for {edit_id} introduces unauthenticated numeric claims: {sorted(new_metrics)}."
-            )
-
-        # Forbidden claims check
-        norm_replacement = normalized_text(replacement_text)
-        for forbidden in forbidden_claims:
-            norm_forbidden = normalized_text(forbidden)
-            if len(norm_forbidden) >= 8 and norm_forbidden in norm_replacement:
-                raise OllamaTailoringContractError(
-                    f"Patch for {edit_id} contains forbidden claim {forbidden!r}."
-                )
-
-    # Atomic application to deep copy of master_content
+    original_digest = canonical_digest(master_content)
     tailored_content = copy.deepcopy(master_content)
-
     for patch in patches:
         apply_patch_to_target(
             patch["target_source_id"],
             patch["replacement_text"],
             tailored_content,
         )
+    if canonical_digest(master_content) != original_digest:
+        raise OllamaTailoringContractError(
+            "The authenticated master resume was mutated during patch application."
+        )
+    if original_digest == canonical_digest(tailored_content) and catalog:
+        raise OllamaTailoringContractError(
+            "Patch application failed to produce changes in tailored content."
+        )
 
-    # Verify original master_content is byte-for-byte unchanged
-    if canonical_digest(master_content) == canonical_digest(tailored_content) and len(catalog) > 0:
-        raise OllamaTailoringContractError("Patch application failed to produce changes in tailored content.")
-
-    # Validate final tailored content schema
     validate_resume_content_payload(
         tailored_content,
         label="Deterministic tailored resume",
     )
-
-    # Check changed content IDs match approved targets exactly
     changed_ids = changed_content_ids(master_content, tailored_content)
     approved_target_ids = {edit["target_source_id"] for edit in catalog}
     if set(changed_ids) != approved_target_ids:
-        unapproved_changed = set(changed_ids) - approved_target_ids
-        missing_changed = approved_target_ids - set(changed_ids)
-        details = []
-        if unapproved_changed:
-            details.append(f"unapproved changed: {sorted(unapproved_changed)}")
-        if missing_changed:
-            details.append(f"missing approved changes: {sorted(missing_changed)}")
+        unapproved = set(changed_ids) - approved_target_ids
+        missing = approved_target_ids - set(changed_ids)
+        details: list[str] = []
+        if unapproved:
+            details.append(f"unapproved changed: {sorted(unapproved)}")
+        if missing:
+            details.append(f"missing approved changes: {sorted(missing)}")
         raise OllamaTailoringContractError(
             f"Tailored content changed target mismatch ({'; '.join(details)})."
         )
-
     return tailored_content
 
 
@@ -402,7 +526,7 @@ def validate_and_apply_revision_patches(
     approved_analysis: dict[str, Any],
     qa_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Atomically validate returned revision patch payload and apply to current_tailored_content deep copy."""
+    """Atomically validate and apply one patch for every authorized QA target."""
     try:
         validate_payload(
             payload,
@@ -414,85 +538,149 @@ def validate_and_apply_revision_patches(
             "The local writer violated the one-shot revision response contract."
         ) from exc
 
-    issue_ids = {
-        issue["issue_id"]
-        for issue in qa_result.get("issues", [])
-        if isinstance(issue, dict) and isinstance(issue.get("issue_id"), str)
-    }
+    target_map = approved_revision_targets(
+        qa_result=qa_result,
+        approved_analysis=approved_analysis,
+    )
+    if not target_map:
+        raise OllamaRevisionContractError(
+            "The supplied QA findings contain no authenticated revision target."
+        )
+    expected_sha256 = canonical_digest(target_map)
+    actual_sha256 = payload.get("authorization_sha256")
+    if not isinstance(actual_sha256, str) or actual_sha256 != expected_sha256:
+        raise OllamaRevisionContractError(
+            "The returned authorization_sha256 digest does not match current "
+            "revision authorization."
+        )
 
+    authorized_issue_ids = {
+        issue_id for issue_ids in target_map.values() for issue_id in issue_ids
+    }
     status = payload.get("status")
     if status == "cannot_apply":
         detail = payload.get("cannot_apply")
-        if not isinstance(detail, dict) or detail.get("issue_id") not in issue_ids:
+        if (
+            not isinstance(detail, dict)
+            or detail.get("issue_id") not in authorized_issue_ids
+        ):
             raise OllamaRevisionContractError(
                 "The local writer returned an unknown QA issue ID in cannot_apply."
             )
         raise OllamaRevisionCannotApplyError(
-            f"The local writer could not apply bounded correction for {detail['issue_id']} ({detail['reason_code']})."
+            f"The local writer could not apply bounded correction for "
+            f"{detail['issue_id']} ({detail['reason_code']})."
         )
-
     if status == "technical_failure":
         detail = payload.get("technical_failure")
         reason_code = detail.get("reason_code") if isinstance(detail, dict) else "unknown"
         raise OllamaRevisionTechnicalFailureError(
             f"The local writer revision reported technical failure {reason_code}."
         )
-
     if status != "complete":
-        raise OllamaRevisionContractError(f"Unexpected status {status!r} in revision patch envelope.")
-
-    target_map = approved_revision_targets(
-        qa_result=qa_result,
-        approved_analysis=approved_analysis,
-    )
-    expected_sha256 = canonical_digest(target_map)
-    actual_sha256 = payload.get("authorization_sha256")
-    if not isinstance(actual_sha256, str) or actual_sha256 != expected_sha256:
         raise OllamaRevisionContractError(
-            "The returned authorization_sha256 digest does not match current revision authorization."
+            f"Unexpected status {status!r} in revision patch envelope."
         )
 
     patches = payload.get("patches")
     if not isinstance(patches, list):
-        raise OllamaRevisionContractError("Revision patch envelope 'patches' field must be an array.")
+        raise OllamaRevisionContractError(
+            "Revision patch envelope 'patches' field must be an array."
+        )
+    if len(patches) != len(target_map):
+        raise OllamaRevisionContractError(
+            "Revision patch count does not match the authenticated target count."
+        )
 
+    catalog_by_target = {
+        edit["target_source_id"]: edit
+        for edit in approved_edit_catalog(approved_analysis)
+    }
+    descriptors_by_target: dict[str, TargetDescriptor] = {}
+    try:
+        for target_id in target_map:
+            edit = catalog_by_target.get(target_id)
+            if edit is None:
+                raise TargetResolutionError(
+                    f"Revision target {target_id!r} has no approved edit."
+                )
+            descriptors_by_target[target_id] = resolve_target_descriptor(
+                edit,
+                current_tailored_content,
+                extracted_resume,
+            )
+    except TargetResolutionError as exc:
+        raise OllamaRevisionContractError(
+            "The revision target catalog cannot be resolved safely."
+        ) from exc
+
+    forbidden_claims = approved_analysis.get("forbidden_claims", [])
+    if not isinstance(forbidden_claims, list):
+        forbidden_claims = []
     seen_issue_ids: set[str] = set()
+    seen_target_ids: set[str] = set()
 
-    for idx, patch in enumerate(patches):
+    for index, patch in enumerate(patches):
         if not isinstance(patch, dict):
-            raise OllamaRevisionContractError(f"Revision patch {idx} is not an object.")
-
+            raise OllamaRevisionContractError(
+                f"Revision patch {index} is not an object."
+            )
         issue_id = patch.get("issue_id")
         target_id = patch.get("target_source_id")
-        replacement_text = patch.get("replacement_text")
-
-        if issue_id not in issue_ids:
-            raise OllamaRevisionContractError(f"Revision patch {idx} references unknown issue_id {issue_id!r}.")
-
+        if issue_id not in authorized_issue_ids:
+            raise OllamaRevisionContractError(
+                f"Revision patch {index} references unknown issue_id {issue_id!r}."
+            )
         if issue_id in seen_issue_ids:
-            raise OllamaRevisionContractError(f"Duplicate revision patch for issue_id {issue_id!r}.")
+            raise OllamaRevisionContractError(
+                f"Duplicate revision patch for issue_id {issue_id!r}."
+            )
         seen_issue_ids.add(issue_id)
-
-        authorized_issues_for_target = target_map.get(target_id, [])
-        if issue_id not in authorized_issues_for_target:
+        if target_id in seen_target_ids:
+            raise OllamaRevisionContractError(
+                f"Duplicate revision patch targeting {target_id!r}."
+            )
+        seen_target_ids.add(target_id)
+        if issue_id not in target_map.get(target_id, []):
             raise OllamaRevisionContractError(
                 f"Target {target_id!r} is not authorized for QA issue {issue_id!r}."
             )
 
-        if not isinstance(replacement_text, str) or not replacement_text.strip():
-            raise OllamaRevisionContractError(f"Revision patch for {issue_id} has empty replacement_text.")
+        descriptor = descriptors_by_target[target_id]
+        edit = catalog_by_target[target_id]
+        try:
+            _validate_replacement_text(
+                edit_id=issue_id,
+                descriptor=descriptor,
+                replacement_text=patch.get("replacement_text"),
+                evidence_texts=authorized_evidence_texts_for_edit(
+                    edit,
+                    descriptor,
+                    extracted_resume,
+                ),
+                forbidden_claims=forbidden_claims,
+                operation="replace",
+            )
+        except OllamaTailoringContractError as exc:
+            raise OllamaRevisionContractError(str(exc)) from exc
 
-    # Apply to deep copy
+    if seen_target_ids != set(target_map):
+        raise OllamaRevisionContractError(
+            "The revision patch set did not cover every authenticated target."
+        )
+
+    current_digest = canonical_digest(current_tailored_content)
     revised_content = copy.deepcopy(current_tailored_content)
-
     for patch in patches:
         apply_patch_to_target(
             patch["target_source_id"],
             patch["replacement_text"],
             revised_content,
         )
-
-    # Validate against canonical tailored resume schema
+    if canonical_digest(current_tailored_content) != current_digest:
+        raise OllamaRevisionContractError(
+            "The current tailored resume was mutated during revision application."
+        )
     validate_resume_content_payload(
         revised_content,
         label="Deterministic revised resume",
@@ -500,9 +688,9 @@ def validate_and_apply_revision_patches(
 
     from .revision import validate_revision_scope
     validate_revision_scope(
-        current_tailored_content,
-        revised_content,
-        target_map,
+        initial_content=current_tailored_content,
+        revised_content=revised_content,
+        qa_result=qa_result,
+        approved_analysis=approved_analysis,
     )
-
     return revised_content

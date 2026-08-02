@@ -41,7 +41,7 @@ def _setup_synthetic_inputs(master_resume_path: Path) -> tuple[dict[str, Any], d
             {
                 "target_source_id": "skill_groups.0",
                 "operation": "replace",
-                "proposed_text": "Core Skills: Python, JavaScript, SQL",
+                "proposed_text": f"{extracted['content']['skill_groups'][0]['label']}: Python, JavaScript, SQL",
                 "alignment_rationale": "Align with job requirements",
                 "evidence_source_ids": ["skill_groups.0"],
             },

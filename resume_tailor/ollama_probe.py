@@ -42,46 +42,57 @@ OBSERVED_WRONG_ROOT_KEYS = (
 
 
 def _minimal_complete_instance(schema: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Build the smallest instance that satisfies the tailoring patch envelope."""
+    """Build a valid minimal instance for static or run-specific patch schemas."""
     catalog_sha256 = "0" * 64
     patches: list[dict[str, Any]] = []
 
     if schema is not None and isinstance(schema.get("properties"), dict):
-        props = schema["properties"]
-        if "catalog_sha256" in props and isinstance(props["catalog_sha256"], dict):
-            enum_vals = props["catalog_sha256"].get("enum")
-            if enum_vals and len(enum_vals) > 0:
-                catalog_sha256 = str(enum_vals[0])
+        properties = schema["properties"]
+        digest_schema = properties.get("catalog_sha256")
+        if isinstance(digest_schema, dict):
+            enum_values = digest_schema.get("enum")
+            if isinstance(enum_values, list) and enum_values:
+                catalog_sha256 = str(enum_values[0])
 
-        patches_schema = props.get("patches")
+        patches_schema = properties.get("patches")
+        array_schema: dict[str, Any] | None = None
         if isinstance(patches_schema, dict):
-            min_items = patches_schema.get("minItems", 0)
-            if min_items > 0:
-                edit_id = "edit.001"
-                target_id = "professional_summary"
-                op = "replace"
-                items_schema = patches_schema.get("items")
-                if isinstance(items_schema, dict) and isinstance(items_schema.get("properties"), dict):
-                    item_props = items_schema["properties"]
-                    if "edit_id" in item_props and isinstance(item_props["edit_id"].get("enum"), list):
-                        edit_id = str(item_props["edit_id"]["enum"][0])
-                    if "target_source_id" in item_props and isinstance(item_props["target_source_id"].get("enum"), list):
-                        target_id = str(item_props["target_source_id"]["enum"][0])
-                    if "operation" in item_props and isinstance(item_props["operation"].get("enum"), list):
-                        op = str(item_props["operation"]["enum"][0])
-
-                patches = [
+            if patches_schema.get("type") == "array":
+                array_schema = patches_schema
+            else:
+                for branch in patches_schema.get("oneOf", []):
+                    if isinstance(branch, dict) and branch.get("type") == "array":
+                        array_schema = branch
+                        break
+        if array_schema is not None:
+            minimum = array_schema.get("minItems", 0)
+            minimum = minimum if isinstance(minimum, int) and minimum >= 0 else 0
+            item_schema = array_schema.get("items", {})
+            item_properties = (
+                item_schema.get("properties", {})
+                if isinstance(item_schema, dict)
+                else {}
+            )
+            edit_values = item_properties.get("edit_id", {}).get("enum", ["edit.001"])
+            target_values = item_properties.get("target_source_id", {}).get(
+                "enum", ["professional_summary"]
+            )
+            operation_values = item_properties.get("operation", {}).get(
+                "enum", ["replace"]
+            )
+            for index in range(minimum):
+                patches.append(
                     {
-                        "edit_id": edit_id,
-                        "target_source_id": target_id,
-                        "operation": op,
-                        "replacement_text": "Updated summary text.",
+                        "edit_id": str(edit_values[index % len(edit_values)]),
+                        "target_source_id": str(
+                            target_values[index % len(target_values)]
+                        ),
+                        "operation": str(
+                            operation_values[index % len(operation_values)]
+                        ),
+                        "replacement_text": f"Updated text {index + 1}.",
                     }
-                    for _ in range(min_items)
-                ]
-    if not patches and (schema is None or schema.get("properties", {}).get("patches", {}).get("minItems", 0) == 0):
-        # Default 0 patches if allowed, or 1 if unconstrained
-        pass
+                )
 
     return {
         "status": "complete",

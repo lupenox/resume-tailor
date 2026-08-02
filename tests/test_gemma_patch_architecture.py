@@ -53,7 +53,7 @@ def _setup_synthetic_inputs(master_resume: Path):
                 "operation": "append",
                 "proposed_text": extracted["content"]["skill_groups"][2]["text"] + ", AI",
                 "alignment_rationale": "Add AI keyword to skill group.",
-                "evidence_source_ids": ["skill_groups.2"],
+                "evidence_source_ids": ["skill_groups.2", "projects.0.bullets.0"],
                 "resolved_evidence": [
                     {
                         "source_id": "skill_groups.2",
@@ -741,3 +741,228 @@ def test_34_35_36_model_independence() -> None:
     assert "gemma" in writer.DEFAULT_OLLAMA_MODEL.lower()
     caps = writer.capabilities_for_model("resume-tailor-gemma")
     assert caps.supports_json_schema is True
+
+# Review regressions: nonempty schema probes, fail-closed budgets, per-edit evidence,
+# immutable approved labels, and the successful one-shot revision path.
+def test_37_nonempty_dynamic_schema_probe_is_supported(
+    master_resume: Path, tmp_path: Path
+) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    catalog = writer.approved_edit_catalog(analysis)
+    schema, _path = writer._write_tailoring_patch_transport_schema(
+        tmp_path,
+        catalog=catalog,
+        catalog_sha256=writer.canonical_digest(catalog),
+    )
+    result = writer.probe_structured_output_support(schema)
+    assert result["supported"] is True
+    assert result["provider_called"] is False
+
+
+def test_38_missing_target_budget_fails_closed(master_resume: Path) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    catalog = writer.approved_edit_catalog(analysis)
+    without_budget = copy.deepcopy(extracted)
+    without_budget["paragraphs"] = [
+        paragraph
+        for paragraph in without_budget["paragraphs"]
+        if paragraph["content_id"] != "professional_summary"
+    ]
+    with pytest.raises(patch_engine.TargetResolutionError, match="no authenticated content budget"):
+        patch_engine.resolve_target_descriptor(
+            catalog[0], extracted["content"], without_budget
+        )
+
+
+def _valid_patch_payload(extracted: dict, analysis: dict) -> dict:
+    catalog = writer.approved_edit_catalog(analysis)
+    current_skill = extracted["content"]["skill_groups"][2]["text"]
+    supported_item = current_skill.split(",", 1)[0].strip()
+    return {
+        "status": "complete",
+        "message": "Complete",
+        "catalog_sha256": writer.canonical_digest(catalog),
+        "cannot_apply": None,
+        "technical_failure": None,
+        "patches": [
+            {
+                "edit_id": "edit.001",
+                "target_source_id": "professional_summary",
+                "operation": "replace",
+                "replacement_text": "Experienced Python engineer building automated workflows.",
+            },
+            {
+                "edit_id": "edit.002",
+                "target_source_id": "skill_groups.2",
+                "operation": "append",
+                "replacement_text": f"{current_skill}, {supported_item}",
+            },
+        ],
+    }
+
+
+def test_39_metric_from_unrelated_source_is_not_authorized_for_summary(
+    master_resume: Path,
+) -> None:
+    from resume_tailor.evidence import _NUMBER_RE, _resume_text
+
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    summary_metrics = set(_NUMBER_RE.findall(extracted["content"]["professional_summary"]))
+    unrelated = sorted(
+        set(_NUMBER_RE.findall(_resume_text(extracted["content"]))) - summary_metrics
+    )
+    assert unrelated, "synthetic fixture needs a number outside the summary"
+    payload = _valid_patch_payload(extracted, analysis)
+    payload["patches"][0]["replacement_text"] = (
+        f"Experienced Python engineer delivering {unrelated[0]} automated workflows."
+    )
+    with pytest.raises(OllamaTailoringContractError, match="unauthenticated numeric claims"):
+        patch_engine.validate_and_apply_patches(
+            payload=payload,
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            approved_analysis=analysis,
+        )
+
+
+def test_40_unsupported_skill_is_rejected_before_merge(master_resume: Path) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    payload = _valid_patch_payload(extracted, analysis)
+    current_skill = extracted["content"]["skill_groups"][2]["text"]
+    payload["patches"][1]["replacement_text"] = (
+        current_skill + ", Go"
+    )
+    with pytest.raises(OllamaTailoringContractError, match="without authenticated source evidence"):
+        patch_engine.validate_and_apply_patches(
+            payload=payload,
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            approved_analysis=analysis,
+        )
+
+
+def test_41_changed_label_in_approved_proposal_fails_before_provider(
+    master_resume: Path,
+) -> None:
+    extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume)
+    analysis = copy.deepcopy(analysis)
+    current_skill = extracted["content"]["skill_groups"][2]["text"]
+    analysis["recommended_edits"][1]["proposed_text"] = (
+        f"Renamed Category: {current_skill}"
+    )
+    with pytest.raises(writer.TailoringPreflightError, match="No writer request"):
+        writer.build_ollama_tailoring_prompt(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=job_desc,
+            job_requirements=reqs,
+            approved_analysis=analysis,
+            company="Synthetic Corp",
+            role="AI Engineer",
+        )
+
+
+def _qa_for_summary() -> dict:
+    return {
+        "status": "material_findings",
+        "summary": "Synthetic QA finding.",
+        "issues": [
+            {
+                "issue_id": "qa.001",
+                "category": "clarity",
+                "severity": "material",
+                "description": "Clarify the summary.",
+                "affected_content_id": "professional_summary",
+                "evidence": "Synthetic evidence.",
+            }
+        ],
+        "technical_failure": None,
+    }
+
+
+def test_42_successful_revision_patch_uses_keyword_scope_validation(
+    master_resume: Path,
+) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    current = copy.deepcopy(extracted["content"])
+    current["professional_summary"] = "Experienced Python engineer building automated workflows."
+    qa_result = _qa_for_summary()
+    target_map = writer.approved_revision_targets(
+        qa_result=qa_result,
+        approved_analysis=analysis,
+    )
+    payload = {
+        "status": "complete",
+        "message": "Revised",
+        "authorization_sha256": writer.canonical_digest(target_map),
+        "cannot_apply": None,
+        "technical_failure": None,
+        "patches": [
+            {
+                "issue_id": "qa.001",
+                "target_source_id": "professional_summary",
+                "replacement_text": "Python engineer building clear automated workflows.",
+            }
+        ],
+    }
+    revised = patch_engine.validate_and_apply_revision_patches(
+        payload=payload,
+        current_tailored_content=current,
+        extracted_resume=extracted,
+        approved_analysis=analysis,
+        qa_result=qa_result,
+    )
+    assert revised["professional_summary"] != current["professional_summary"]
+
+
+def test_43_revision_budget_and_digest_are_enforced(master_resume: Path) -> None:
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
+    current = copy.deepcopy(extracted["content"])
+    current["professional_summary"] = "Experienced Python engineer building automated workflows."
+    qa_result = _qa_for_summary()
+    target_map = writer.approved_revision_targets(
+        qa_result=qa_result,
+        approved_analysis=analysis,
+    )
+    payload = {
+        "status": "complete",
+        "message": "Revised",
+        "authorization_sha256": writer.canonical_digest(target_map),
+        "cannot_apply": None,
+        "technical_failure": None,
+        "patches": [
+            {
+                "issue_id": "qa.001",
+                "target_source_id": "professional_summary",
+                "replacement_text": "Python " * 200,
+            }
+        ],
+    }
+    with pytest.raises(Exception, match="exceeds target budget"):
+        patch_engine.validate_and_apply_revision_patches(
+            payload=payload,
+            current_tailored_content=current,
+            extracted_resume=extracted,
+            approved_analysis=analysis,
+            qa_result=qa_result,
+        )
+
+    cannot_apply = {
+        "status": "cannot_apply",
+        "message": "Cannot apply",
+        "catalog_sha256": "0" * 64,
+        "cannot_apply": {
+            "edit_id": "edit.001",
+            "reason_code": "other_bounded_constraint",
+            "reason": "Synthetic",
+        },
+        "technical_failure": None,
+        "patches": None,
+    }
+    with pytest.raises(OllamaTailoringContractError, match="catalog_sha256 digest does not match"):
+        patch_engine.validate_and_apply_patches(
+            payload=cannot_apply,
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            approved_analysis=analysis,
+        )
