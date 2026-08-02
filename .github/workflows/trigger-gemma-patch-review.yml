@@ -3,7 +3,7 @@ name: Trigger Gemma patch review
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
