@@ -344,11 +344,11 @@ def build_ollama_tailoring_prompt(
                     "edit_id": descriptor.edit_id,
                     "target_source_id": descriptor.target_source_id,
                     "operation": descriptor.operation,
-                    "current_mutable_text": descriptor.current_mutable_text,
+                    "mutable_current_body": descriptor.current_mutable_text,
                     "exact_rendered_existing_text": descriptor.exact_rendered_existing_text,
-                    "label_if_composite": descriptor.label,
+                    "immutable_label": descriptor.label,
                     "maximum_rendered_characters": descriptor.maximum_rendered_characters,
-                    "approved_proposed_mutable_text": mutable_proposed_text(edit, descriptor),
+                    "mutable_proposed_body": mutable_proposed_text(edit, descriptor),
                     "alignment_rationale": descriptor.alignment_rationale,
                     "evidence_source_ids": descriptor.evidence_source_ids,
                     "authenticated_metrics": authenticated_metrics_for_edit(
@@ -398,7 +398,7 @@ AUTHORING RULES
      NEVER include or rewrite the label (e.g. do NOT write 'Software & Data:').
 2. OPERATION SEMANTICS.
    - For "replace": replacement_text is the new complete mutable text.
-   - For "append": replacement_text MUST start with the exact current_mutable_text prefix and add a nonempty suffix.
+   - For "append": replacement_text MUST start with the exact mutable_current_body prefix and add a nonempty suffix.
 3. STAY WITHIN CHARACTER BUDGETS.
    - The rendered text (including label if composite) MUST NOT exceed maximum_rendered_characters.
 4. NO UNSUPPORTED CLAIMS OR NEW METRICS.
@@ -786,11 +786,11 @@ def build_ollama_revision_prompt(
                 {
                     "target_source_id": content_id,
                     "authorized_issue_ids": issue_ids,
-                    "current_mutable_text": descriptor.current_mutable_text,
+                    "mutable_current_body": descriptor.current_mutable_text,
                     "exact_rendered_existing_text": descriptor.exact_rendered_existing_text,
-                    "label_if_composite": descriptor.label,
+                    "immutable_label": descriptor.label,
                     "maximum_rendered_characters": descriptor.maximum_rendered_characters,
-                    "approved_proposed_mutable_text": mutable_proposed_text(edit, descriptor),
+                    "mutable_proposed_body": mutable_proposed_text(edit, descriptor),
                     "authenticated_metrics": authenticated_metrics_for_edit(
                         edit, descriptor, extracted_resume
                     ),

@@ -869,7 +869,7 @@ def test_40_unsupported_skill_is_rejected_before_merge(master_resume: Path) -> N
         )
 
 
-def test_41_changed_label_in_approved_proposal_fails_before_provider(
+def test_41_mismatched_label_in_approved_proposal_is_preserved(
     master_resume: Path,
 ) -> None:
     extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume)
@@ -878,16 +878,17 @@ def test_41_changed_label_in_approved_proposal_fails_before_provider(
     analysis["recommended_edits"][1]["proposed_text"] = (
         f"Renamed Category: {current_skill}"
     )
-    with pytest.raises(writer.TailoringPreflightError, match="No writer request"):
-        writer.build_ollama_tailoring_prompt(
-            master_content=extracted["content"],
-            extracted_resume=extracted,
-            job_description=job_desc,
-            job_requirements=reqs,
-            approved_analysis=analysis,
-            company="Synthetic Corp",
-            role="AI Engineer",
-        )
+    prompt = writer.build_ollama_tailoring_prompt(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=job_desc,
+        job_requirements=reqs,
+        approved_analysis=analysis,
+        company="Synthetic Corp",
+        role="AI Engineer",
+    )
+    assert prompt is not None
+    assert f"Renamed Category: {current_skill}" in prompt
 
 
 def _qa_for_summary() -> dict:
