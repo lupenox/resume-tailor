@@ -748,13 +748,13 @@ def changed_content_ids(
     """Return stable logical content IDs whose exact rendered text changed."""
     before_values = _paragraph_values(before)
     after_values = _paragraph_values(after)
-    if before_values.keys() != after_values.keys():
-        raise ValueError("Resume content structure changed while comparing revisions.")
-    return [
-        content_id
-        for content_id, value in before_values.items()
-        if after_values[content_id] != value
-    ]
+    changed: list[str] = []
+    for content_id in sorted(set(before_values.keys()) | set(after_values.keys())):
+        val_before = before_values.get(content_id)
+        val_after = after_values.get(content_id)
+        if val_before != val_after:
+            changed.append(content_id)
+    return changed
 
 
 def content_values(content: dict[str, Any]) -> dict[str, str]:
@@ -865,6 +865,20 @@ def validate_tailored_content(
     tailored_text = _resume_text(tailored)
     normalized_source = normalized_text(source_text)
 
+    authorized_evidence_texts = [source_text]
+    source_blocks = extracted_resume.get("source_blocks", [])
+    if isinstance(source_blocks, list):
+        for block in source_blocks:
+            if isinstance(block, dict) and isinstance(block.get("exact_text"), str):
+                authorized_evidence_texts.append(block["exact_text"])
+    for edit in analysis.get("recommended_edits", []):
+        if isinstance(edit, dict):
+            for block in edit.get("resolved_evidence", []):
+                if isinstance(block, dict) and isinstance(block.get("exact_text"), str):
+                    authorized_evidence_texts.append(block["exact_text"])
+
+    normalized_authorized_evidence = normalized_text(" ".join(authorized_evidence_texts))
+
     original_tech_by_location = {
         (location, normalized_text(item))
         for location, item in _technology_items(original)
@@ -873,13 +887,14 @@ def validate_tailored_content(
         normalized_item = normalized_text(item)
         if (location, normalized_item) not in original_tech_by_location:
             report.introduced_technologies.append(f"{location}: {item}")
-        if normalized_item not in normalized_source:
+        if normalized_item not in normalized_authorized_evidence:
             report.issues.append(
                 f"Technology/skill item lacks verbatim source evidence at "
                 f"{location}: {item!r}."
             )
 
-    original_metrics = set(_NUMBER_RE.findall(source_text))
+    combined_metric_source = " ".join(authorized_evidence_texts)
+    original_metrics = set(_NUMBER_RE.findall(combined_metric_source))
     for metric in _NUMBER_RE.findall(tailored_text):
         if metric not in original_metrics and metric not in report.introduced_metrics:
             report.introduced_metrics.append(metric)

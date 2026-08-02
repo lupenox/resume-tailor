@@ -171,6 +171,55 @@ def _authorized_source_catalog(
     ]
 
 
+def _build_constraint_manifest(
+    master_content: dict[str, Any],
+    extracted_resume: dict[str, Any],
+    edits: list[dict[str, Any]],
+    approved_analysis: dict[str, Any],
+) -> dict[str, Any]:
+    from .evidence import _NUMBER_RE, _resume_text
+
+    immutable_field_values = {
+        "education.institution": master_content.get("education", {}).get("institution", ""),
+        "education.degree_details": master_content.get("education", {}).get("degree_details", ""),
+        "education.coursework.label": master_content.get("education", {}).get("coursework", {}).get("label", ""),
+        "education.certifications.label": master_content.get("education", {}).get("certifications", {}).get("label", ""),
+        "open_source.name": master_content.get("open_source", {}).get("name", ""),
+        "open_source.technologies": master_content.get("open_source", {}).get("technologies", ""),
+        "experience.role": master_content.get("experience", {}).get("role", ""),
+        "experience.employer_location": master_content.get("experience", {}).get("employer_location", ""),
+        "experience.dates": master_content.get("experience", {}).get("dates", ""),
+        "skill_group_labels": [
+            group.get("label", "") for group in master_content.get("skill_groups", [])
+        ],
+        "project_names": [
+            project.get("name", "") for project in master_content.get("projects", [])
+        ],
+    }
+    project_bullet_counts = {
+        str(i): len(project.get("bullets", []))
+        for i, project in enumerate(master_content.get("projects", []))
+    }
+    expected_item_counts = {
+        "skill_groups": len(master_content.get("skill_groups", [])),
+        "projects": len(master_content.get("projects", [])),
+        "experience_bullets": len(master_content.get("experience", {}).get("bullets", [])),
+        "project_bullet_counts": project_bullet_counts,
+    }
+
+    source_text = _resume_text(master_content)
+    authenticated_metrics = sorted(list(set(_NUMBER_RE.findall(source_text))))
+
+    return {
+        "immutable_field_values": immutable_field_values,
+        "expected_item_counts": expected_item_counts,
+        "authorized_edit_targets": [
+            edit.get("target_source_id") for edit in edits if isinstance(edit, dict)
+        ],
+        "authenticated_metrics": authenticated_metrics,
+    }
+
+
 def build_ollama_tailoring_prompt(
     *,
     master_content: dict[str, Any],
@@ -203,6 +252,9 @@ def build_ollama_tailoring_prompt(
         for paragraph in extracted_resume["paragraphs"]
     ]
     source_catalog = _authorized_source_catalog(extracted_resume, edits)
+    constraint_manifest = _build_constraint_manifest(
+        master_content, extracted_resume, edits, approved_analysis
+    )
     return f"""Write the complete approved tailored resume now. Return exactly one
 JSON object matching the supplied structured-output schema. Do not return
 Markdown, commentary, planning, questions, or JSON fences. Do not use tools,
@@ -230,32 +282,44 @@ FORBIDDEN CLAIMS
 CONTENT BUDGETS
 {_canonical_json(budgets)}
 
-AUTHORING RULES
-- Apply every approved edit and no unapproved edit. Preserve every other value.
-- The master resume is the only factual authority. Approved analysis cannot
-  create evidence, and proposed wording is never evidence.
-- Never add an unsupported technology, qualification, metric, credential,
-  seniority level, leadership claim, employment fact, availability statement,
-  citizenship statement, accomplishment, date, or customer impact.
-- Preserve institution, degree details, certification status, employers, dates,
-  project names, open-source identity, numeric claims, labels, section order,
-  exactly three skill groups, exactly three projects, every existing project
-  bullet count, one open-source contribution, and one employment entry.
-- Stay inside every supplied character budget. Use concise plain language.
-- Write bullets for a fast recruiter scan: state WHAT supported skill or keyword
-  was used, HOW it was used, and its supported RESULT or REASON when the source
-  actually provides one. Never manufacture a result to complete that pattern.
-- Make the first bullet of each project or experience entry understandable to a
-  reader without specialized industry knowledge. Keep each bullet to one
-  sentence and at most one terminal period.
-- Prefer supported job keywords in the first half of the resume, but never force
-  an unsupported keyword into a claim.
-- Use past tense for completed work and avoid first-person pronouns.
-- Return status complete with the entire tailored content when every approved
-  edit can be applied safely.
-- If one approved edit cannot be applied safely, return cannot_apply with its
-  local edit_id and one bounded reason code. Never guess or ask a question.
-- Use technical_failure only for a genuine execution/output failure.
+DETERMINISTIC CONSTRAINT MANIFEST
+{_canonical_json(constraint_manifest)}
+
+AUTHORING RULES (STRICT PRIORITY HIERARCHY)
+1. PRESERVE ALL IMMUTABLE FIELDS AND LABELS EXACTLY.
+   - Do not change section labels, employer names, job titles, school names, dates,
+     locations, project names, open-source identity, or skill-group labels.
+   - Skill-group labels (e.g. {constraint_manifest['immutable_field_values']['skill_group_labels']})
+     are IMMUTABLE. Even when editing a skill group, keep its label unchanged and only update its text.
+2. APPLY ONLY AUTHENTICATED APPROVED EDITS.
+   - Apply each edit in APPROVED EDIT CATALOG to its exact target_source_id.
+   - Do not make any unapproved edits to any part of the resume.
+3. PRESERVE ALL UNEDITED CONTENT EXACTLY.
+   - Any paragraph or bullet that does not have an approved edit target MUST remain 100% identical to the master resume.
+4. PRESERVE LIST ITEM COUNTS EXACTLY.
+   - Maintain the exact number of skill groups ({constraint_manifest['expected_item_counts']['skill_groups']}),
+     projects ({constraint_manifest['expected_item_counts']['projects']}),
+     experience bullets ({constraint_manifest['expected_item_counts']['experience_bullets']}),
+     and project bullets (e.g. project 0: {constraint_manifest['expected_item_counts']['project_bullet_counts'].get('0')}).
+   - Rewriting one bullet must NEVER omit, combine, or drop another bullet.
+5. NEVER ADD UNSUPPORTED TECHNOLOGIES, SKILLS, CLAIMS, OR NUMBERS.
+   - Never add an unsupported technology, qualification, metric, credential,
+     seniority level, leadership claim, employment fact, availability statement,
+     accomplishment, date, or customer impact.
+   - Do not introduce new technologies, tools, skills, or synonyms (e.g. 'agent state machines', 'API integration')
+     unless present in master resume or authorized edit evidence.
+   - Do not introduce any new numbers, counts, percentages, ranges, or metrics not present in master resume.
+6. BULLET STYLE & KEYWORD GUIDELINES.
+   - Write bullets for a fast recruiter scan: state WHAT supported skill or keyword
+     was used, HOW it was used, and its supported RESULT or REASON when the source
+     actually provides one. Never manufacture a result to complete that pattern.
+   - Prefer supported job keywords in the first half of the resume, but never force
+     an unsupported keyword into a claim.
+7. RETURN THE COMPLETE REQUIRED STRUCTURED ENVELOPE.
+   - Return status "complete" with tailored_content when all approved edits are applied cleanly under these rules.
+8. RETURN CANNOT_APPLY WHEN EDITS VIOLATE CONSTRAINTS.
+   - If an approved edit cannot be applied without violating these rules or constraints, return status "cannot_apply"
+     with its local edit_id and a bounded reason code. Never guess or fabricate output.
 """
 
 
@@ -594,10 +658,38 @@ def _invoke_payload(
     return payload, response_path, generation
 
 
+def _validate_gemma_structural_contract(
+    *,
+    master_content: dict[str, Any],
+    tailored: dict[str, Any],
+    approved_analysis: dict[str, Any],
+) -> None:
+    orig_groups = master_content.get("skill_groups", [])
+    tail_groups = tailored.get("skill_groups", [])
+    if len(orig_groups) == len(tail_groups):
+        for index, (orig, tail) in enumerate(zip(orig_groups, tail_groups, strict=True)):
+            if orig.get("label") != tail.get("label"):
+                raise OllamaTailoringContractError(
+                    f"Gemma output modified immutable skill-group label at index {index}."
+                )
+
+    orig_projects = master_content.get("projects", [])
+    tail_projects = tailored.get("projects", [])
+    if len(orig_projects) == len(tail_projects):
+        for index, (orig_p, tail_p) in enumerate(zip(orig_projects, tail_projects)):
+            orig_bullets = orig_p.get("bullets", [])
+            tail_bullets = tail_p.get("bullets", [])
+            if len(orig_bullets) != len(tail_bullets):
+                raise OllamaTailoringContractError(
+                    f"Gemma output altered bullet count for project {index}."
+                )
+
+
 def _resolve_initial_payload(
     payload: dict[str, Any],
     *,
     approved_analysis: dict[str, Any],
+    master_content: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         validate_payload(
@@ -629,7 +721,14 @@ def _resolve_initial_payload(
             "The local writer reported technical failure "
             f"{detail['reason_code']}. Provider prose was omitted."
         )
-    return payload["tailored_resume"]
+    tailored = payload["tailored_resume"]
+    if master_content is not None:
+        _validate_gemma_structural_contract(
+            master_content=master_content,
+            tailored=tailored,
+            approved_analysis=approved_analysis,
+        )
+    return tailored
 
 
 def invoke_ollama(
@@ -683,6 +782,7 @@ def invoke_ollama(
         tailored = _resolve_initial_payload(
             payload,
             approved_analysis=approved_analysis,
+            master_content=master_content,
         )
     except ModelError as exc:
         _write_metadata(
