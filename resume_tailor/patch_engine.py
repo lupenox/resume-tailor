@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,40 @@ def canonical_digest(payload: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(canonical_bytes).hexdigest()
+
+
+def duplicate_catalog_target_ids(catalog: list[dict[str, Any]]) -> list[str]:
+    """Return sorted target IDs repeated by more than one approved edit."""
+    counts: dict[str, int] = {}
+    for edit in catalog:
+        target_id = edit.get("target_source_id")
+        if isinstance(target_id, str):
+            counts[target_id] = counts.get(target_id, 0) + 1
+    return sorted(target_id for target_id, count in counts.items() if count > 1)
+
+
+def _canonical_unicode(value: str) -> str:
+    """Normalize canonically equivalent Unicode sequences for identity checks."""
+    return unicodedata.normalize("NFC", value)
+
+
+def _normalized_claim_text(value: str) -> str:
+    """Normalize compatibility forms, case, and whitespace for claim matching."""
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _contains_forbidden_claim(text: str, claim: str) -> bool:
+    normalized_text_value = _normalized_claim_text(text)
+    normalized_claim = _normalized_claim_text(claim)
+    if not normalized_claim:
+        return False
+    return (
+        re.search(
+            rf"(?<!\w){re.escape(normalized_claim)}(?!\w)",
+            normalized_text_value,
+        )
+        is not None
+    )
 
 
 class TargetResolutionError(Exception):
@@ -266,7 +301,9 @@ def _validate_replacement_text(
         raise OllamaTailoringContractError(
             f"Patch for {edit_id} has empty replacement_text."
         )
-    if replacement_text == descriptor.current_mutable_text:
+    if _canonical_unicode(replacement_text) == _canonical_unicode(
+        descriptor.current_mutable_text
+    ):
         raise OllamaTailoringContractError(
             f"Patch for {edit_id} is a no-op replacement."
         )
@@ -323,12 +360,10 @@ def _validate_replacement_text(
                     "authenticated source evidence."
                 )
 
-    normalized_replacement = normalized_text(replacement_text)
     for forbidden in forbidden_claims:
         if not isinstance(forbidden, str):
             continue
-        normalized_forbidden = normalized_text(forbidden)
-        if len(normalized_forbidden) >= 8 and normalized_forbidden in normalized_replacement:
+        if _contains_forbidden_claim(replacement_text, forbidden):
             raise OllamaTailoringContractError(
                 f"Patch for {edit_id} contains a forbidden claim."
             )
@@ -365,6 +400,12 @@ def validate_and_apply_patches(
         ) from exc
 
     catalog = approved_edit_catalog(approved_analysis)
+    duplicate_targets = duplicate_catalog_target_ids(catalog)
+    if duplicate_targets:
+        raise OllamaTailoringContractError(
+            "The approved edit catalog repeats target source IDs: "
+            f"{duplicate_targets}."
+        )
     expected_sha256 = canonical_digest(catalog)
     actual_sha256 = payload.get("catalog_sha256")
     if not isinstance(actual_sha256, str) or actual_sha256 != expected_sha256:
@@ -592,9 +633,15 @@ def validate_and_apply_revision_patches(
             "Revision patch count does not match the authenticated target count."
         )
 
+    approved_catalog = approved_edit_catalog(approved_analysis)
+    duplicate_targets = duplicate_catalog_target_ids(approved_catalog)
+    if duplicate_targets:
+        raise OllamaRevisionContractError(
+            "The approved edit catalog repeats revision target source IDs: "
+            f"{duplicate_targets}."
+        )
     catalog_by_target = {
-        edit["target_source_id"]: edit
-        for edit in approved_edit_catalog(approved_analysis)
+        edit["target_source_id"]: edit for edit in approved_catalog
     }
     descriptors_by_target: dict[str, TargetDescriptor] = {}
     try:

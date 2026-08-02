@@ -19,6 +19,7 @@ from .ollama_transport import OLLAMA_BASE_URL, run_ollama_request
 from .patch_engine import (
     TargetResolutionError,
     authenticated_metrics_for_edit,
+    duplicate_catalog_target_ids,
     authorized_evidence_texts_for_edit,
     canonical_digest,
     mutable_proposed_text,
@@ -324,6 +325,12 @@ def build_ollama_tailoring_prompt(
         ) from exc
 
     catalog = approved_edit_catalog(approved_analysis)
+    duplicate_targets = duplicate_catalog_target_ids(catalog)
+    if duplicate_targets:
+        raise TailoringPreflightError(
+            "Local Ollama tailoring preflight failed: the approved edit catalog "
+            f"repeats target source IDs {duplicate_targets}. No writer request was launched."
+        )
     catalog_sha256 = canonical_digest(catalog)
 
     target_descriptors: list[dict[str, Any]] = []
@@ -927,6 +934,12 @@ def invoke_ollama(
         role=role,
     )
     catalog = approved_edit_catalog(approved_analysis)
+    duplicate_targets = duplicate_catalog_target_ids(catalog)
+    if duplicate_targets:
+        raise TailoringPreflightError(
+            "Local Ollama tailoring preflight failed: the approved edit catalog "
+            f"repeats target source IDs {duplicate_targets}. No writer request was launched."
+        )
     catalog_sha256 = canonical_digest(catalog)
     schema, transport_path = _write_tailoring_patch_transport_schema(
         run_directory,
