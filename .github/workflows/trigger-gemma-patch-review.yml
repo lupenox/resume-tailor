@@ -79,7 +79,7 @@ jobs:
           replace_exact(
               architecture_tests,
               'current_skill + ", FabricatedSkillWithoutEvidence"',
-              'current_skill + ", Rust"',
+              'current_skill + ", Go"',
           )
 
           evidence_tests = Path('tests/test_gemma_evidence_contract.py')
