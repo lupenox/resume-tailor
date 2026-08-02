@@ -90,21 +90,21 @@ def test_ollama_dependency_versions_verify_server_and_model(
         calls.append((str(kwargs["path"]), kwargs["body"]))
         if kwargs["path"] == "/api/version":
             return {"version": "0.12.3"}
-        return {"details": {"family": "qwen3"}}
+        return {"details": {"family": "gemma4"}}
 
     monkeypatch.setattr(transport, "run_ollama_request", fake_request)
     versions = transport.ollama_dependency_versions(
-        model="resume-tailor-qwen",
+        model="resume-tailor-gemma",
         cwd=tmp_path,
     )
 
     assert calls == [
         ("/api/version", None),
-        ("/api/show", {"model": "resume-tailor-qwen"}),
+        ("/api/show", {"model": "resume-tailor-gemma"}),
     ]
     assert versions == {
         "ollama": "0.12.3",
-        "ollama_model": "resume-tailor-qwen",
-        "ollama_model_family": "qwen3",
+        "ollama_model": "resume-tailor-gemma",
+        "ollama_model_family": "gemma4",
         "ollama_endpoint": "http://127.0.0.1:11434",
     }

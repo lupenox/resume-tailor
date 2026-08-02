@@ -542,7 +542,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         antigravity_retry_inputs = antigravity_reprocess_inputs.retry_inputs
     if antigravity_retry_inputs is not None:
         writer_provider = "antigravity"
-    writer_name = "Qwen" if writer_provider == "ollama" else "Antigravity"
+    writer_name = "Gemma 4 12B" if writer_provider == "ollama" else "Antigravity"
     document_format = (
         "headless" if writer_provider == "ollama" else "master-template"
     )
@@ -1359,7 +1359,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         except AntigravityTailoringPreflightError as exc:
             if writer_provider == "ollama":
                 raise TailoringPreflightError(
-                    "Local Qwen tailoring preflight failed. No writer request "
+                    "Local Ollama tailoring preflight failed. No writer request "
                     "was launched."
                 ) from exc
             raise
@@ -1401,9 +1401,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     heartbeat_handler=lambda elapsed, alive: hooks.progress(
                         "antigravity_tailoring",
                         (
-                            "Qwen is still writing locally"
+                            "Gemma 4 12B is still writing locally"
                             if alive
-                            else "Qwen completed; local validation is continuing"
+                            else "Gemma 4 12B completed; local validation is continuing"
                         )
                         + f" — elapsed {_elapsed_label(elapsed)}.",
                         elapsed_seconds=max(0, int(elapsed)),
@@ -2055,8 +2055,8 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         elif isinstance(exc, TruthfulnessError):
             # Schema-valid writer output rejected by the deterministic evidence
             # and content-budget gate. Attribute it to the writer provider so a
-            # preserved Qwen failure is distinguishable from a schema failure.
-            # The exception type and exit code are deliberately unchanged.
+            # preserved historical Ollama failure is distinguishable from a
+            # schema failure. The exception type and exit code are unchanged.
             stage_name = str(metadata.get("stage", ""))
             if writer_provider == "ollama" and "evidence" in stage_name:
                 metadata["failure_class"] = "ollama-downstream-evidence"

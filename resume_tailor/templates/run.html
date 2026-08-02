@@ -137,7 +137,7 @@
                 <div>
                   <p class="eyebrow">Approval required</p>
                   <h2>Review evidence-backed recommendations</h2>
-                  <p>Local Qwen will not tailor content until you approve this analysis.</p>
+                  <p>Local Gemma 4 12B will not tailor content until you approve this analysis.</p>
                 </div>
               </div>
               <div class="analysis-overview">
@@ -316,7 +316,7 @@
 
           {% elif run.approval.kind == "qa_revision" %}
             {% set qa = run.approval.payload.qa_result %}
-            {% set writer_name = run.approval.payload.writer_name or "Qwen" %}
+            {% set writer_name = run.approval.payload.writer_name or "Gemma 4 12B" %}
             <section class="card gate-card">
               <div class="gate-heading">
                 <span class="gate-icon" aria-hidden="true">04</span>
@@ -603,21 +603,21 @@
               <div class="alert alert-warning">
                 {% if run.failure_kind == "ollama_preflight" %}
                   <strong>Local writer preflight failure</strong>
-                  <span>The authenticated inputs failed before any Qwen or Ollama request was launched.</span>
+                  <span>The authenticated inputs failed before any Ollama request was launched.</span>
                 {% elif run.failure_kind == "ollama_connection" %}
-                  <strong>Local Qwen connection failure</strong>
+                  <strong>Local Ollama connection failure</strong>
                   <span>Resume Tailor could not reach Ollama or load the configured model at 127.0.0.1:11434.</span>
                 {% elif run.failure_kind == "ollama_contract" %}
-                  <strong>Qwen structured-output failure</strong>
+                  <strong>Local writer structured-output failure</strong>
                   <span>The local response failed schema or evidence validation, so no résumé was rendered.</span>
                 {% elif run.failure_kind == "ollama_cannot_apply" %}
                   <strong>Approved edit could not be applied</strong>
-                  <span>Qwen reported a bounded conflict instead of inventing a replacement claim.</span>
+                  <span>Gemma 4 12B reported a bounded conflict instead of inventing a replacement claim.</span>
                 {% else %}
-                  <strong>Qwen technical failure</strong>
+                  <strong>Local writer technical failure</strong>
                   <span>The local writer stopped safely and preserved sanitized diagnostics.</span>
                 {% endif %}
-                <span>No remote writer fallback was attempted. Confirm Ollama and resume-tailor-qwen are running, then start a new run.</span>
+                <span>No remote writer fallback was attempted. Confirm Ollama and resume-tailor-gemma are running, then start a new run.</span>
               </div>
             {% elif run.failure_kind == "retrieval" %}
               <div class="alert alert-info">

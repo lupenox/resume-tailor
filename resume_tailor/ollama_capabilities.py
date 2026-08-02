@@ -1,11 +1,11 @@
 """Explicit, configurable local model capabilities and deterministic budgeting.
 
-The Qwen writer previously hardcoded ``num_ctx=8192`` and ``num_predict=4096``
-inside the chat request. A prompt of 7,590 tokens plus 1,145 generated tokens
-exceeds an 8,192-token window, so generation can silently overflow the context
-and lose the structured-output framing long before the output ceiling is
-reached. This module makes those limits explicit, configurable, and checked
-before any provider request is launched.
+The local Ollama writer previously hardcoded ``num_ctx=8192`` and
+``num_predict=4096`` inside the chat request. A prompt of 7,590 tokens plus
+1,145 generated tokens exceeds an 8,192-token window, so generation can
+silently overflow the context and lose the structured-output framing long
+before the output ceiling is reached. This module makes those limits explicit,
+configurable, and checked before any provider request is launched.
 
 Nothing here relaxes a schema, an immutable fact, an approved-edit rule, an
 evidence rule, or a content budget. The budget is an additional local gate.
@@ -135,6 +135,16 @@ class OllamaModelCapabilities:
 
 #: Declared capabilities per known local model, by exact name then by prefix.
 MODEL_CAPABILITIES: dict[str, OllamaModelCapabilities] = {
+    # Active default writer: Gemma 4 12B via resume-tailor-gemma profile.
+    # Conservative operational window; the base model supports larger contexts
+    # but the application requests only what is needed and tested.
+    "resume-tailor-gemma": OllamaModelCapabilities(
+        context_window=32_768,
+        max_output_tokens=8_192,
+        min_output_tokens=2_048,
+    ),
+    # Historical Qwen entry retained for the preserved regression fixture and
+    # any runs that were created with the prior default profile.
     "resume-tailor-qwen": OllamaModelCapabilities(
         context_window=32_768,
         max_output_tokens=8_192,
@@ -151,7 +161,7 @@ def capabilities_for_model(
     """Resolve declared capabilities for ``model``, applying explicit overrides."""
     base = MODEL_CAPABILITIES.get(model)
     if base is None:
-        # Match on the tag-free name so "resume-tailor-qwen:latest" resolves.
+        # Match on the tag-free name so e.g. "resume-tailor-gemma:latest" resolves.
         bare = model.split(":", 1)[0]
         base = MODEL_CAPABILITIES.get(bare, OllamaModelCapabilities())
     if overrides is None:

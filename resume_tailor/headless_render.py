@@ -372,7 +372,7 @@ def render_headless_docx(
 ) -> None:
     """Render grounded content into a deterministic Headless-style résumé.
 
-    Qwen controls wording only. Page geometry, typography, ordering, hyperlinks,
+    Gemma 4 12B controls wording only. Page geometry, typography, ordering, hyperlinks,
     and structural validation remain deterministic Python responsibilities.
     """
     if source_path.resolve() == destination_path.resolve():

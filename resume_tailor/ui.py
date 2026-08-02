@@ -100,7 +100,7 @@ WORKFLOW_STAGES: tuple[tuple[str, str], ...] = (
     ("confirming_posting", "Confirming posting"),
     ("codex_analysis", "Codex analysis"),
     ("reviewing_changes", "Reviewing proposed changes"),
-    ("antigravity_tailoring", "Qwen résumé writing"),
+    ("antigravity_tailoring", "Gemma 4 12B résumé writing"),
     ("evidence_validation", "Evidence validation"),
     ("rendering", "Rendering DOCX/PDF"),
     ("final_qa", "Initial Codex QA"),
@@ -942,7 +942,7 @@ class RunManager:
         elif failure_kind == "ollama_preflight":
             technical = (
                 "Local authentication of the approved inputs failed before any "
-                "Qwen or Ollama request. Résumé and job content are omitted."
+                "Gemma 4 12B or Ollama request. Résumé and job content are omitted."
             )
             message = _OLLAMA_PREFLIGHT_UI_MESSAGE
         elif failure_kind == "ollama_connection":
@@ -953,19 +953,19 @@ class RunManager:
             message = _OLLAMA_CONNECTION_UI_MESSAGE
         elif failure_kind == "ollama_contract":
             technical = (
-                "The Qwen response failed strict JSON, canonical schema, edit-ID, "
+                "The Gemma 4 12B response failed strict JSON, canonical schema, edit-ID, "
                 "or revision validation. Provider content is omitted."
             )
             message = _OLLAMA_CONTRACT_UI_MESSAGE
         elif failure_kind == "ollama_cannot_apply":
             technical = (
-                "Qwen returned a bounded cannot_apply result for one authenticated "
+                "Gemma 4 12B returned a bounded cannot_apply result for one authenticated "
                 "edit or QA issue. Provider prose is omitted."
             )
             message = _OLLAMA_CANNOT_APPLY_UI_MESSAGE
         elif failure_kind == "ollama_technical_failure":
             technical = (
-                "Qwen returned a structured technical_failure result. Provider "
+                "Gemma 4 12B returned a structured technical_failure result. Provider "
                 "prose is omitted."
             )
             message = _OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE
@@ -1329,23 +1329,23 @@ _ANTIGRAVITY_TECHNICAL_FAILURE_UI_MESSAGE = (
 )
 _OLLAMA_CONNECTION_UI_MESSAGE = (
     "Resume Tailor could not reach the local Ollama service or load the configured "
-    "Qwen model at 127.0.0.1:11434. No remote fallback was attempted."
+    "Gemma 4 12B model at 127.0.0.1:11434. No remote fallback was attempted."
 )
 _OLLAMA_CONTRACT_UI_MESSAGE = (
-    "Qwen returned content that did not satisfy the local structured-output and "
+    "Gemma 4 12B returned content that did not satisfy the local structured-output and "
     "evidence contract. The response and sanitized validation envelope were preserved."
 )
 _OLLAMA_CANNOT_APPLY_UI_MESSAGE = (
-    "Qwen could not safely apply one authenticated approved edit. No unsupported "
+    "Gemma 4 12B could not safely apply one authenticated approved edit. No unsupported "
     "claim was substituted."
 )
 _OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE = (
-    "Qwen reported a bounded local writing failure. Authenticated inputs and "
+    "Gemma 4 12B reported a bounded local writing failure. Authenticated inputs and "
     "diagnostics were preserved."
 )
 _OLLAMA_PREFLIGHT_UI_MESSAGE = (
     "The authenticated tailoring inputs failed local completeness preflight. "
-    "No Qwen or Ollama request was launched."
+    "No Gemma 4 12B or Ollama request was launched."
 )
 _OLLAMA_BUDGET_UI_MESSAGE = (
     "The approved tailoring prompt does not fit the configured local model "
@@ -1549,8 +1549,8 @@ def _safe_error_message(error: ResumeTailorError) -> str:
             if "codex" in str(error).casefold()
             else "Antigravity"
             if "antigravity" in str(error).casefold()
-            else "Qwen"
-            if "qwen" in str(error).casefold() or "ollama" in str(error).casefold()
+            else "Gemma 4 12B"
+            if "gemma" in str(error).casefold() or "ollama" in str(error).casefold()
             else "The model stage"
         )
         return (

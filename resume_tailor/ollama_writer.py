@@ -40,7 +40,7 @@ from .utilities import (
 )
 
 
-DEFAULT_OLLAMA_MODEL = "resume-tailor-qwen"
+DEFAULT_OLLAMA_MODEL = "resume-tailor-gemma"
 OLLAMA_RESPONSE_FILENAME = "ollama-response.json"
 OLLAMA_RESPONSE_METADATA_FILENAME = "ollama-response-envelope.json"
 OLLAMA_REVISION_RESPONSE_FILENAME = "ollama-revision-response.json"
@@ -193,7 +193,7 @@ def build_ollama_tailoring_prompt(
         )
     except AntigravityTailoringPreflightError as exc:
         raise TailoringPreflightError(
-            "Local Qwen tailoring preflight failed. No writer request was launched."
+            "Local Ollama tailoring preflight failed. No writer request was launched."
         ) from exc
     budgets = [
         {
@@ -407,7 +407,7 @@ def _write_metadata(
     prompt_bytes = prompt.encode("utf-8")
     metadata = {
         "version": 2,
-        "provider": "qwen",
+        "provider": "gemma",
         "runtime": "ollama",
         "model": model,
         "endpoint": OLLAMA_BASE_URL,
@@ -562,13 +562,13 @@ def _invoke_payload(
     try:
         payload = _chat_payload(
             body,
-            label="Qwen structured output",
+            label="Gemma 4 12B structured output",
             generation=generation,
         )
         _validate_transport_payload(
             payload,
             transport_schema=transport_schema,
-            label="Qwen structured output",
+            label="Gemma 4 12B structured output",
         )
     except ModelError as exc:
         _write_metadata(
@@ -603,11 +603,11 @@ def _resolve_initial_payload(
         validate_payload(
             payload,
             "tailored_resume.schema.json",
-            label="Qwen output",
+            label="Gemma 4 12B output",
         )
     except ModelError as exc:
         raise OllamaCanonicalSchemaError(
-            "Qwen output passed transport validation but violated the canonical "
+            "Gemma 4 12B output passed transport validation but violated the canonical "
             "post-approval tailoring contract. Résumé content was omitted."
         ) from exc
     if payload["status"] == "cannot_apply":
@@ -617,16 +617,16 @@ def _resolve_initial_payload(
         }
         if detail["edit_id"] not in allowed_ids:
             raise OllamaEvidenceRejectionError(
-                "Qwen returned an unknown approved edit ID in cannot_apply."
+                "The local writer returned an unknown approved edit ID in cannot_apply."
             )
         raise OllamaCannotApplyError(
-            "Qwen could not apply approved "
+            "The local writer could not apply approved "
             f"{detail['edit_id']} ({detail['reason_code']})."
         )
     if payload["status"] == "technical_failure":
         detail = payload["technical_failure"]
         raise OllamaTechnicalFailureError(
-            "Qwen reported technical failure "
+            "The local writer reported technical failure "
             f"{detail['reason_code']}. Provider prose was omitted."
         )
     return payload["tailored_resume"]
@@ -734,7 +734,7 @@ def invoke_ollama_revision(
 ) -> dict[str, Any]:
     if attempt_number != 1:
         raise OllamaRevisionContractError(
-            "Exactly one Qwen revision attempt is permitted."
+            "Exactly one local writer revision attempt is permitted."
         )
     issue_ids = {
         issue["issue_id"]
@@ -743,7 +743,7 @@ def invoke_ollama_revision(
     }
     if qa_result.get("status") != "material_findings" or not issue_ids:
         raise OllamaRevisionContractError(
-            "A Qwen revision requires authenticated material QA findings."
+            "A local writer revision requires authenticated material QA findings."
         )
     model = validate_ollama_model_name(model)
     prompt = build_revision_prompt(
@@ -753,7 +753,7 @@ def invoke_ollama_revision(
         qa_result=qa_result,
         company=company,
         role=role,
-        provider_name="Qwen",
+        provider_name="Gemma 4 12B",
     )
     schema, transport_path = _write_transport_schema(
         run_directory,
@@ -778,7 +778,7 @@ def invoke_ollama_revision(
         validate_payload(
             payload,
             "antigravity_revision.schema.json",
-            label="Qwen revision output",
+            label="Gemma 4 12B revision output",
         )
     except ModelError as exc:
         _write_metadata(
@@ -796,23 +796,23 @@ def invoke_ollama_revision(
             generation=generation,
         )
         raise OllamaRevisionContractError(
-            "Qwen violated the one-shot revision response contract."
+            "The local writer violated the one-shot revision response contract."
         ) from exc
     try:
         if payload["status"] == "cannot_apply":
             detail = payload["cannot_apply"]
             if detail["issue_id"] not in issue_ids:
                 raise OllamaRevisionContractError(
-                    "Qwen returned an unknown QA issue ID in cannot_apply."
+                    "The local writer returned an unknown QA issue ID in cannot_apply."
                 )
             raise OllamaRevisionCannotApplyError(
-                "Qwen could not apply the bounded correction for "
+                "The local writer could not apply the bounded correction for "
                 f"{detail['issue_id']} ({detail['reason_code']})."
             )
         if payload["status"] == "technical_failure":
             detail = payload["technical_failure"]
             raise OllamaRevisionTechnicalFailureError(
-                "Qwen revision reported technical failure "
+                "The local writer revision reported technical failure "
                 f"{detail['reason_code']}."
             )
     except ModelError as exc:
