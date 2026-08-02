@@ -3,7 +3,7 @@ name: Verify Opus audit hardening
 on:
   pull_request:
     branches: [main]
-    types: [opened]
+    types: [opened, reopened]
 
 permissions:
   contents: write
@@ -26,7 +26,9 @@ jobs:
 
       - name: Apply bounded audit hardening
         run: |
+          python .github/scripts/prepare_opus_audit_hardening.py
           python .github/scripts/apply_opus_audit_hardening.py
+          rm -f .github/scripts/prepare_opus_audit_hardening.py
           rm -f .github/scripts/apply_opus_audit_hardening.py
           rm -f .github/workflows/verify-opus-audit-hardening.yml
 
