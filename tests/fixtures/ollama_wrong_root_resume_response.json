@@ -1,0 +1,44 @@
+{
+  "fixture": "ollama-wrong-root-resume-response",
+  "purpose": "Reproduce the preserved Step 6 Qwen structured-output failure in which the model returned a complete, parseable, naturally-stopped response whose root was a bare resume shape instead of the required status envelope.",
+  "synthetic": true,
+  "contains_real_resume_content": false,
+  "contains_prompt_or_provider_transcript": false,
+  "observed_signals": {
+    "done": true,
+    "done_reason": "stop",
+    "eval_count": 1145,
+    "prompt_eval_count": 7590,
+    "context_window": 8192,
+    "reported_total_tokens": 8735,
+    "hit_output_ceiling": false,
+    "note": "prompt_eval_count + eval_count (8735) exceeds the 8192-token context window even though generation stopped naturally and never reached the 4096-token output ceiling."
+  },
+  "expected_classification": {
+    "failure_class": "ollama-transport-schema",
+    "validation_path": "transport_schema",
+    "missing_required_root_fields": [
+      "cannot_apply",
+      "message",
+      "status",
+      "tailored_resume",
+      "technical_failure"
+    ]
+  },
+  "chat_body": {
+    "model": "resume-tailor-qwen:latest",
+    "created_at": "2026-01-01T00:00:00.000000Z",
+    "done": true,
+    "done_reason": "stop",
+    "message": {
+      "role": "assistant",
+      "content": "{\"header\":{\"name\":\"Synthetic Candidate\",\"contact\":\"synthetic@example.invalid\"},\"objective_summary\":\"Synthetic summary sentence for regression purposes only.\",\"education_certifications\":{\"institution\":\"Synthetic Institute\",\"degree\":\"Synthetic Degree\",\"certifications\":\"Synthetic Certification\"},\"technical_skills\":[{\"label\":\"Languages\",\"text\":\"Python\"},{\"label\":\"Tooling\",\"text\":\"Pytest\"},{\"label\":\"Practices\",\"text\":\"Schema validation\"}],\"ai_engineering_projects\":[{\"name\":\"Synthetic Project One\",\"technologies\":\"Python\",\"bullets\":[\"Synthetic supported bullet.\"]},{\"name\":\"Synthetic Project Two\",\"technologies\":\"Python\",\"bullets\":[\"Synthetic supported bullet.\"]},{\"name\":\"Synthetic Project Three\",\"technologies\":\"Python\",\"bullets\":[\"Synthetic supported bullet.\"]}],\"open_source_contribution\":{\"name\":\"synthetic/repo\",\"technologies\":\"Python\",\"bullet\":\"Synthetic supported contribution.\"},\"experience\":{\"role\":\"Synthetic Role\",\"employer_location\":\"Synthetic Employer, Remote\",\"dates\":\"2020 - 2021\",\"bullets\":[\"Synthetic supported responsibility.\"]}}"
+    },
+    "total_duration": 1000000000,
+    "load_duration": 1000000,
+    "prompt_eval_count": 7590,
+    "prompt_eval_duration": 500000000,
+    "eval_count": 1145,
+    "eval_duration": 400000000
+  }
+}

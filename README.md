@@ -199,9 +199,16 @@ Create the local writer profile once after downloading Qwen:
 
 ```text
 FROM qwen3.5:9b
-PARAMETER num_ctx 8192
+PARAMETER num_ctx 32768
 PARAMETER temperature 0.2
 ```
+
+`num_ctx` must be at least the `context_window` declared for the model in
+`resume_tailor/ollama_capabilities.py`. A smaller profile window silently
+truncates the prompt inside the Ollama server, which can produce a structurally
+wrong response even when the request itself is valid. See
+[docs/qwen-ollama-writer.md](docs/qwen-ollama-writer.md) for the budgeting and
+failure-classification rules.
 
 Save that as a `Modelfile`, then run:
 
