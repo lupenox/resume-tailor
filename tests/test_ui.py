@@ -344,6 +344,9 @@ async def _start(
             if mode == "pasted"
             else ""
         ),
+        # UI pipeline fixtures still exercise the Codex CLI stub unless a test
+        # explicitly selects another analysis provider.
+        "analysis_provider": "codex",
     }
     if extra:
         data.update(extra)
@@ -415,6 +418,11 @@ def _write_synthetic_source_failure(
             run,
             source_resume_sha256=source_hash,
         ),
+        "analysis": {
+            "provider": "codex",
+            "name": "Codex",
+            "automatic_fallback": False,
+        },
         "error": {
             "type": "SourceEvidenceError",
             "message": (
@@ -450,6 +458,9 @@ def _write_synthetic_antigravity_launch_failure(
         yes=False,
         keep_workdir=False,
         timeout=(30, "30s"),
+        analysis_provider="codex",
+        writer_provider="antigravity",
+        ollama_model="resume-tailor-gemma",
     )
     original = cli_module.invoke_antigravity
 
@@ -621,6 +632,65 @@ def test_ui_defaults_to_the_shared_cli_pipeline(
         master_resume=master_resume,
     )
     assert app.state.manager.pipeline_runner is run_pipeline
+
+
+def test_workflow_sidebar_shows_recorded_analysis_provider(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    """Regression: analysis stage label must follow metadata.analysis.provider."""
+    from resume_tailor.analysis import workflow_stages_for_provider
+
+    output_directory = tmp_path / "output"
+    output_directory.mkdir()
+    for provider, expected_label in (
+        ("gemma_local", "Gemma Local analysis"),
+        ("codex", "Codex analysis"),
+        ("grok_cli", "Grok CLI analysis"),
+        ("grok", "Grok CLI analysis"),
+    ):
+        run = output_directory / f"run-{provider}"
+        run.mkdir()
+        atomic_write_json(
+            run / "run-metadata.json",
+            {
+                "application": "resume-tailor",
+                "status": "FAILED",
+                "stage": "codex-analysis",
+                "company": "Example",
+                "role": "Developer",
+                "analysis": {
+                    "provider": provider,
+                    "name": provider,
+                    "automatic_fallback": False,
+                },
+                "error": {
+                    "type": "ModelError",
+                    "message": "synthetic stop",
+                    "exit_code": 10,
+                },
+            },
+        )
+        app = create_app(
+            output_directory=output_directory,
+            master_resume=master_resume,
+            pipeline_runner=StubbedUIPipeline(),
+        )
+        snapshot = app.state.manager.snapshot(f"history-{run.name}")
+        stages = dict(snapshot["workflow_stages"])
+        assert stages["codex_analysis"] == expected_label
+        assert dict(workflow_stages_for_provider(provider))[
+            "codex_analysis"
+        ] == expected_label
+
+        async def scenario() -> None:
+            async with _client(app) as client:
+                await _session(client)
+                page = await client.get(f"/runs/history-{run.name}")
+                assert page.status_code == 200
+                assert expected_label in page.text
+
+        asyncio.run(scenario())
 
 
 def test_ui_cli_does_not_offer_remote_binding() -> None:
@@ -1591,6 +1661,8 @@ def test_apify_result_format_failure_shows_safe_input_fallback(
             str(output_directory),
             "--timeout",
             "30s",
+            "--analysis-provider",
+            "codex",
         ]
     )
     assert code == ExitCode.MODEL

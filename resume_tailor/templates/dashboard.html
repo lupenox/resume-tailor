@@ -141,26 +141,34 @@
 
         <fieldset class="form-section">
           <legend>Analysis provider</legend>
-          {% set selected_analysis_provider = form_values.get("analysis_provider", "codex") %}
-          <div class="choice-grid choice-grid-two">
+          {% set selected_analysis_provider = form_values.get("analysis_provider", "gemma_local") %}
+          <div class="choice-grid">
+            <label class="choice-card">
+              <input type="radio" name="analysis_provider" value="gemma_local"
+                {% if selected_analysis_provider not in ["codex", "grok_cli", "grok"] %}checked{% endif %}>
+              <span class="choice-title">Gemma Local</span>
+              <span class="choice-copy">Free local Ollama analysis</span>
+              <span class="choice-meta">Recommended · no cloud key</span>
+            </label>
             <label class="choice-card">
               <input type="radio" name="analysis_provider" value="codex"
-                {% if selected_analysis_provider != "grok" %}checked{% endif %}>
+                {% if selected_analysis_provider == "codex" %}checked{% endif %}>
               <span class="choice-title">Codex</span>
-              <span class="choice-copy">Default analysis provider</span>
+              <span class="choice-copy">Cloud Codex CLI analysis</span>
               <span class="choice-meta">Explicit selection · no auto-fallback</span>
             </label>
             <label class="choice-card">
-              <input type="radio" name="analysis_provider" value="grok"
-                {% if selected_analysis_provider == "grok" %}checked{% endif %}>
-              <span class="choice-title">Grok Build</span>
+              <input type="radio" name="analysis_provider" value="grok_cli"
+                {% if selected_analysis_provider in ["grok_cli", "grok"] %}checked{% endif %}>
+              <span class="choice-title">Grok CLI</span>
               <span class="choice-copy">Authenticated local Grok CLI</span>
-              <span class="choice-meta">Must be chosen explicitly</span>
+              <span class="choice-meta">Experimental · explicit only</span>
             </label>
           </div>
           <p class="field-help">
-            Codex remains the default. Resume Tailor never switches providers
-            automatically when Codex hits a usage limit.
+            Gemma Local is recommended for free offline analysis. Resume Tailor
+            never switches providers automatically after a failure. Initial final
+            QA remains Codex-only even when Gemma Local is selected for analysis.
           </p>
         </fieldset>
 
@@ -169,12 +177,14 @@
           <p>
             The master file is never overwritten. URL retrieval sends only the public
             URL to Apify; no résumé content is included. After you approve the
-            normalized posting, the selected analysis provider (Codex by default, or
-            Grok when explicitly chosen) analyzes, local Gemma 4 12B writes,
-            deterministic Python validates and formats, and a fresh Codex session
-            independently reviews the completed résumé. Validated job metadata and
-            lifecycle events are recorded in private local SQLite analytics; résumé
-            body text and credentials are excluded.
+            normalized posting, the selected analysis provider (Gemma Local by
+            default; Codex or Grok CLI when explicitly chosen) analyzes, local
+            Gemma 4 12B writes, and deterministic Python validates and formats.
+            Initial final QA remains a separate Codex session and is not yet a
+            local Gemma provider—selecting Gemma Local for analysis does not make
+            the full workflow free of Codex. Validated job metadata and lifecycle
+            events are recorded in private local SQLite analytics; résumé body
+            text and credentials are excluded.
           </p>
         </div>
 

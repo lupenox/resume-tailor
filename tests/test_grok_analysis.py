@@ -72,10 +72,10 @@ def _valid_envelope(text: str, *, stop_reason: str = "end_turn") -> str:
     )
 
 
-def test_codex_remains_default_analysis_provider() -> None:
-    assert DEFAULT_ANALYSIS_PROVIDER == "codex"
-    assert normalize_analysis_provider(None) == "codex"
-    assert normalize_analysis_provider("") == "codex"
+def test_gemma_local_is_default_analysis_provider() -> None:
+    assert DEFAULT_ANALYSIS_PROVIDER == "gemma_local"
+    assert normalize_analysis_provider(None) == "gemma_local"
+    assert normalize_analysis_provider("") == "gemma_local"
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -89,12 +89,13 @@ def test_codex_remains_default_analysis_provider() -> None:
             "job.txt",
         ]
     )
-    assert args.analysis_provider == "codex"
+    assert args.analysis_provider == "gemma_local"
 
 
-def test_explicit_grok_provider_selection() -> None:
-    assert normalize_analysis_provider("grok") == "grok"
-    assert analysis_provider_label("grok") == "Grok"
+def test_explicit_grok_cli_provider_selection() -> None:
+    assert normalize_analysis_provider("grok") == "grok_cli"
+    assert normalize_analysis_provider("grok_cli") == "grok_cli"
+    assert analysis_provider_label("grok_cli") == "Grok CLI"
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -107,10 +108,10 @@ def test_explicit_grok_provider_selection() -> None:
             "--job-file",
             "job.txt",
             "--analysis-provider",
-            "grok",
+            "grok_cli",
         ]
     )
-    assert args.analysis_provider == "grok"
+    assert args.analysis_provider == "grok_cli"
 
 
 def test_resolve_grok_executable_from_path(
@@ -217,7 +218,7 @@ def test_invoke_analysis_dispatches_to_grok(
 ) -> None:
     extracted, _ = extract_resume(master_resume)
     payload = invoke_analysis(
-        provider="grok",
+        provider="grok_cli",
         extracted_resume=extracted,
         job_description="Python role",
         job_requirements=_job_catalog(),
@@ -629,18 +630,18 @@ def test_resolved_artifact_is_provider_neutral_for_grok(
     meta = write_resolved_analysis_artifact(
         tmp_path,
         resolved,
-        provider="grok",
+        provider="grok_cli",
     )
     assert meta["filename"] == ANALYSIS_RESOLVED_FILENAME
-    assert meta["provider"] == "grok"
+    assert meta["provider"] == "grok_cli"
     assert meta["legacy_codex_alias_written"] is False
     assert (tmp_path / ANALYSIS_RESOLVED_FILENAME).is_file()
     assert not (tmp_path / CODEX_ANALYSIS_RESOLVED_FILENAME).exists()
     document = json.loads(
         (tmp_path / ANALYSIS_RESOLVED_FILENAME).read_text(encoding="utf-8")
     )
-    assert document["provider"] == "grok"
-    assert document["provider_label"] == "Grok"
+    assert document["provider"] == "grok_cli"
+    assert document["provider_label"] == "Grok CLI"
     assert unwrap_resolved_analysis_document(document)["role_summary"]
 
 

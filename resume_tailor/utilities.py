@@ -183,6 +183,105 @@ class GrokInnerAnalysisError(GrokAnalysisError):
         )
 
 
+class GemmaAnalysisError(AnalysisProviderError):
+    """Local Gemma analysis failed; subclass names one sanitized path."""
+
+    classification = "generic_provider_failure"
+    provider = "gemma_local"
+
+
+class GemmaOllamaUnavailableError(GemmaAnalysisError):
+    """The localhost Ollama server is not reachable for analysis."""
+
+    classification = "ollama_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Local Ollama is unavailable for Gemma analysis. Confirm Ollama is "
+            "running on 127.0.0.1:11434. No automatic provider fallback was "
+            "attempted."
+        )
+
+
+class GemmaModelUnavailableError(GemmaAnalysisError):
+    """The configured Gemma analysis model is not available in Ollama."""
+
+    classification = "model_unavailable"
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        super().__init__(
+            f"The configured Gemma analysis model {model!r} is not available in "
+            "local Ollama. Pull or create the model, then start a new run with "
+            "analysis provider gemma_local."
+        )
+
+
+class GemmaAnalysisTimeoutError(GemmaAnalysisError):
+    """The Gemma analysis request exceeded its bounded timeout."""
+
+    classification = "timeout"
+
+    def __init__(self, timeout_seconds: int) -> None:
+        super().__init__(
+            f"Gemma analysis timed out after {timeout_seconds}s. The localhost "
+            "request was stopped. Retry with a larger bounded --timeout only "
+            "after confirming Ollama is responsive."
+        )
+
+
+class GemmaConnectionError(GemmaAnalysisError):
+    """A bounded localhost Ollama connection failure during analysis."""
+
+    classification = "connection_failure"
+
+
+class GemmaResponseTooLargeError(GemmaAnalysisError):
+    """The Ollama analysis response exceeded the local size bound."""
+
+    classification = "response_too_large"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Gemma analysis returned a response larger than the local safety "
+            "limit. Provider content was omitted; reduce the posting or résumé "
+            "size and start a new run."
+        )
+
+
+class GemmaTransportEnvelopeError(GemmaAnalysisError):
+    """The Ollama chat envelope was missing, incomplete, or not structured."""
+
+    classification = "malformed_transport_envelope"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(
+            "Gemma analysis returned a malformed Ollama transport envelope. "
+            f"Provider body content was omitted ({detail})."
+        )
+
+
+class GemmaInnerAnalysisError(GemmaAnalysisError):
+    """message.content was not exactly one canonical analysis document."""
+
+    classification = "malformed_inner_analysis"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(
+            "Gemma analysis content was not exactly one canonical résumé-analysis "
+            f"JSON document ({detail}). Markdown fences, trailing commentary, "
+            "and multiple JSON documents are rejected."
+        )
+
+
+class GemmaStructuredOutputError(GemmaAnalysisError):
+    """Structured-output grammar was ignored or incomplete."""
+
+    classification = "structured_output_failure"
+
+
 class OllamaConnectionError(ModelError):
     """The localhost-only Ollama API could not complete a bounded request."""
 

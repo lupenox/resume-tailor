@@ -53,6 +53,7 @@ from .analysis import (
     ANALYSIS_PROVIDERS,
     DEFAULT_ANALYSIS_PROVIDER,
     normalize_analysis_provider,
+    workflow_stages_for_provider,
 )
 from .ollama_writer import DEFAULT_OLLAMA_MODEL
 from .retry import (
@@ -75,6 +76,15 @@ from .utilities import (
     CancellationError,
     CodexSchemaCompatibilityError,
     CodexUsageLimitError,
+    GemmaAnalysisError,
+    GemmaAnalysisTimeoutError,
+    GemmaConnectionError,
+    GemmaInnerAnalysisError,
+    GemmaModelUnavailableError,
+    GemmaOllamaUnavailableError,
+    GemmaResponseTooLargeError,
+    GemmaStructuredOutputError,
+    GemmaTransportEnvelopeError,
     GrokAnalysisError,
     GrokAuthenticationError,
     GrokExecutableError,
@@ -110,19 +120,9 @@ MAX_JOB_BYTES = 500_000
 MAX_REQUEST_BYTES = MAX_RESUME_BYTES + MAX_JOB_BYTES + 256_000
 COOKIE_NAME = "resume_tailor_session"
 
-WORKFLOW_STAGES: tuple[tuple[str, str], ...] = (
-    ("validating_input", "Validating input"),
-    ("fetching_job", "Apify job retrieval"),
-    ("confirming_posting", "Confirming posting"),
-    ("codex_analysis", "Codex analysis"),
-    ("reviewing_changes", "Reviewing proposed changes"),
-    ("antigravity_tailoring", "Local résumé tailoring"),
-    ("evidence_validation", "Evidence validation"),
-    ("rendering", "Rendering DOCX/PDF"),
-    ("final_qa", "Initial Codex QA"),
-    ("revision_phase", "Optional one-shot revision"),
-    ("complete", "Complete"),
-)
+# Stage keys are stable; labels for the analysis step are provider-specific and
+# are resolved per run via workflow_stages_for_provider().
+WORKFLOW_STAGES: tuple[tuple[str, str], ...] = workflow_stages_for_provider(None)
 _STAGE_INDEX = {name: index for index, (name, _) in enumerate(WORKFLOW_STAGES)}
 _TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED"}
 _DOWNLOAD_EXACT = {
@@ -141,6 +141,10 @@ _DOWNLOAD_EXACT = {
     "grok-analysis-response.sanitized.json",
     "grok-analysis-schema.json",
     "grok-analysis-diagnostic.json",
+    "gemma-analysis-prompt.sanitized.txt",
+    "gemma-analysis-schema.json",
+    "gemma-analysis-response.sanitized.json",
+    "gemma-analysis-diagnostic.json",
     "antigravity-response.json",
     "antigravity-response-envelope.json",
     "antigravity-revision-response.json",
@@ -745,6 +749,12 @@ class RunManager:
             record.artifact_directory,
             failure_kind=failure_kind,
         )
+        analysis_meta = metadata.get("analysis")
+        analysis_provider = (
+            analysis_meta.get("provider")
+            if isinstance(analysis_meta, dict)
+            else None
+        )
         return {
             "run_id": record.run_id,
             "created_at": record.created_at,
@@ -754,6 +764,10 @@ class RunManager:
             "status": record.status,
             "stage": record.stage,
             "stage_index": _STAGE_INDEX.get(record.stage, 0),
+            "analysis_provider": analysis_provider,
+            "workflow_stages": workflow_stages_for_provider(
+                analysis_provider if isinstance(analysis_provider, str) else None
+            ),
             "message": record.message,
             "artifact_directory": (
                 str(record.artifact_directory)
@@ -1005,6 +1019,12 @@ class RunManager:
                 if status == "COMPLETE"
                 else "The preserved run stopped safely."
             )
+        analysis_meta = metadata.get("analysis")
+        analysis_provider = (
+            analysis_meta.get("provider")
+            if isinstance(analysis_meta, dict)
+            else None
+        )
         return {
             "run_id": run_id,
             "created_at": metadata.get("created_at", ""),
@@ -1014,6 +1034,10 @@ class RunManager:
             "status": status,
             "stage": stage,
             "stage_index": _STAGE_INDEX.get(stage, 0),
+            "analysis_provider": analysis_provider,
+            "workflow_stages": workflow_stages_for_provider(
+                analysis_provider if isinstance(analysis_provider, str) else None
+            ),
             "message": message,
             "artifact_directory": str(run_directory),
             "error": technical,
@@ -1078,8 +1102,13 @@ class RunManager:
                 prior_analysis = prior_metadata.get("analysis")
                 if isinstance(prior_analysis, dict):
                     prior_provider = prior_analysis.get("provider")
-                    if prior_provider in ANALYSIS_PROVIDERS:
-                        namespace.analysis_provider = prior_provider
+                    if isinstance(prior_provider, str):
+                        try:
+                            namespace.analysis_provider = (
+                                normalize_analysis_provider(prior_provider)
+                            )
+                        except InputError:
+                            pass
         try:
             return self.start(
                 namespace=namespace,
@@ -1446,7 +1475,26 @@ def _failure_kind_for_error(
         return "grok_transport"
     if isinstance(error, GrokInnerAnalysisError):
         return "grok_inner_analysis"
-    if isinstance(error, (GrokProcessError, GrokAnalysisError, AnalysisProviderError)):
+    if isinstance(error, GemmaOllamaUnavailableError):
+        return "gemma_ollama_unavailable"
+    if isinstance(error, GemmaModelUnavailableError):
+        return "gemma_model_unavailable"
+    if isinstance(error, GemmaAnalysisTimeoutError):
+        return "gemma_timeout"
+    if isinstance(error, GemmaConnectionError):
+        return "gemma_connection"
+    if isinstance(error, GemmaResponseTooLargeError):
+        return "gemma_response_too_large"
+    if isinstance(error, GemmaTransportEnvelopeError):
+        return "gemma_transport"
+    if isinstance(error, GemmaInnerAnalysisError):
+        return "gemma_inner_analysis"
+    if isinstance(error, GemmaStructuredOutputError):
+        return "gemma_structured_output"
+    if isinstance(
+        error,
+        (GrokProcessError, GrokAnalysisError, GemmaAnalysisError, AnalysisProviderError),
+    ):
         return "analysis_provider"
     if stage in {"fetching_job", "confirming_posting"}:
         return "retrieval"
@@ -1475,9 +1523,26 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         return "grok_transport"
     if failure_class == "grok-inner-analysis":
         return "grok_inner_analysis"
+    if failure_class == "gemma-ollama-unavailable":
+        return "gemma_ollama_unavailable"
+    if failure_class == "gemma-model-unavailable":
+        return "gemma_model_unavailable"
+    if failure_class == "gemma-analysis-timeout":
+        return "gemma_timeout"
+    if failure_class == "gemma-connection-failure":
+        return "gemma_connection"
+    if failure_class == "gemma-response-too-large":
+        return "gemma_response_too_large"
+    if failure_class == "gemma-transport-envelope":
+        return "gemma_transport"
+    if failure_class == "gemma-inner-analysis":
+        return "gemma_inner_analysis"
+    if failure_class == "gemma-structured-output":
+        return "gemma_structured_output"
     if failure_class in {
         "grok-nonzero-exit",
         "grok-analysis-failure",
+        "gemma-analysis-failure",
         "analysis-provider-failure",
     }:
         return "analysis_provider"
@@ -1647,7 +1712,7 @@ def _safe_error_message(error: ResumeTailorError) -> str:
     if isinstance(error, GrokAuthenticationError):
         return (
             "Grok Build CLI authentication failed. Log in through grok.com, then "
-            "start a new run with analysis provider set to Grok."
+            "start a new run with analysis provider set to Grok CLI."
         )
     if isinstance(error, GrokTimeoutError):
         return (
@@ -1670,15 +1735,53 @@ def _safe_error_message(error: ResumeTailorError) -> str:
             "Grok analysis stopped with a classified provider failure. Sanitized "
             "technical details are available below; useful artifacts were preserved."
         )
+    if isinstance(error, GemmaOllamaUnavailableError):
+        return (
+            "Local Ollama is unavailable for Gemma analysis. Confirm Ollama is "
+            "running on 127.0.0.1:11434. No automatic provider fallback was attempted."
+        )
+    if isinstance(error, GemmaModelUnavailableError):
+        return (
+            "The configured Gemma analysis model is not available in local Ollama. "
+            "Pull or create resume-tailor-gemma (or GEMMA_ANALYSIS_MODEL), then "
+            "start a new run."
+        )
+    if isinstance(error, GemmaAnalysisTimeoutError):
+        return (
+            "Gemma analysis exceeded the bounded timeout. Sanitized diagnostics "
+            "were preserved; no automatic provider fallback was attempted."
+        )
+    if isinstance(error, (GemmaConnectionError, GemmaResponseTooLargeError)):
+        return (
+            "Gemma analysis could not complete the bounded localhost Ollama "
+            "request. Sanitized diagnostics were preserved."
+        )
+    if isinstance(error, GemmaTransportEnvelopeError):
+        return (
+            "Gemma analysis returned a malformed Ollama response envelope. "
+            "Provider body content was omitted."
+        )
+    if isinstance(error, GemmaInnerAnalysisError):
+        return (
+            "Gemma analysis content was not exactly one canonical analysis JSON "
+            "document. Markdown fences, trailing commentary, and multiple "
+            "documents are rejected."
+        )
+    if isinstance(error, (GemmaStructuredOutputError, GemmaAnalysisError)):
+        return (
+            "Gemma Local analysis stopped with a classified provider failure. "
+            "Sanitized technical details are available below; useful artifacts "
+            "were preserved."
+        )
     if isinstance(error, ModelError):
         provider = (
             "Codex"
             if "codex" in str(error).casefold()
-            else "Grok"
+            else "Grok CLI"
             if "grok" in str(error).casefold()
             else "Antigravity"
             if "antigravity" in str(error).casefold()
-            else "Gemma 4 12B"
+            else "Gemma Local"
             if "gemma" in str(error).casefold() or "ollama" in str(error).casefold()
             else "The model stage"
         )
@@ -1745,7 +1848,12 @@ def _render(
         request=request,
         csrf_token=app.state.settings.launch_token,
         version=__version__,
-        workflow_stages=WORKFLOW_STAGES,
+        workflow_stages=(
+            context["run"].get("workflow_stages")
+            if isinstance(context.get("run"), Mapping)
+            and isinstance(context["run"].get("workflow_stages"), (list, tuple))
+            else WORKFLOW_STAGES
+        ),
         max_job_description_characters=(
             MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
         ),

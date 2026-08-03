@@ -131,6 +131,10 @@ def _arguments(
         "30s",
         "--writer-provider",
         "antigravity",
+        # Pipeline fixtures use the Codex CLI stub; select it explicitly so the
+        # free Gemma Local default does not change existing Codex coverage.
+        "--analysis-provider",
+        "codex",
     ]
     if yes:
         arguments.append("--yes")
@@ -152,6 +156,8 @@ def _url_arguments(
         "30s",
         "--writer-provider",
         "antigravity",
+        "--analysis-provider",
+        "codex",
     ]
 
 
@@ -294,6 +300,8 @@ def test_default_pipeline_routes_approved_writing_to_local_gemma(
             str(tmp_path / "output"),
             "--timeout",
             "30s",
+            "--analysis-provider",
+            "codex",
         ]
     )
 
@@ -464,6 +472,8 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
             "--timeout",
             "30s",
             "--yes",
+            "--analysis-provider",
+            "codex",
         ]
     )
     hooks = PipelineHooks(
@@ -572,6 +582,8 @@ def test_default_gemma_artifact_preflight_failure_is_provider_specific(
             "--timeout",
             "30s",
             "--yes",
+            "--analysis-provider",
+            "codex",
         ]
     )
 
@@ -691,6 +703,8 @@ def test_local_text_modes_never_enable_apify_retrieval(
             "--timeout",
             "30s",
             "--yes",
+            "--analysis-provider",
+            "codex",
         ]
 
     code = main(arguments)

@@ -103,6 +103,15 @@ from .utilities import (
     CancellationError,
     CodexUsageLimitError,
     ExitCode,
+    GemmaAnalysisError,
+    GemmaAnalysisTimeoutError,
+    GemmaConnectionError,
+    GemmaInnerAnalysisError,
+    GemmaModelUnavailableError,
+    GemmaOllamaUnavailableError,
+    GemmaResponseTooLargeError,
+    GemmaStructuredOutputError,
+    GemmaTransportEnvelopeError,
     GrokAnalysisError,
     GrokAuthenticationError,
     GrokExecutableError,
@@ -230,8 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=ANALYSIS_PROVIDERS,
         default=DEFAULT_ANALYSIS_PROVIDER,
         help=(
-            "résumé-analysis provider (default: codex; grok is an explicit "
-            "alternative and is never selected automatically)"
+            "résumé-analysis provider (default: gemma_local; codex and grok_cli "
+            "are explicit alternatives and are never selected automatically)"
         ),
     )
     parser.add_argument(
@@ -314,13 +323,28 @@ def _runtime_dependency_versions() -> dict[str, str]:
 def _analysis_dependency_versions(
     cwd: Path,
     analysis_provider: str = DEFAULT_ANALYSIS_PROVIDER,
+    ollama_model: str = DEFAULT_OLLAMA_MODEL,
 ) -> dict[str, str]:
     provider = normalize_analysis_provider(analysis_provider)
     versions = {
         **_runtime_dependency_versions(),
         "analysis_provider": provider,
     }
-    if provider == "grok":
+    if provider == "gemma_local":
+        from .gemma_analysis import resolve_gemma_analysis_model
+        from .ollama_transport import ollama_dependency_versions
+
+        model = resolve_gemma_analysis_model(ollama_model)
+        versions.update(
+            ollama_dependency_versions(
+                model=model,
+                cwd=cwd,
+                timeout_seconds=15,
+            )
+        )
+        versions["gemma_analysis_model"] = model
+        return versions
+    if provider == "grok_cli":
         from .grok_analysis import resolve_grok_executable
 
         grok = resolve_grok_executable()
@@ -932,11 +956,13 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["tools"] = _analysis_dependency_versions(
                 run_directory,
                 analysis_provider,
+                ollama_model,
             )
         else:
             metadata["tools"] = _analysis_dependency_versions(
                 run_directory,
                 analysis_provider,
+                ollama_model,
             )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
@@ -1375,7 +1401,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     transport_artifact.metadata()
                 )
                 _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            else:
+            elif analysis_provider == "grok_cli":
                 metadata["stage"] = "analysis-schema-preflight"
                 hooks.progress(
                     "codex_analysis",
@@ -1404,6 +1430,35 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     "generated_from_source_and_requirement_catalogs": True,
                 }
                 _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            else:
+                metadata["stage"] = "analysis-schema-preflight"
+                hooks.progress(
+                    "codex_analysis",
+                    f"Generating the source-bound {analysis_label} analysis schema.",
+                )
+                from .gemma_analysis import prepare_gemma_analysis_schema
+
+                gemma_schema = prepare_gemma_analysis_schema(
+                    extracted,
+                    job_requirements,
+                    run_directory,
+                )
+                metadata["gemma_analysis_schema"] = {
+                    "filename": Path(gemma_schema["path"]).name,
+                    "sha256": gemma_schema["sha256"],
+                    "size_bytes": gemma_schema["size_bytes"],
+                    "evidence_source_id_count": gemma_schema[
+                        "evidence_source_id_count"
+                    ],
+                    "editable_source_id_count": gemma_schema[
+                        "editable_source_id_count"
+                    ],
+                    "job_requirement_id_count": gemma_schema[
+                        "job_requirement_id_count"
+                    ],
+                    "generated_from_source_and_requirement_catalogs": True,
+                }
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
             metadata["stage"] = "codex-analysis"
             hooks.progress(
@@ -1422,6 +1477,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 run_directory=run_directory,
                 timeout_seconds=timeout_seconds,
                 transport_artifact=transport_artifact,
+                model=ollama_model,
                 progress_handler=lambda elapsed, alive: hooks.progress(
                     "codex_analysis",
                     (
@@ -2309,7 +2365,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         if isinstance(exc, CodexUsageLimitError):
             metadata["failure_class"] = "codex-usage-limit"
             metadata["analysis_failure_classification"] = exc.classification
-            metadata["analysis_provider_suggestion"] = "grok"
+            metadata["analysis_provider_suggestion"] = "gemma_local"
         if isinstance(exc, GrokExecutableError):
             metadata["failure_class"] = "grok-executable-unavailable"
             metadata["analysis_failure_classification"] = exc.classification
@@ -2339,6 +2395,40 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             and "failure_class" not in metadata
         ):
             metadata["failure_class"] = "grok-analysis-failure"
+            metadata["analysis_failure_classification"] = getattr(
+                exc,
+                "classification",
+                "generic_provider_failure",
+            )
+        if isinstance(exc, GemmaOllamaUnavailableError):
+            metadata["failure_class"] = "gemma-ollama-unavailable"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaModelUnavailableError):
+            metadata["failure_class"] = "gemma-model-unavailable"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaAnalysisTimeoutError):
+            metadata["failure_class"] = "gemma-analysis-timeout"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaConnectionError):
+            metadata["failure_class"] = "gemma-connection-failure"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaResponseTooLargeError):
+            metadata["failure_class"] = "gemma-response-too-large"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaTransportEnvelopeError):
+            metadata["failure_class"] = "gemma-transport-envelope"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaInnerAnalysisError):
+            metadata["failure_class"] = "gemma-inner-analysis"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaStructuredOutputError):
+            metadata["failure_class"] = "gemma-structured-output"
+            metadata["analysis_failure_classification"] = exc.classification
+        if (
+            isinstance(exc, GemmaAnalysisError)
+            and "failure_class" not in metadata
+        ):
+            metadata["failure_class"] = "gemma-analysis-failure"
             metadata["analysis_failure_classification"] = getattr(
                 exc,
                 "classification",
