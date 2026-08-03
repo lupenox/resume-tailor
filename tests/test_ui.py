@@ -890,7 +890,10 @@ def test_real_pipeline_records_view_only_after_ui_posting_gate_is_presented(
     monkeypatch.setattr(
         cli_module,
         "_analysis_dependency_versions",
-        lambda _directory: {"resume_tailor": "synthetic", "codex": "synthetic"},
+        lambda *_args, **_kwargs: {
+            "resume_tailor": "synthetic",
+            "codex": "synthetic",
+        },
     )
     app = create_app(
         output_directory=tmp_path / "output",
@@ -930,7 +933,10 @@ def test_real_pipeline_failed_retrieval_is_not_counted_as_viewed(
     monkeypatch.setattr(
         cli_module,
         "_analysis_dependency_versions",
-        lambda _directory: {"resume_tailor": "synthetic", "codex": "synthetic"},
+        lambda *_args, **_kwargs: {
+            "resume_tailor": "synthetic",
+            "codex": "synthetic",
+        },
     )
     app = create_app(
         output_directory=tmp_path / "output",
@@ -1270,7 +1276,17 @@ def test_source_evidence_failure_guidance_and_safe_retry(
     )
     monkeypatch.setattr(
         "resume_tailor.cli._tailoring_dependency_versions",
-        lambda _: pytest.fail("Antigravity dependencies checked before approval"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "Antigravity dependencies checked before approval"
+        ),
+    )
+    monkeypatch.setattr(
+        "resume_tailor.cli._analysis_dependency_versions",
+        lambda *_args, **_kwargs: {
+            "resume_tailor": "synthetic",
+            "codex": "synthetic",
+            "analysis_provider": "codex",
+        },
     )
     app = create_app(
         output_directory=output_directory,
@@ -1286,7 +1302,7 @@ def test_source_evidence_failure_guidance_and_safe_retry(
             assert page.status_code == 200
             assert "Model evidence-contract failure" in page.text
             assert "violated the authoritative local evidence contract" in page.text
-            assert "Retry Codex analysis" in page.text
+            assert "Retry analysis" in page.text
             assert "LinkedIn fallback" not in page.text
             assert "job-file" not in page.text
             assert "PRIVATE SYNTHETIC SOURCE QUOTATION" not in page.text
@@ -1310,7 +1326,10 @@ def test_source_evidence_failure_guidance_and_safe_retry(
             assert not (retry_directory / "job-source.json").exists()
             assert (retry_directory / "job-requirements.json").is_file()
             assert not (retry_directory / "antigravity-response.json").exists()
-            assert (retry_directory / "codex-analysis-resolved.json").is_file()
+            assert (
+                (retry_directory / "analysis-resolved.json").is_file()
+                or (retry_directory / "codex-analysis-resolved.json").is_file()
+            )
             metadata = json.loads(
                 (retry_directory / "run-metadata.json").read_text(encoding="utf-8")
             )
@@ -1336,6 +1355,11 @@ def test_antigravity_launch_failure_guidance_and_authenticated_recovery(
         for path in source_run.iterdir()
         if path.is_file()
     }
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_analysis",
+        lambda **_kwargs: pytest.fail("Analysis ran during Antigravity recovery"),
+    )
     monkeypatch.setattr(
         cli_module,
         "invoke_codex_analysis",
@@ -1368,7 +1392,7 @@ def test_antigravity_launch_failure_guidance_and_authenticated_recovery(
                 page.text
             )
             assert "Retry Antigravity tailoring" in page.text
-            assert "Retry Codex analysis" not in page.text
+            assert "Retry analysis" not in page.text
             assert "LinkedIn retrieval fallback" not in page.text
             assert "codex-analysis-approval.json" not in page.text
             assert '<details class="diff-details technical-details">' in page.text
@@ -1390,8 +1414,9 @@ def test_antigravity_launch_failure_guidance_and_authenticated_recovery(
             assert recovery_directory != source_run
             assert not (recovery_directory / "codex-analysis.json").exists()
             assert (
-                recovery_directory / "codex-analysis-resolved.json"
-            ).is_file()
+                (recovery_directory / "analysis-resolved.json").is_file()
+                or (recovery_directory / "codex-analysis-resolved.json").is_file()
+            )
             assert (
                 recovery_directory / "codex-analysis-approval.json"
             ).is_file()
@@ -1443,6 +1468,11 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
     }
     monkeypatch.setattr(
         cli_module,
+        "invoke_analysis",
+        lambda **_kwargs: pytest.fail("Analysis ran during Antigravity recovery"),
+    )
+    monkeypatch.setattr(
+        cli_module,
         "invoke_codex_analysis",
         lambda **_kwargs: pytest.fail("Codex ran during Antigravity recovery"),
     )
@@ -1469,7 +1499,7 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
             assert "did not apply the approved tailoring plan" in page.text
             assert "not a request for missing experience" in page.text
             assert "Retry Antigravity tailoring" in page.text
-            assert "Retry Codex analysis" not in page.text
+            assert "Retry analysis" not in page.text
             assert "LinkedIn retrieval fallback" not in page.text
             assert "Plan mode activated" not in page.text
             assert "What synthetic task" not in page.text
@@ -1546,7 +1576,7 @@ def test_apify_result_format_failure_shows_safe_input_fallback(
     monkeypatch.setattr(
         cli_module,
         "_analysis_dependency_versions",
-        lambda _cwd: {
+        lambda *_args, **_kwargs: {
             "resume_tailor": "0.1.0",
             "codex": "stub",
         },
@@ -1605,6 +1635,11 @@ def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(
         for path in source_run.iterdir()
         if path.is_file()
     }
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_analysis",
+        lambda **_kwargs: pytest.fail("Analysis ran during offline reprocessing"),
+    )
     monkeypatch.setattr(
         cli_module,
         "invoke_codex_analysis",
@@ -1788,7 +1823,7 @@ def test_source_evidence_retry_refuses_changed_input_hash(
             page = await client.get(f"/runs/{source_id}")
             assert page.status_code == 200
             assert "New run required" in page.text
-            assert "Retry Codex analysis" not in page.text
+            assert "Retry analysis" not in page.text
             retry = await client.post(
                 f"/runs/{source_id}/retry-codex-analysis",
                 data={"csrf_token": token},

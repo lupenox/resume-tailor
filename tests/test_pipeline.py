@@ -178,6 +178,7 @@ def test_simulated_pipeline_artifact_tree_and_source_immutability(
         "extracted-master-resume.json",
         "codex-analysis-transport.schema.json",
         "codex-analysis.json",
+        "analysis-resolved.json",
         "codex-analysis-resolved.json",
         "codex-analysis-approval.json",
         "antigravity-response.json",
@@ -387,6 +388,7 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
         )
         return raw
 
+    monkeypatch.setattr(cli_module, "invoke_analysis", fake_analysis)
     monkeypatch.setattr(cli_module, "invoke_codex_analysis", fake_analysis)
 
     def reject_provider(**_kwargs: object) -> object:
@@ -599,7 +601,13 @@ def test_failure_preserves_useful_artifacts(
     assert (run / "job-description.txt").is_file()
     assert (run / "extracted-master-resume.json").is_file()
     assert (run / "codex-analysis.json").is_file()
+    assert (run / "analysis-resolved.json").is_file()
     assert (run / "codex-analysis-resolved.json").is_file()
+    resolved_doc = json.loads(
+        (run / "analysis-resolved.json").read_text(encoding="utf-8")
+    )
+    assert resolved_doc["provider"] == "codex"
+    assert "analysis" in resolved_doc
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["status"] == "FAILED"
     assert metadata["source_resume"]["unchanged"] is True
@@ -627,6 +635,7 @@ def test_analytics_failure_warns_but_does_not_corrupt_resume_pipeline(
 
     assert code == ExitCode.WAITING
     run = next(output_dir.iterdir())
+    assert (run / "analysis-resolved.json").is_file()
     assert (run / "codex-analysis-resolved.json").is_file()
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["analytics"]["warnings"] == [
@@ -840,6 +849,11 @@ def test_apify_is_the_only_step_2_retrieval_provider(
     _stub_apify_retrieval(monkeypatch, calls=calls)
     monkeypatch.setattr(
         cli_module,
+        "invoke_analysis",
+        lambda **_: pytest.fail("Analysis ran before posting approval"),
+    )
+    monkeypatch.setattr(
+        cli_module,
         "invoke_codex_analysis",
         lambda **_: pytest.fail("Codex analysis ran before posting approval"),
     )
@@ -851,12 +865,14 @@ def test_apify_is_the_only_step_2_retrieval_provider(
     monkeypatch.setattr(
         cli_module,
         "_tailoring_dependency_versions",
-        lambda _: pytest.fail("Writer dependencies were invoked during Step 2"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "Writer dependencies were invoked during Step 2"
+        ),
     )
     monkeypatch.setattr(
         cli_module,
         "_analysis_dependency_versions",
-        lambda _: {
+        lambda *_args, **_kwargs: {
             "resume_tailor": "0.1.0",
             "codex": "stub",
         },
@@ -912,7 +928,7 @@ def test_malformed_apify_result_is_stage_specific_and_stops_before_analysis(
     monkeypatch.setattr(
         cli_module,
         "_analysis_dependency_versions",
-        lambda _cwd: {
+        lambda *_args, **_kwargs: {
             "resume_tailor": "0.1.0",
             "codex": "stub",
         },

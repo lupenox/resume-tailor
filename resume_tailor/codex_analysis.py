@@ -21,6 +21,7 @@ from .schemas import (
 )
 from .utilities import (
     CodexSchemaCompatibilityError,
+    CodexUsageLimitError,
     ModelError,
     SourceEvidenceError,
     atomic_write_json,
@@ -28,6 +29,9 @@ from .utilities import (
     require_executable,
     run_command,
 )
+
+# Exact known Codex usage-limit phrase. Do not classify arbitrary failures as quota.
+_CODEX_USAGE_LIMIT_PHRASE = "you've hit your usage limit"
 
 
 def _untrusted_job_block(job_description: str) -> str:
@@ -222,6 +226,10 @@ def invoke_codex_analysis(
                     "Codex rejected the analysis transport schema",
                 )
             )
+        # Classify only the known usage-limit phrase. Generic Codex failures
+        # must never trigger an automatic Grok fallback.
+        if _CODEX_USAGE_LIMIT_PHRASE in provider_detail:
+            raise CodexUsageLimitError()
         raise ModelError(concise_process_error(result, "Codex analysis"))
     if not output_path.is_file():
         raise ModelError("Codex did not create codex-analysis.json.")
@@ -259,11 +267,15 @@ def invoke_codex_analysis(
     return payload
 
 
-def readable_analysis(analysis: dict[str, Any]) -> str:
+def readable_analysis(
+    analysis: dict[str, Any],
+    *,
+    provider_label: str = "Codex",
+) -> str:
     fit = analysis["fit_assessment"]
     lines = [
         "",
-        "Codex resume-to-job analysis",
+        f"{provider_label} resume-to-job analysis",
         f"Role summary: {analysis['role_summary']}",
         f"Fit: {fit['overall']}",
     ]

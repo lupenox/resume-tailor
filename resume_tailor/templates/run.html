@@ -493,20 +493,49 @@
             {% if run.failure_kind == "source_evidence" %}
               <div class="alert alert-warning">
                 <strong>Model evidence-contract failure</strong>
-                <span>Codex returned a job-requirement or résumé-source reference that did not satisfy the authoritative local catalogs. The confirmed job description was preserved and can be reused by a verified retry.</span>
+                <span>The analysis provider returned a job-requirement or résumé-source reference that did not satisfy the authoritative local catalogs. The confirmed job description was preserved and can be reused by a verified retry.</span>
               </div>
               {% if run.retry_eligible %}
                 <form action="/runs/{{ run.run_id }}/retry-codex-analysis" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                  <button class="primary-button" type="submit">Retry Codex analysis <span>→</span></button>
+                  <button class="primary-button" type="submit">Retry analysis <span>→</span></button>
                 </form>
-                <p class="field-help">{{ run.retry_reason }} The retry creates a new isolated run and stops at the normal analysis approval gate.</p>
+                <p class="field-help">{{ run.retry_reason }} The retry creates a new isolated run and stops at the normal analysis approval gate. It reuses the same analysis provider when recorded.</p>
               {% elif run.retry_reason %}
                 <div class="alert alert-info">
                   <strong>New run required</strong>
                   <span>{{ run.retry_reason }}</span>
                 </div>
               {% endif %}
+            {% elif run.failure_kind == "codex_usage_limit" %}
+              <div class="alert alert-warning">
+                <strong>Codex usage limit</strong>
+                <span>Codex reported a usage limit. Resume Tailor did not switch providers automatically and did not reuse any failed Codex output.</span>
+              </div>
+              <div class="alert alert-info">
+                <strong>Optional alternative</strong>
+                <span>You may start a new run and explicitly select Grok as the analysis provider. Grok is never invoked automatically after a Codex failure.</span>
+              </div>
+            {% elif run.failure_kind == "grok_executable" %}
+              <div class="alert alert-warning">
+                <strong>Grok executable unavailable</strong>
+                <span>Install the Grok Build CLI and ensure it is available at ~/.grok/bin/grok or on PATH, then start a new run with Grok selected explicitly.</span>
+              </div>
+            {% elif run.failure_kind == "grok_prompt_too_large" %}
+              <div class="alert alert-warning">
+                <strong>Grok analysis prompt too large</strong>
+                <span>The analysis prompt exceeded the local process argument-size limit. Reduce the confirmed posting or résumé size and start a new run. Prompt contents are not stored in this error.</span>
+              </div>
+            {% elif run.failure_kind == "grok_authentication" %}
+              <div class="alert alert-warning">
+                <strong>Grok authentication required</strong>
+                <span>Log in through grok.com, then start a new run with analysis provider set to Grok. No credentials are stored in this run.</span>
+              </div>
+            {% elif run.failure_kind in ["grok_usage_limit", "grok_timeout", "grok_transport", "grok_inner_analysis", "analysis_provider"] %}
+              <div class="alert alert-warning">
+                <strong>Grok analysis failure</strong>
+                <span>Grok analysis stopped safely. Sanitized diagnostics may be preserved under grok-analysis-* filenames. No automatic fallback to Codex was attempted.</span>
+              </div>
             {% elif run.failure_kind == "apify_linkedin_retrieval" %}
               <div class="alert alert-warning">
                 {% if run.retrieval_classification in ["missing_token", "invalid_token"] %}

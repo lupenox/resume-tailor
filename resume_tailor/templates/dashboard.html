@@ -139,16 +139,42 @@
           </div>
         </fieldset>
 
+        <fieldset class="form-section">
+          <legend>Analysis provider</legend>
+          {% set selected_analysis_provider = form_values.get("analysis_provider", "codex") %}
+          <div class="choice-grid choice-grid-two">
+            <label class="choice-card">
+              <input type="radio" name="analysis_provider" value="codex"
+                {% if selected_analysis_provider != "grok" %}checked{% endif %}>
+              <span class="choice-title">Codex</span>
+              <span class="choice-copy">Default analysis provider</span>
+              <span class="choice-meta">Explicit selection · no auto-fallback</span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="analysis_provider" value="grok"
+                {% if selected_analysis_provider == "grok" %}checked{% endif %}>
+              <span class="choice-title">Grok Build</span>
+              <span class="choice-copy">Authenticated local Grok CLI</span>
+              <span class="choice-meta">Must be chosen explicitly</span>
+            </label>
+          </div>
+          <p class="field-help">
+            Codex remains the default. Resume Tailor never switches providers
+            automatically when Codex hits a usage limit.
+          </p>
+        </fieldset>
+
         <div class="privacy-note">
           <span class="shield-icon" aria-hidden="true">✓</span>
           <p>
             The master file is never overwritten. URL retrieval sends only the public
             URL to Apify; no résumé content is included. After you approve the
-            normalized posting, Codex analyzes, local Gemma 4 12B writes, deterministic Python
-            validates and formats, and a fresh Codex session independently reviews
-            the completed résumé. Validated job metadata and lifecycle events are
-            recorded in private local SQLite analytics; résumé body text and
-            credentials are excluded.
+            normalized posting, the selected analysis provider (Codex by default, or
+            Grok when explicitly chosen) analyzes, local Gemma 4 12B writes,
+            deterministic Python validates and formats, and a fresh Codex session
+            independently reviews the completed résumé. Validated job metadata and
+            lifecycle events are recorded in private local SQLite analytics; résumé
+            body text and credentials are excluded.
           </p>
         </div>
 

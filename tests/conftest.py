@@ -56,8 +56,10 @@ def stubs_on_path(
     monkeypatch.setenv("PATH", f"{stubs}:{os.environ['PATH']}")
     monkeypatch.delenv("STUB_CODEX_MODE", raising=False)
     monkeypatch.delenv("STUB_AGY_MODE", raising=False)
+    monkeypatch.delenv("STUB_GROK_MODE", raising=False)
     for name in (
         "STUB_CODEX_INVOCATION_LOG",
+        "STUB_GROK_INVOCATION_LOG",
         "APIFY_API_TOKEN",
         "APIFY_ACTOR_ID",
     ):

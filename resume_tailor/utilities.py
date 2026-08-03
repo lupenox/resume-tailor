@@ -58,6 +58,131 @@ class ModelError(ResumeTailorError):
     exit_code = ExitCode.MODEL
 
 
+class AnalysisProviderError(ModelError):
+    """A résumé-analysis provider failed with a classified, sanitized reason.
+
+    ``classification`` is a stable machine-readable token used by UI guidance
+    and run metadata. Provider prose is omitted from subclasses that represent
+    transport or authentication failures.
+    """
+
+    classification = "generic_provider_failure"
+    provider = "analysis"
+
+    def __init__(self, message: str, *, classification: str | None = None) -> None:
+        if classification is not None:
+            self.classification = classification
+        super().__init__(message)
+
+
+class CodexUsageLimitError(AnalysisProviderError):
+    """Codex reported the known usage-limit message; no automatic fallback."""
+
+    classification = "provider_usage_limit"
+    provider = "codex"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Codex reported a usage limit. No automatic provider fallback was "
+            "attempted. Wait for the limit to reset, or explicitly select Grok "
+            "as the analysis provider and start a new run."
+        )
+
+
+class GrokAnalysisError(AnalysisProviderError):
+    """Grok Build analysis failed; subclass names one sanitized path."""
+
+    classification = "generic_provider_failure"
+    provider = "grok"
+
+
+class GrokExecutableError(DependencyError):
+    """The Grok Build CLI executable could not be resolved or started."""
+
+    classification = "executable_unavailable"
+    provider = "grok"
+
+
+class GrokPromptTooLargeError(DependencyError):
+    """The Grok analysis prompt exceeded the OS process argument-size limit."""
+
+    classification = "prompt_too_large"
+    provider = "grok"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Grok analysis could not start because the analysis prompt exceeded "
+            "the local process argument-size limit (OS E2BIG). Reduce the "
+            "confirmed posting or résumé size and start a new run. Prompt "
+            "contents are omitted from this error."
+        )
+
+
+class GrokUsageLimitError(GrokAnalysisError):
+    """Grok reported a provider usage or quota limit."""
+
+    classification = "provider_usage_limit"
+
+
+class GrokAuthenticationError(GrokAnalysisError):
+    """Grok CLI authentication is missing or rejected."""
+
+    classification = "authentication_failure"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Grok Build CLI authentication failed. Log in through grok.com, then "
+            "retry with the analysis provider explicitly set to grok. No "
+            "credential values are stored or displayed."
+        )
+
+
+class GrokTimeoutError(GrokAnalysisError):
+    """The Grok analysis subprocess exceeded its bounded timeout."""
+
+    classification = "timeout"
+
+    def __init__(self, timeout_seconds: int) -> None:
+        super().__init__(
+            f"Grok analysis timed out after {timeout_seconds}s. The full "
+            "subprocess group was stopped. Retry with a larger bounded "
+            "--timeout only after confirming the local Grok CLI is responsive."
+        )
+
+
+class GrokProcessError(GrokAnalysisError):
+    """Grok exited nonzero without a more specific classified reason."""
+
+    classification = "nonzero_exit"
+
+
+class GrokTransportEnvelopeError(GrokAnalysisError):
+    """The Grok CLI transport envelope was missing, malformed, or incomplete."""
+
+    classification = "malformed_transport_envelope"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(
+            "Grok returned a malformed transport envelope. Provider thought and "
+            f"response body content were omitted ({detail})."
+        )
+
+
+class GrokInnerAnalysisError(GrokAnalysisError):
+    """The envelope text field was not exactly one canonical analysis document."""
+
+    classification = "malformed_inner_analysis"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(
+            "Grok envelope text was not exactly one canonical résumé-analysis "
+            f"JSON document ({detail}). Markdown fences, trailing commentary, "
+            "and multiple JSON documents are rejected."
+        )
+
+
 class OllamaConnectionError(ModelError):
     """The localhost-only Ollama API could not complete a bounded request."""
 

@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Test stub for the Grok Build CLI. Never calls a real Grok service."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def _write_envelope(text: str, *, stop_reason: str = "end_turn") -> None:
+    envelope = {
+        "text": text,
+        "stopReason": stop_reason,
+        "sessionId": "stub-session",
+        "requestId": "stub-request",
+        "thought": "STUB_THOUGHT_MUST_NEVER_BE_TREATED_AS_ANALYSIS",
+        "usage": {"input": 1, "output": 1},
+        "modelUsage": {"grok-4.5-build": {"requests": 1}},
+    }
+    sys.stdout.write(json.dumps(envelope, ensure_ascii=False))
+
+
+if "--version" in sys.argv:
+    print("grok-build stub-0.0")
+    raise SystemExit(0)
+
+mode = os.environ.get("STUB_GROK_MODE", "ready")
+prompt = ""
+if "-p" in sys.argv:
+    try:
+        prompt = sys.argv[sys.argv.index("-p") + 1]
+    except (ValueError, IndexError):
+        print("missing -p prompt", file=sys.stderr)
+        raise SystemExit(2)
+else:
+    print("missing -p", file=sys.stderr)
+    raise SystemExit(2)
+
+if "--output-format" not in sys.argv or "json" not in sys.argv:
+    print("missing --output-format json", file=sys.stderr)
+    raise SystemExit(2)
+
+if "--no-auto-update" not in sys.argv:
+    print("missing --no-auto-update", file=sys.stderr)
+    raise SystemExit(2)
+
+invocation_log = os.environ.get("STUB_GROK_INVOCATION_LOG")
+if invocation_log:
+    with Path(invocation_log).open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "argv0": Path(sys.argv[0]).name,
+                    "has_prompt": bool(prompt),
+                    "prompt_bytes": len(prompt.encode("utf-8")),
+                    "no_auto_update": "--no-auto-update" in sys.argv,
+                    "output_format_json": (
+                        "--output-format" in sys.argv and "json" in sys.argv
+                    ),
+                    "cwd": str(Path.cwd()),
+                    "env_keys": sorted(
+                        key
+                        for key in os.environ
+                        if key.startswith("STUB_GROK") or key in {"PATH", "HOME"}
+                    ),
+                }
+            )
+            + "\n"
+        )
+
+if mode == "timeout":
+    # Simulate a long hang; the parent kills the process group on timeout.
+    import time
+
+    time.sleep(3600)
+    raise SystemExit(0)
+
+if mode == "nonzero":
+    print("stub Grok process failure", file=sys.stderr)
+    raise SystemExit(9)
+
+if mode == "auth_failure":
+    print("not logged in; authentication required", file=sys.stderr)
+    raise SystemExit(3)
+
+if mode == "usage_limit":
+    print("You've hit your usage limit", file=sys.stderr)
+    raise SystemExit(4)
+
+if mode == "malformed_transport":
+    sys.stdout.write("not-json-transport")
+    raise SystemExit(0)
+
+if mode == "transport_not_object":
+    sys.stdout.write("[1,2,3]")
+    raise SystemExit(0)
+
+if mode == "missing_text":
+    sys.stdout.write(
+        json.dumps(
+            {"stopReason": "end_turn", "thought": "secret"},
+            ensure_ascii=False,
+        )
+    )
+    raise SystemExit(0)
+
+if mode == "nonstring_text":
+    sys.stdout.write(
+        json.dumps(
+            {"text": {"nested": True}, "stopReason": "end_turn"},
+            ensure_ascii=False,
+        )
+    )
+    raise SystemExit(0)
+
+if mode == "bad_stop_reason":
+    sys.stdout.write(
+        json.dumps(
+            {"text": "{}", "stopReason": "length"},
+            ensure_ascii=False,
+        )
+    )
+    raise SystemExit(0)
+
+if mode == "empty_text":
+    sys.stdout.write(
+        json.dumps({"text": "   ", "stopReason": "end_turn"}, ensure_ascii=False)
+    )
+    raise SystemExit(0)
+
+# Build a default valid analysis from the prompt catalog when present.
+requirement_ids: list[str] = []
+if "BEGIN_LOCAL_JOB_REQUIREMENT_CATALOG" in prompt:
+    catalog_marker = "BEGIN_LOCAL_JOB_REQUIREMENT_CATALOG\n"
+    catalog_end = "\nEND_LOCAL_JOB_REQUIREMENT_CATALOG"
+    try:
+        catalog = json.loads(
+            prompt.split(catalog_marker, 1)[1].split(catalog_end, 1)[0]
+        )
+        requirement_ids = [
+            item["requirement_id"] for item in catalog.get("requirements", [])
+        ]
+    except (IndexError, json.JSONDecodeError, TypeError, KeyError):
+        requirement_ids = []
+
+supported_id = requirement_ids[0] if requirement_ids else "skill.001"
+unsupported = [item for item in requirement_ids if item != supported_id]
+
+valid_analysis = {
+    "role_summary": "Stubbed Grok target role analysis.",
+    "fit_assessment": {
+        "overall": "Supported fit based on the supplied master resume.",
+        "strengths": ["Agentic AI project evidence"],
+        "gaps": ["No unsupported experience should be claimed"],
+    },
+    "supported_requirement_mappings": [
+        {
+            "requirement_id": supported_id,
+            "evidence_source_ids": ["skill_groups.0"],
+            "strength": "strong",
+        }
+    ],
+    "unsupported_requirement_ids": unsupported,
+    "recommended_edits": [],
+    "immutable_facts": ["Example Institute", "Synthetic credential"],
+    "forbidden_claims": ["RAG", "GraphQL"],
+    "content_budget_guidance": [],
+    "questions_for_user": [],
+}
+
+if mode == "markdown_fence":
+    fenced = "```json\n" + json.dumps(valid_analysis) + "\n```"
+    _write_envelope(fenced)
+    raise SystemExit(0)
+
+if mode == "multiple_json":
+    first = json.dumps(valid_analysis)
+    second = json.dumps({"extra": True})
+    _write_envelope(first + "\n" + second)
+    raise SystemExit(0)
+
+if mode == "trailing_text":
+    _write_envelope(json.dumps(valid_analysis) + "\nHere is commentary.")
+    raise SystemExit(0)
+
+if mode == "malformed_inner":
+    _write_envelope("{not valid json")
+    raise SystemExit(0)
+
+if mode == "schema_invalid":
+    invalid = {"role_summary": "missing everything else"}
+    _write_envelope(json.dumps(invalid))
+    raise SystemExit(0)
+
+if mode == "unsupported_claim":
+    payload = dict(valid_analysis)
+    payload["supported_requirement_mappings"] = [
+        {
+            "requirement_id": supported_id,
+            "evidence_source_ids": ["skill_groups.0"],
+            "strength": "strong",
+        }
+    ]
+    # Leave a catalog requirement both supported and unsupported later via empty unsupported
+    payload["unsupported_requirement_ids"] = []
+    _write_envelope(json.dumps(payload))
+    raise SystemExit(0)
+
+if mode == "invalid_source_ids":
+    payload = dict(valid_analysis)
+    payload["recommended_edits"] = [
+        {
+            "target_source_id": "professional_summary",
+            "operation": "replace",
+            "proposed_text": "Synthetic proposed text.",
+            "alignment_rationale": "Synthetic regression case.",
+            "evidence_source_ids": ["paragraph 3 describes the summary"],
+        }
+    ]
+    _write_envelope(json.dumps(payload))
+    raise SystemExit(0)
+
+if mode == "character_budget":
+    payload = dict(valid_analysis)
+    # Oversized mutable body for a composite structured field.
+    payload["recommended_edits"] = [
+        {
+            "target_source_id": "skill_groups.0",
+            "operation": "replace",
+            "proposed_text": "X" * 5000,
+            "alignment_rationale": "Synthetic over-budget structured proposal.",
+            "evidence_source_ids": ["skill_groups.0"],
+        }
+    ]
+    _write_envelope(json.dumps(payload))
+    raise SystemExit(0)
+
+if mode == "ready":
+    _write_envelope(json.dumps(valid_analysis, ensure_ascii=False))
+    raise SystemExit(0)
+
+print(f"unknown STUB_GROK_MODE={mode}", file=sys.stderr)
+raise SystemExit(99)

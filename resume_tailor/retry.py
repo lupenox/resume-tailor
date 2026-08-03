@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .analysis import (
+    ANALYSIS_RESOLVED_FILENAME,
+    CODEX_ANALYSIS_RESOLVED_FILENAME,
+    unwrap_resolved_analysis_document,
+)
 from .utilities import InputError, atomic_write_json, sha256_file, utc_now_iso
 
 
@@ -456,19 +461,98 @@ def load_retry_inputs(
     )
 
 
-_APPROVED_ANALYSIS_ARTIFACTS: dict[str, tuple[str, int]] = {
+_COMMON_APPROVED_ANALYSIS_ARTIFACTS: dict[str, tuple[str, int]] = {
     "job_description": ("job-description.txt", _MAX_JOB_BYTES),
     "job_requirements": ("job-requirements.json", _MAX_METADATA_BYTES),
     "resume_extraction": ("extracted-master-resume.json", _MAX_EXTRACTION_BYTES),
+}
+
+# Historical Codex-only key retained for reading older approval records.
+_LEGACY_RESOLVED_CODEX_KEY = "resolved_codex_analysis"
+_LEGACY_RESOLVED_CODEX_NAME = CODEX_ANALYSIS_RESOLVED_FILENAME
+
+_APPROVED_ANALYSIS_ARTIFACTS: dict[str, tuple[str, int]] = {
+    **_COMMON_APPROVED_ANALYSIS_ARTIFACTS,
     "codex_transport_schema": (
         "codex-analysis-transport.schema.json",
         _MAX_SCHEMA_BYTES,
     ),
-    "resolved_codex_analysis": (
-        "codex-analysis-resolved.json",
+    "resolved_analysis": (ANALYSIS_RESOLVED_FILENAME, _MAX_METADATA_BYTES),
+    # Legacy alias kept only so historical approval records still authenticate.
+    _LEGACY_RESOLVED_CODEX_KEY: (
+        _LEGACY_RESOLVED_CODEX_NAME,
         _MAX_METADATA_BYTES,
     ),
 }
+
+
+def _artifact_size_limit(filename: str) -> int:
+    if filename == "job-description.txt":
+        return _MAX_JOB_BYTES
+    if filename.endswith(".schema.json") or filename.endswith("-schema.json"):
+        return _MAX_SCHEMA_BYTES
+    if filename == "extracted-master-resume.json":
+        return _MAX_EXTRACTION_BYTES
+    return _MAX_METADATA_BYTES
+
+
+def _approval_artifacts_for_run(run_directory: Path) -> dict[str, tuple[str, int]]:
+    """Select approval artifact paths for the current run's analysis provider."""
+    artifacts = dict(_COMMON_APPROVED_ANALYSIS_ARTIFACTS)
+    # Prefer the provider-neutral resolved document when present.
+    if (run_directory / ANALYSIS_RESOLVED_FILENAME).is_file():
+        artifacts["resolved_analysis"] = (
+            ANALYSIS_RESOLVED_FILENAME,
+            _MAX_METADATA_BYTES,
+        )
+    elif (run_directory / CODEX_ANALYSIS_RESOLVED_FILENAME).is_file():
+        # Pre-neutralization Codex runs (or Codex alias-only recoveries).
+        artifacts[_LEGACY_RESOLVED_CODEX_KEY] = (
+            CODEX_ANALYSIS_RESOLVED_FILENAME,
+            _MAX_METADATA_BYTES,
+        )
+    else:
+        raise InputError(
+            "Resolved analysis artifact is missing; analysis approval cannot be "
+            "recorded."
+        )
+    if (run_directory / "codex-analysis-transport.schema.json").is_file():
+        artifacts["codex_transport_schema"] = (
+            "codex-analysis-transport.schema.json",
+            _MAX_SCHEMA_BYTES,
+        )
+    if (run_directory / "grok-analysis-schema.json").is_file():
+        artifacts["grok_analysis_schema"] = (
+            "grok-analysis-schema.json",
+            _MAX_SCHEMA_BYTES,
+        )
+    return artifacts
+
+
+def _resolved_analysis_from_parsed(
+    parsed: dict[str, dict[str, Any]],
+    approval: dict[str, Any],
+) -> dict[str, Any]:
+    """Load the bare analysis from a new or historical approved artifact."""
+    approval_artifacts = approval.get("artifacts")
+    if not isinstance(approval_artifacts, dict):
+        raise InputError("The stored analysis approval is missing artifact metadata.")
+    for key in ("resolved_analysis", _LEGACY_RESOLVED_CODEX_KEY):
+        entry = approval_artifacts.get(key)
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("filename")
+        if not isinstance(name, str) or name not in parsed:
+            continue
+        return unwrap_resolved_analysis_document(parsed[name])
+    # Fallback for partially loaded historical fixtures.
+    for name in (ANALYSIS_RESOLVED_FILENAME, CODEX_ANALYSIS_RESOLVED_FILENAME):
+        if name in parsed:
+            return unwrap_resolved_analysis_document(parsed[name])
+    raise InputError(
+        "The stored analysis approval is missing an authenticated resolved "
+        "analysis artifact."
+    )
 
 
 def record_codex_analysis_approval(
@@ -479,12 +563,12 @@ def record_codex_analysis_approval(
     role: str,
     approval_mode: str,
 ) -> dict[str, Any]:
-    """Persist a hash-only record after the Codex analysis gate is approved."""
+    """Persist a hash-only record after the analysis gate is approved."""
     if approval_mode not in {"interactive", "assume_yes"}:
         raise InputError("The Codex approval mode is invalid.")
     source_hash = _hash_value(source_resume_sha256, label="source résumé")
     artifacts: dict[str, dict[str, str]] = {}
-    for key, (name, maximum) in _APPROVED_ANALYSIS_ARTIFACTS.items():
+    for key, (name, maximum) in _approval_artifacts_for_run(run_directory).items():
         value = _read_child(run_directory, name, maximum=maximum)
         artifacts[key] = {"filename": name, "sha256": _digest(value)}
     job_source = run_directory / "job-source.json"
@@ -693,19 +777,31 @@ def verify_tailoring_run_artifacts(
         )
 
     artifacts: dict[str, bytes] = {}
-    for key, (name, maximum) in _APPROVED_ANALYSIS_ARTIFACTS.items():
+    approval_artifacts = approval.get("artifacts")
+    if not isinstance(approval_artifacts, dict):
+        raise InputError(
+            "The stored Codex approval record is missing artifact metadata; "
+            "no Antigravity provider request was launched."
+        )
+    for key, entry in approval_artifacts.items():
+        if key == "job_source":
+            continue
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("filename")
+        if not isinstance(name, str) or not name:
+            raise InputError(
+                f"The stored Codex approval record is missing authenticated {key} "
+                "data; start a new run."
+            )
         artifacts[name] = _approved_artifact_bytes(
             run_directory,
             approval,
             key=key,
             expected_name=name,
-            maximum=maximum,
+            maximum=_artifact_size_limit(name),
         )
-    approval_artifacts = approval.get("artifacts")
-    if (
-        isinstance(approval_artifacts, dict)
-        and approval_artifacts.get("job_source") is not None
-    ):
+    if approval_artifacts.get("job_source") is not None:
         _approved_artifact_bytes(
             run_directory,
             approval,
@@ -721,6 +817,14 @@ def verify_tailoring_run_artifacts(
             "The approved job description is not valid UTF-8; no Antigravity "
             "provider request was launched."
         ) from exc
+    stored_resolved = _resolved_analysis_from_parsed(
+        {
+            name: _json_object(value, label=name)
+            for name, value in artifacts.items()
+            if name.endswith(".json")
+        },
+        approval,
+    )
     comparisons = {
         "confirmed job description": stored_job == job_description.rstrip("\n"),
         "résumé extraction": _canonical_json(
@@ -737,12 +841,7 @@ def verify_tailoring_run_artifacts(
             )
         )
         == _canonical_json(job_requirements),
-        "resolved Codex analysis": _canonical_json(
-            _json_object(
-                artifacts["codex-analysis-resolved.json"],
-                label="resolved Codex analysis",
-            )
-        )
+        "resolved analysis": _canonical_json(stored_resolved)
         == _canonical_json(approved_analysis),
     }
     if not all(comparisons.values()):
@@ -873,25 +972,36 @@ def _validated_antigravity_retry_payloads(
 
     artifact_bytes: dict[str, bytes] = {}
     parsed: dict[str, dict[str, Any]] = {}
-    for key, (name, maximum) in _APPROVED_ANALYSIS_ARTIFACTS.items():
+    approval_artifacts = approval.get("artifacts")
+    if not isinstance(approval_artifacts, dict):
+        raise InputError(
+            "The stored Codex approval record is missing artifact metadata; "
+            "start a new run."
+        )
+    for key, entry in approval_artifacts.items():
+        if key == "job_source":
+            continue
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("filename")
+        if not isinstance(name, str) or not name:
+            raise InputError(
+                f"The stored Codex approval record is missing authenticated {key} "
+                "data; start a new run."
+            )
         value = _approved_artifact_bytes(
             source_directory,
             approval,
             key=key,
             expected_name=name,
-            maximum=maximum,
+            maximum=_artifact_size_limit(name),
         )
         artifact_bytes[name] = value
         if name.endswith(".json"):
             parsed[name] = _json_object(value, label=key.replace("_", " "))
     artifact_bytes[ANALYSIS_APPROVAL_FILENAME] = approval_bytes
 
-    approval_artifacts = approval.get("artifacts")
-    job_source_entry = (
-        approval_artifacts.get("job_source")
-        if isinstance(approval_artifacts, dict)
-        else None
-    )
+    job_source_entry = approval_artifacts.get("job_source")
     job_source_hash: str | None = None
     if job_source_entry is not None:
         value = _approved_artifact_bytes(
@@ -918,7 +1028,7 @@ def _validated_antigravity_retry_payloads(
         raise InputError("Stored job description is empty.")
     extraction = parsed["extracted-master-resume.json"]
     job_requirements = parsed["job-requirements.json"]
-    approved_analysis = parsed["codex-analysis-resolved.json"]
+    approved_analysis = _resolved_analysis_from_parsed(parsed, approval)
 
     source = metadata.get("source_resume")
     extraction_source = extraction.get("source")
@@ -1054,9 +1164,20 @@ def _validated_antigravity_retry_payloads(
             "new run."
         )
 
-    resolved_analysis_hash = _digest(
-        artifact_bytes["codex-analysis-resolved.json"]
+    resolved_filename = next(
+        (
+            name
+            for name in (ANALYSIS_RESOLVED_FILENAME, CODEX_ANALYSIS_RESOLVED_FILENAME)
+            if name in artifact_bytes
+        ),
+        None,
     )
+    if resolved_filename is None:
+        raise InputError(
+            "The stored analysis approval is missing an authenticated resolved "
+            "analysis artifact."
+        )
+    resolved_analysis_hash = _digest(artifact_bytes[resolved_filename])
     context = AntigravityRetryContext(
         source_directory=source_directory,
         company=company.strip(),

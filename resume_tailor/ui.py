@@ -49,6 +49,11 @@ from .orchestration import (
     ApprovalResponse,
     PipelineHooks,
 )
+from .analysis import (
+    ANALYSIS_PROVIDERS,
+    DEFAULT_ANALYSIS_PROVIDER,
+    normalize_analysis_provider,
+)
 from .ollama_writer import DEFAULT_OLLAMA_MODEL
 from .retry import (
     antigravity_retry_failure_kind,
@@ -60,6 +65,7 @@ from .utilities import (
     ApifyConfigurationError,
     ApifyLinkedInRetrievalError,
     ApprovalError,
+    AnalysisProviderError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
     AntigravityResponseEnvelopeError,
@@ -68,6 +74,16 @@ from .utilities import (
     AntigravityTechnicalFailureError,
     CancellationError,
     CodexSchemaCompatibilityError,
+    CodexUsageLimitError,
+    GrokAnalysisError,
+    GrokAuthenticationError,
+    GrokExecutableError,
+    GrokInnerAnalysisError,
+    GrokProcessError,
+    GrokPromptTooLargeError,
+    GrokTimeoutError,
+    GrokTransportEnvelopeError,
+    GrokUsageLimitError,
     InputError,
     ModelError,
     OllamaBudgetError,
@@ -116,9 +132,15 @@ _DOWNLOAD_EXACT = {
     "job-requirements.json",
     "extracted-master-resume.json",
     "codex-analysis.json",
+    "analysis-resolved.json",
     "codex-analysis-resolved.json",
     "codex-analysis-normalization-warnings.json",
     "codex-analysis-transport.schema.json",
+    "grok-analysis-prompt.sanitized.txt",
+    "grok-analysis-transport.json",
+    "grok-analysis-response.sanitized.json",
+    "grok-analysis-schema.json",
+    "grok-analysis-diagnostic.json",
     "antigravity-response.json",
     "antigravity-response-envelope.json",
     "antigravity-revision-response.json",
@@ -1046,7 +1068,18 @@ class RunManager:
             retry_context=context,
             writer_provider="ollama",
             ollama_model=DEFAULT_OLLAMA_MODEL,
+            analysis_provider=DEFAULT_ANALYSIS_PROVIDER,
         )
+        # Preserve an explicit prior analysis provider when authenticated metadata
+        # records one; never invent a switch from Codex to Grok on retry.
+        if source_directory is not None:
+            prior_metadata = _safe_json(source_directory / "run-metadata.json")
+            if isinstance(prior_metadata, dict):
+                prior_analysis = prior_metadata.get("analysis")
+                if isinstance(prior_analysis, dict):
+                    prior_provider = prior_analysis.get("provider")
+                    if prior_provider in ANALYSIS_PROVIDERS:
+                        namespace.analysis_provider = prior_provider
         try:
             return self.start(
                 namespace=namespace,
@@ -1087,6 +1120,7 @@ class RunManager:
             antigravity_retry_context=context,
             writer_provider="antigravity",
             ollama_model=DEFAULT_OLLAMA_MODEL,
+            analysis_provider=DEFAULT_ANALYSIS_PROVIDER,
         )
         try:
             return self.start(
@@ -1128,6 +1162,7 @@ class RunManager:
             antigravity_reprocess_context=context,
             writer_provider="antigravity",
             ollama_model=DEFAULT_OLLAMA_MODEL,
+            analysis_provider=DEFAULT_ANALYSIS_PROVIDER,
         )
         try:
             return self.start(
@@ -1395,6 +1430,24 @@ def _failure_kind_for_error(
         return "ollama_technical_failure"
     if isinstance(error, CodexSchemaCompatibilityError):
         return "schema"
+    if isinstance(error, CodexUsageLimitError):
+        return "codex_usage_limit"
+    if isinstance(error, GrokExecutableError):
+        return "grok_executable"
+    if isinstance(error, GrokPromptTooLargeError):
+        return "grok_prompt_too_large"
+    if isinstance(error, GrokUsageLimitError):
+        return "grok_usage_limit"
+    if isinstance(error, GrokAuthenticationError):
+        return "grok_authentication"
+    if isinstance(error, GrokTimeoutError):
+        return "grok_timeout"
+    if isinstance(error, GrokTransportEnvelopeError):
+        return "grok_transport"
+    if isinstance(error, GrokInnerAnalysisError):
+        return "grok_inner_analysis"
+    if isinstance(error, (GrokProcessError, GrokAnalysisError, AnalysisProviderError)):
+        return "analysis_provider"
     if stage in {"fetching_job", "confirming_posting"}:
         return "retrieval"
     if isinstance(error, ModelError):
@@ -1405,6 +1458,29 @@ def _failure_kind_for_error(
 def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
     if metadata.get("failure_class") == "source-evidence-analysis":
         return "source_evidence"
+    failure_class = str(metadata.get("failure_class", ""))
+    if failure_class == "codex-usage-limit":
+        return "codex_usage_limit"
+    if failure_class == "grok-executable-unavailable":
+        return "grok_executable"
+    if failure_class == "grok-prompt-too-large":
+        return "grok_prompt_too_large"
+    if failure_class == "grok-usage-limit":
+        return "grok_usage_limit"
+    if failure_class == "grok-authentication-failure":
+        return "grok_authentication"
+    if failure_class == "grok-timeout":
+        return "grok_timeout"
+    if failure_class == "grok-transport-envelope":
+        return "grok_transport"
+    if failure_class == "grok-inner-analysis":
+        return "grok_inner_analysis"
+    if failure_class in {
+        "grok-nonzero-exit",
+        "grok-analysis-failure",
+        "analysis-provider-failure",
+    }:
+        return "analysis_provider"
     error = metadata.get("error")
     error_type = error.get("type") if isinstance(error, Mapping) else None
     error_message = error.get("message") if isinstance(error, Mapping) else None
@@ -1457,8 +1533,13 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         stage == "codex-analysis"
         and error_type in {"SourceEvidenceError", "TruthfulnessError"}
         and isinstance(error_message, str)
-        and error_message.startswith(
-            "Codex analysis failed local source-evidence validation:"
+        and (
+            error_message.startswith(
+                "Codex analysis failed local source-evidence validation:"
+            )
+            or error_message.startswith(
+                "Grok analysis failed local source-evidence validation:"
+            )
         )
     ):
         return "source_evidence"
@@ -1546,10 +1627,55 @@ def _safe_error_message(error: ResumeTailorError) -> str:
         return _OLLAMA_TECHNICAL_FAILURE_UI_MESSAGE
     if isinstance(error, CodexSchemaCompatibilityError):
         return "Codex could not start because its output schema was incompatible."
+    if isinstance(error, CodexUsageLimitError):
+        return (
+            "Codex hit its usage limit. Resume Tailor did not switch providers "
+            "automatically. Wait for the limit to reset, or start a new run and "
+            "explicitly select Grok as the analysis provider."
+        )
+    if isinstance(error, GrokExecutableError):
+        return (
+            "The Grok Build CLI executable was not found or could not be started. "
+            "Install Grok Build and ensure ~/.grok/bin/grok is available."
+        )
+    if isinstance(error, GrokPromptTooLargeError):
+        return (
+            "Grok analysis could not start because the analysis prompt exceeded "
+            "the local process argument-size limit. Reduce the confirmed posting "
+            "or résumé size and start a new run. Prompt contents are not shown."
+        )
+    if isinstance(error, GrokAuthenticationError):
+        return (
+            "Grok Build CLI authentication failed. Log in through grok.com, then "
+            "start a new run with analysis provider set to Grok."
+        )
+    if isinstance(error, GrokTimeoutError):
+        return (
+            "Grok analysis exceeded the bounded timeout. The process group was "
+            "stopped; sanitized diagnostics were preserved."
+        )
+    if isinstance(error, GrokTransportEnvelopeError):
+        return (
+            "Grok returned a malformed transport envelope. Thought content and "
+            "provider body text were omitted; sanitized diagnostics were preserved."
+        )
+    if isinstance(error, GrokInnerAnalysisError):
+        return (
+            "Grok envelope text was not exactly one canonical analysis JSON "
+            "document. Markdown fences, trailing commentary, and multiple "
+            "documents are rejected."
+        )
+    if isinstance(error, (GrokUsageLimitError, GrokProcessError, GrokAnalysisError)):
+        return (
+            "Grok analysis stopped with a classified provider failure. Sanitized "
+            "technical details are available below; useful artifacts were preserved."
+        )
     if isinstance(error, ModelError):
         provider = (
             "Codex"
             if "codex" in str(error).casefold()
+            else "Grok"
+            if "grok" in str(error).casefold()
             else "Antigravity"
             if "antigravity" in str(error).casefold()
             else "Gemma 4 12B"
@@ -1584,7 +1710,8 @@ _TECHNICAL_BLOCK = re.compile(
     flags=re.DOTALL,
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY|APIFY)_[A-Z0-9_]*(?:KEY|TOKEN)"
+    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY|APIFY|GROK|XAI)_[A-Z0-9_]*"
+    r"(?:KEY|TOKEN|COOKIE|SECRET|PASSWORD)"
     r"\s*=\s*[^\s]+"
 )
 
@@ -1813,6 +1940,9 @@ async def _prepare_namespace(
             timeout=manager.settings.timeout,
             writer_provider="ollama",
             ollama_model=DEFAULT_OLLAMA_MODEL,
+            analysis_provider=normalize_analysis_provider(
+                _form_text(form, "analysis_provider") or DEFAULT_ANALYSIS_PROVIDER
+            ),
         )
         return namespace, staging, source_mode, company, role
     except Exception:
@@ -2249,6 +2379,7 @@ def _safe_form_values(form: FormData) -> dict[str, str]:
         "company",
         "role",
         "pasted_description",
+        "analysis_provider",
     }
     return {
         name: value

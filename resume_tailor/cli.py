@@ -25,7 +25,19 @@ from .antigravity_writer import (
     preflight_tailoring_inputs,
 )
 from .clipboard import read_clipboard
-from .codex_analysis import invoke_codex_analysis, readable_analysis
+from .analysis import (
+    ANALYSIS_PROVIDERS,
+    ANALYSIS_RESOLVED_FILENAME,
+    CODEX_ANALYSIS_RESOLVED_FILENAME,
+    DEFAULT_ANALYSIS_PROVIDER,
+    analysis_provider_label,
+    invoke_analysis,
+    normalize_analysis_provider,
+    readable_analysis,
+    write_resolved_analysis_artifact,
+)
+# Re-export for tests and callers that still patch/import the Codex entrypoint.
+from .codex_analysis import invoke_codex_analysis
 from .evidence import (
     build_content_diff,
     resolve_analysis_evidence,
@@ -78,6 +90,7 @@ from .utilities import (
     ApifyConfigurationError,
     ApifyLinkedInRetrievalError,
     ApprovalError,
+    AnalysisProviderError,
     AntigravityCannotApplyError,
     AntigravityLaunchSizeError,
     AntigravityResponseEnvelopeError,
@@ -88,7 +101,17 @@ from .utilities import (
     AntigravityTailoringPreflightError,
     AntigravityTechnicalFailureError,
     CancellationError,
+    CodexUsageLimitError,
     ExitCode,
+    GrokAnalysisError,
+    GrokAuthenticationError,
+    GrokExecutableError,
+    GrokInnerAnalysisError,
+    GrokProcessError,
+    GrokPromptTooLargeError,
+    GrokTimeoutError,
+    GrokTransportEnvelopeError,
+    GrokUsageLimitError,
     InputError,
     IntegrityError,
     OllamaBudgetError,
@@ -203,6 +226,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--analysis-provider",
+        choices=ANALYSIS_PROVIDERS,
+        default=DEFAULT_ANALYSIS_PROVIDER,
+        help=(
+            "résumé-analysis provider (default: codex; grok is an explicit "
+            "alternative and is never selected automatically)"
+        ),
+    )
+    parser.add_argument(
         "--ollama-model",
         default=DEFAULT_OLLAMA_MODEL,
         help=f"local Ollama model/profile (default: {DEFAULT_OLLAMA_MODEL})",
@@ -279,12 +311,28 @@ def _runtime_dependency_versions() -> dict[str, str]:
     }
 
 
-def _analysis_dependency_versions(cwd: Path) -> dict[str, str]:
-    codex = require_executable("codex")
-    return {
+def _analysis_dependency_versions(
+    cwd: Path,
+    analysis_provider: str = DEFAULT_ANALYSIS_PROVIDER,
+) -> dict[str, str]:
+    provider = normalize_analysis_provider(analysis_provider)
+    versions = {
         **_runtime_dependency_versions(),
-        "codex": _tool_version(codex, ["--version"], cwd=cwd),
+        "analysis_provider": provider,
     }
+    if provider == "grok":
+        from .grok_analysis import resolve_grok_executable
+
+        grok = resolve_grok_executable()
+        versions["grok"] = _tool_version(
+            grok,
+            ["--no-auto-update", "--version"],
+            cwd=cwd,
+        )
+        return versions
+    codex = require_executable("codex")
+    versions["codex"] = _tool_version(codex, ["--version"], cwd=cwd)
+    return versions
 
 
 def _tailoring_dependency_versions(
@@ -572,6 +620,10 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         raise InputError(
             f"Unsupported résumé writer provider: {writer_provider!r}."
         )
+    analysis_provider = normalize_analysis_provider(
+        getattr(args, "analysis_provider", DEFAULT_ANALYSIS_PROVIDER)
+    )
+    analysis_label = analysis_provider_label(analysis_provider)
     ollama_model = validate_ollama_model_name(
         getattr(args, "ollama_model", DEFAULT_OLLAMA_MODEL)
     )
@@ -734,6 +786,11 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             "model": ollama_model if writer_provider == "ollama" else None,
             "document_format": document_format,
         },
+        "analysis": {
+            "provider": analysis_provider,
+            "name": analysis_label,
+            "automatic_fallback": False,
+        },
         "source_resume": {
             "filename": resume_path.name,
             "sha256_before": source_hash,
@@ -872,9 +929,15 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         if antigravity_retry_inputs is not None:
             metadata["tools"] = _tailoring_dependency_versions(run_directory)
         elif retry_inputs is not None:
-            metadata["tools"] = _analysis_dependency_versions(run_directory)
+            metadata["tools"] = _analysis_dependency_versions(
+                run_directory,
+                analysis_provider,
+            )
         else:
-            metadata["tools"] = _analysis_dependency_versions(run_directory)
+            metadata["tools"] = _analysis_dependency_versions(
+                run_directory,
+                analysis_provider,
+            )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
         if requested_linkedin_url is not None:
@@ -1194,11 +1257,20 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["codex_analysis_transport_schema"] = (
                 transport_artifact.metadata()
             )
-            analysis_bytes = antigravity_retry_inputs.artifact_bytes[
-                "codex-analysis-resolved.json"
-            ]
+            resolved_name = next(
+                (
+                    name
+                    for name in (
+                        ANALYSIS_RESOLVED_FILENAME,
+                        CODEX_ANALYSIS_RESOLVED_FILENAME,
+                    )
+                    if name in antigravity_retry_inputs.artifact_bytes
+                ),
+                CODEX_ANALYSIS_RESOLVED_FILENAME,
+            )
+            analysis_bytes = antigravity_retry_inputs.artifact_bytes[resolved_name]
             atomic_write_bytes(
-                run_directory / "codex-analysis-resolved.json",
+                run_directory / resolved_name,
                 analysis_bytes,
             )
             approval_bytes = antigravity_retry_inputs.artifact_bytes[
@@ -1209,7 +1281,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 approval_bytes,
             )
             if (
-                sha256_file(run_directory / "codex-analysis-resolved.json")
+                sha256_file(run_directory / resolved_name)
                 != antigravity_retry_inputs.context.resolved_analysis_sha256
                 or sha256_file(run_directory / ANALYSIS_APPROVAL_FILENAME)
                 != antigravity_retry_inputs.context.approval_record_sha256
@@ -1287,29 +1359,61 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             analysis = antigravity_retry_inputs.approved_analysis
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
         else:
-            metadata["stage"] = "codex-analysis-schema-preflight"
-            hooks.progress(
-                "codex_analysis",
-                "Generating and validating the source-bound Codex output schema.",
-            )
-            transport_artifact = prepare_codex_analysis_transport_schema(
-                extracted,
-                job_requirements,
-                run_directory,
-            )
-            metadata["codex_analysis_transport_schema"] = (
-                transport_artifact.metadata()
-            )
-            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            transport_artifact = None
+            if analysis_provider == "codex":
+                metadata["stage"] = "codex-analysis-schema-preflight"
+                hooks.progress(
+                    "codex_analysis",
+                    "Generating and validating the source-bound Codex output schema.",
+                )
+                transport_artifact = prepare_codex_analysis_transport_schema(
+                    extracted,
+                    job_requirements,
+                    run_directory,
+                )
+                metadata["codex_analysis_transport_schema"] = (
+                    transport_artifact.metadata()
+                )
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            else:
+                metadata["stage"] = "analysis-schema-preflight"
+                hooks.progress(
+                    "codex_analysis",
+                    f"Generating the source-bound {analysis_label} analysis schema.",
+                )
+                from .grok_analysis import prepare_grok_analysis_schema
+
+                grok_schema = prepare_grok_analysis_schema(
+                    extracted,
+                    job_requirements,
+                    run_directory,
+                )
+                metadata["grok_analysis_schema"] = {
+                    "filename": Path(grok_schema["path"]).name,
+                    "sha256": grok_schema["sha256"],
+                    "size_bytes": grok_schema["size_bytes"],
+                    "evidence_source_id_count": grok_schema[
+                        "evidence_source_id_count"
+                    ],
+                    "editable_source_id_count": grok_schema[
+                        "editable_source_id_count"
+                    ],
+                    "job_requirement_id_count": grok_schema[
+                        "job_requirement_id_count"
+                    ],
+                    "generated_from_source_and_requirement_catalogs": True,
+                }
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
             metadata["stage"] = "codex-analysis"
             hooks.progress(
                 "codex_analysis",
-                "Codex analysis started. Strong reasoning may take several minutes; "
-                "no unreliable ETA is shown.",
+                f"{analysis_label} analysis started. Strong reasoning may take "
+                "several minutes; no unreliable ETA is shown.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            raw_analysis = invoke_codex_analysis(
+            raw_analysis = invoke_analysis(
+                provider=analysis_provider,
                 extracted_resume=extracted,
                 job_description=job_description,
                 job_requirements=job_requirements,
@@ -1321,11 +1425,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 progress_handler=lambda elapsed, alive: hooks.progress(
                     "codex_analysis",
                     (
-                        "Codex analysis is still running"
+                        f"{analysis_label} analysis is still running"
                         if alive
                         else (
-                            "No Codex process detected; the process exited and local "
-                            "structured-output validation is continuing"
+                            f"No {analysis_label} process detected; the process "
+                            "exited and local structured-output validation is "
+                            "continuing"
                         )
                     )
                     + f" — elapsed {_elapsed_label(elapsed)}.",
@@ -1340,38 +1445,59 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             )
             if analysis_issues:
                 raise SourceEvidenceError(
-                    "Codex analysis failed local source-evidence validation:\n"
+                    f"{analysis_label} analysis failed local source-evidence "
+                    "validation:\n"
                     + "\n".join(
                         f"- {issue.describe()}" for issue in analysis_issues
                     )
                 )
-            atomic_write_json(
-                run_directory / "codex-analysis-resolved.json",
+            resolved_meta = write_resolved_analysis_artifact(
+                run_directory,
                 analysis,
+                provider=analysis_provider,
             )
+            metadata["analysis_resolved"] = {
+                "filename": resolved_meta["filename"],
+                "provider": resolved_meta["provider"],
+                "provider_label": resolved_meta["provider_label"],
+                "legacy_codex_alias_written": resolved_meta[
+                    "legacy_codex_alias_written"
+                ],
+                "sha256": sha256_file(
+                    run_directory / resolved_meta["filename"]
+                ),
+            }
             if hooks.approval_handler is None:
-                print(readable_analysis(analysis))
+                print(
+                    readable_analysis(
+                        analysis,
+                        provider_label=analysis_label,
+                    )
+                )
             if analysis["questions_for_user"]:
                 questions = "\n".join(
                     f"- {question}" for question in analysis["questions_for_user"]
                 )
                 raise WaitingError(
-                    "Codex has unanswered factual questions. The pipeline stopped "
-                    f"instead of guessing:\n{questions}"
+                    f"{analysis_label} has unanswered factual questions. The "
+                    "pipeline stopped instead of guessing:\n"
+                    f"{questions}"
                 )
             hooks.progress(
                 "reviewing_changes",
-                "Codex analysis passed local evidence checks and awaits approval.",
+                f"{analysis_label} analysis passed local evidence checks and "
+                "awaits approval.",
             )
             analysis_approval = hooks.approve(
                 kind="codex_analysis",
-                title="Codex analysis",
+                title=f"{analysis_label} analysis",
                 payload=analysis,
                 assume_yes=args.yes,
             )
             if analysis_approval.action != "approve":
                 raise ApprovalError(
-                    "Codex analysis was not approved; artifacts were preserved."
+                    f"{analysis_label} analysis was not approved; artifacts were "
+                    "preserved."
                 )
             metadata["codex_analysis_approval"] = (
                 record_codex_analysis_approval(
@@ -1825,7 +1951,14 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                         run_directory / "extracted-master-resume.json"
                     ),
                     "approved_analysis_sha256": sha256_file(
-                        run_directory / "codex-analysis-resolved.json"
+                        run_directory
+                        / (
+                            ANALYSIS_RESOLVED_FILENAME
+                            if (
+                                run_directory / ANALYSIS_RESOLVED_FILENAME
+                            ).is_file()
+                            else CODEX_ANALYSIS_RESOLVED_FILENAME
+                        )
                     ),
                     "initial_tailored_content_sha256": sha256_file(
                         initial_content_path
@@ -2173,7 +2306,55 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         revision_stage = "revision" in str(metadata.get("stage", ""))
         if isinstance(exc, SourceEvidenceError):
             metadata["failure_class"] = "source-evidence-analysis"
-        elif isinstance(exc, TruthfulnessError):
+        if isinstance(exc, CodexUsageLimitError):
+            metadata["failure_class"] = "codex-usage-limit"
+            metadata["analysis_failure_classification"] = exc.classification
+            metadata["analysis_provider_suggestion"] = "grok"
+        if isinstance(exc, GrokExecutableError):
+            metadata["failure_class"] = "grok-executable-unavailable"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GrokPromptTooLargeError):
+            metadata["failure_class"] = "grok-prompt-too-large"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GrokUsageLimitError):
+            metadata["failure_class"] = "grok-usage-limit"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GrokAuthenticationError):
+            metadata["failure_class"] = "grok-authentication-failure"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GrokTimeoutError):
+            metadata["failure_class"] = "grok-timeout"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GrokProcessError):
+            metadata["failure_class"] = "grok-nonzero-exit"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GrokTransportEnvelopeError):
+            metadata["failure_class"] = "grok-transport-envelope"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GrokInnerAnalysisError):
+            metadata["failure_class"] = "grok-inner-analysis"
+            metadata["analysis_failure_classification"] = exc.classification
+        if (
+            isinstance(exc, GrokAnalysisError)
+            and "failure_class" not in metadata
+        ):
+            metadata["failure_class"] = "grok-analysis-failure"
+            metadata["analysis_failure_classification"] = getattr(
+                exc,
+                "classification",
+                "generic_provider_failure",
+            )
+        if (
+            isinstance(exc, AnalysisProviderError)
+            and "failure_class" not in metadata
+        ):
+            metadata["failure_class"] = "analysis-provider-failure"
+            metadata["analysis_failure_classification"] = getattr(
+                exc,
+                "classification",
+                "generic_provider_failure",
+            )
+        if isinstance(exc, TruthfulnessError) and "failure_class" not in metadata:
             # Schema-valid writer output rejected by the deterministic evidence
             # and content-budget gate. Attribute it to the writer provider so a
             # preserved historical Ollama failure is distinguishable from a
