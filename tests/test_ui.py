@@ -2263,3 +2263,115 @@ def test_new_ollama_failure_classes_keep_contract_guidance_and_no_recovery() -> 
         )
         == "ollama_preflight"
     )
+
+
+def test_deterministic_only_history_exposes_envelope_without_fake_response(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    tailoring_label = dict(ui.WORKFLOW_STAGES)["antigravity_tailoring"]
+    assert tailoring_label == "Local résumé tailoring"
+    assert "gemma" not in tailoring_label.casefold()
+    assert "writing" not in tailoring_label.casefold()
+
+    output_directory = tmp_path / "deterministic-history"
+    run_directory = output_directory / "synthetic-deterministic-run"
+    run_directory.mkdir(parents=True)
+    envelope = {
+        "version": 2,
+        "provider": "deterministic",
+        "runtime": "local",
+        "model": None,
+        "ollama_invoked": False,
+        "execution_mode": "deterministic-local",
+        "output_format": "deterministic-json",
+        "response_envelope_type": "deterministic-local-patches",
+        "validation_result": "PASS",
+        "validation_path": "pass",
+        "response": None,
+        "execution": {
+            "execution_mode": "deterministic_only",
+            "deterministic_patch_count": 1,
+            "gemma_patch_count": 0,
+            "deterministic_target_ids": ["skill_groups.0"],
+            "prose_target_ids": [],
+            "full_catalog_digest": "a" * 64,
+            "writer_subset_digest": None,
+            "ollama_invoked": False,
+        },
+    }
+    atomic_write_json(run_directory / "ollama-response-envelope.json", envelope)
+    atomic_write_json(
+        run_directory / "tailored-content.initial.json",
+        {"synthetic": "deterministic content reference"},
+    )
+    atomic_write_json(
+        run_directory / "run-metadata.json",
+        {
+            "application": "resume-tailor",
+            "status": "COMPLETE",
+            "stage": "complete",
+            "created_at": "2026-08-03T12:00:00+00:00",
+            "company": "Synthetic Systems",
+            "role": "Evidence Engineer",
+            "job_source": "file",
+            "writer": {
+                "provider": "deterministic",
+                "name": "Deterministic local compiler",
+                "model": None,
+                "runtime": "local",
+                "ollama_invoked": False,
+            },
+            "revision_cycle": {
+                "final_generation": "initial",
+                "initial": {
+                    "provider": "deterministic",
+                    "model": None,
+                    "ollama_invoked": False,
+                    "response_envelope_type": "deterministic-local-patches",
+                    "output_format": "deterministic-json",
+                    "tailored_content": {
+                        "filename": "tailored-content.initial.json",
+                        "sha256": sha256_file(
+                            run_directory / "tailored-content.initial.json"
+                        ),
+                    },
+                },
+            },
+        },
+    )
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "deterministic-history.sqlite3",
+        pipeline_runner=StubbedUIPipeline(),
+    )
+    try:
+        history = app.state.manager.history()
+        entry = next(
+            item
+            for item in history
+            if item["run_id"] == "history-synthetic-deterministic-run"
+        )
+        artifact_names = {artifact["name"] for artifact in entry["artifacts"]}
+        assert "ollama-response-envelope.json" in artifact_names
+        assert "ollama-response.json" not in artifact_names
+
+        snapshot = app.state.manager.snapshot(entry["run_id"])
+        assert snapshot["status"] == "COMPLETE"
+        assert snapshot["failure_kind"] is None
+        assert snapshot["retry_eligible"] is False
+        assert snapshot["antigravity_retry_eligible"] is False
+        assert snapshot["antigravity_reprocess_eligible"] is False
+        assert snapshot["metadata"]["writer"]["provider"] == "deterministic"
+        assert app.state.manager.resolve_artifact(
+            entry["run_id"],
+            "ollama-response-envelope.json",
+        ) == (run_directory / "ollama-response-envelope.json").resolve()
+        with pytest.raises(InputError, match="not available"):
+            app.state.manager.resolve_artifact(
+                entry["run_id"],
+                "ollama-response.json",
+            )
+    finally:
+        app.state.manager.shutdown()

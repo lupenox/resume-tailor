@@ -10,6 +10,11 @@ from resume_tailor.evidence import resolve_analysis_evidence, validate_tailored_
 from resume_tailor.job_requirements import build_job_requirement_catalog
 from resume_tailor import ollama_writer as writer
 from resume_tailor import patch_engine
+from resume_tailor.structured_patch_compiler import (
+    combine_hybrid_patch_payload,
+    deterministic_only_metadata,
+    hybrid_execution_metadata,
+)
 from resume_tailor.utilities import (
     OllamaTailoringContractError,
     OllamaCannotApplyError,
@@ -17,6 +22,8 @@ from resume_tailor.utilities import (
     OllamaCanonicalSchemaError,
     OllamaTransportSchemaError,
     OllamaTechnicalFailureError,
+    OllamaRevisionContractError,
+    ModelError,
 )
 
 
@@ -709,7 +716,7 @@ def test_32_technical_failure_cannot_include_patches() -> None:
         ],
     }
     from resume_tailor.schemas import validate_payload
-    with pytest.raises(Exception):
+    with pytest.raises(ModelError, match="failed local schema validation"):
         validate_payload(payload, "ollama_tailoring_patch.schema.json", label="Test")
 
 
@@ -728,7 +735,7 @@ def test_33_metadata_contains_no_resume_text(master_resume: Path, tmp_path: Path
                 "content": json.dumps({
                     "status": "complete",
                     "message": "Done",
-                    "catalog_sha256": writer.canonical_digest(writer.approved_edit_catalog(analysis)),
+                    "catalog_sha256": writer.canonical_digest(writer.partition_edit_catalog(writer.approved_edit_catalog(analysis))[1]),
                     "cannot_apply": None,
                     "technical_failure": None,
                     "patches": [
@@ -737,12 +744,6 @@ def test_33_metadata_contains_no_resume_text(master_resume: Path, tmp_path: Path
                             "target_source_id": "professional_summary",
                             "operation": "replace",
                             "replacement_text": "SECRET_REPLACEMENT_TEXT_MARKER",
-                        },
-                        {
-                            "edit_id": "edit.002",
-                            "target_source_id": "skill_groups.2",
-                            "operation": "append",
-                            "replacement_text": extracted["content"]["skill_groups"][2]["text"] + ", AI",
                         },
                     ],
                 }),
@@ -967,7 +968,7 @@ def test_43_revision_budget_and_digest_are_enforced(master_resume: Path) -> None
             }
         ],
     }
-    with pytest.raises(Exception, match="exceeds target budget"):
+    with pytest.raises(OllamaRevisionContractError, match="exceeds target budget"):
         patch_engine.validate_and_apply_revision_patches(
             payload=payload,
             current_tailored_content=current,
@@ -1122,3 +1123,80 @@ def test_48_unicode_equivalent_replacement_is_rejected_as_noop() -> None:
             evidence_texts=[descriptor.exact_rendered_existing_text],
             forbidden_claims=[],
         )
+
+
+def _hybrid_patch(edit_id: str) -> dict:
+    return {
+        "edit_id": edit_id,
+        "target_source_id": "professional_summary",
+        "operation": "replace",
+        "replacement_text": "Synthetic replacement.",
+    }
+
+
+@pytest.mark.parametrize(
+    ("deterministic_ids", "prose_ids", "catalog_ids", "message"),
+    [
+        (["edit.001", "edit.001"], [], ["edit.001"], "Duplicate deterministic"),
+        ([], ["edit.001", "edit.001"], ["edit.001"], "Duplicate prose"),
+        (["edit.001"], ["edit.001"], ["edit.001"], "collision"),
+        (["edit.001"], [], ["edit.001", "edit.002"], "missing IDs"),
+        (["edit.001"], ["edit.999"], ["edit.001"], "extra IDs"),
+    ],
+)
+def test_49_hybrid_combiner_requires_exact_edit_id_set(
+    deterministic_ids: list[str],
+    prose_ids: list[str],
+    catalog_ids: list[str],
+    message: str,
+) -> None:
+    with pytest.raises(OllamaTailoringContractError, match=message):
+        combine_hybrid_patch_payload(
+            deterministic_patches=[
+                _hybrid_patch(edit_id) for edit_id in deterministic_ids
+            ],
+            prose_patches=[_hybrid_patch(edit_id) for edit_id in prose_ids],
+            full_catalog=[{"edit_id": edit_id} for edit_id in catalog_ids],
+            full_catalog_sha256="0" * 64,
+        )
+
+
+def test_50_execution_metadata_distinguishes_prose_and_empty_catalog() -> None:
+    prose_edit = {
+        "edit_id": "edit.001",
+        "target_source_id": "professional_summary",
+    }
+    prose_metadata = hybrid_execution_metadata(
+        deterministic_patches=[],
+        prose_patches=[_hybrid_patch("edit.001")],
+        deterministic_edits=[],
+        prose_edits=[prose_edit],
+        full_catalog_sha256="1" * 64,
+        writer_subset_sha256="1" * 64,
+        ollama_invoked=True,
+    )
+    assert prose_metadata["execution_mode"] == "prose_only"
+
+    mixed_metadata = hybrid_execution_metadata(
+        deterministic_patches=[_hybrid_patch("edit.001")],
+        prose_patches=[_hybrid_patch("edit.002")],
+        deterministic_edits=[
+            {"edit_id": "edit.001", "target_source_id": "skill_groups.0"}
+        ],
+        prose_edits=[
+            {"edit_id": "edit.002", "target_source_id": "professional_summary"}
+        ],
+        full_catalog_sha256="2" * 64,
+        writer_subset_sha256="3" * 64,
+        ollama_invoked=True,
+    )
+    assert mixed_metadata["execution_mode"] == "hybrid"
+
+    empty_metadata = deterministic_only_metadata(
+        deterministic_patches=[],
+        deterministic_edits=[],
+        full_catalog_sha256="4" * 64,
+    )
+    assert empty_metadata["execution_mode"] == "deterministic_only"
+    assert empty_metadata["writer_skipped_reason"] == "empty_catalog"
+    assert empty_metadata["deterministic_patch_count"] == 0

@@ -100,7 +100,7 @@ WORKFLOW_STAGES: tuple[tuple[str, str], ...] = (
     ("confirming_posting", "Confirming posting"),
     ("codex_analysis", "Codex analysis"),
     ("reviewing_changes", "Reviewing proposed changes"),
-    ("antigravity_tailoring", "Gemma 4 12B résumé writing"),
+    ("antigravity_tailoring", "Local résumé tailoring"),
     ("evidence_validation", "Evidence validation"),
     ("rendering", "Rendering DOCX/PDF"),
     ("final_qa", "Initial Codex QA"),

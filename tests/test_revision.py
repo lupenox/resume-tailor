@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import resume_tailor.ollama_writer as ollama_writer_module
 from resume_tailor.docx_extract import extract_resume
 from resume_tailor.evidence import validate_tailored_content
 from resume_tailor.revision import (
@@ -14,12 +15,15 @@ from resume_tailor.revision import (
     invoke_antigravity_revision,
     validate_revision_scope,
 )
+from resume_tailor.schemas import schema_path
 from resume_tailor.utilities import (
     AntigravityResponseEnvelopeError,
     AntigravityRevisionCannotApplyError,
     AntigravityRevisionContractError,
     AntigravityRevisionTechnicalFailureError,
+    OllamaRevisionContractError,
     RevisionValidationError,
+    sha256_file,
 )
 
 
@@ -233,3 +237,159 @@ def test_second_revision_attempt_is_blocked_before_provider_launch(
         )
 
     assert not log.exists()
+
+
+def test_successful_prose_only_ollama_revision_is_scoped_and_one_shot(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, analysis, qa = _inputs(master_resume)
+    invocation_calls: list[dict[str, Any]] = []
+    target_map = {"professional_summary": ["qa.001"]}
+    authorization_sha256 = ollama_writer_module.canonical_digest(target_map)
+    canonical_schema_path = schema_path("ollama_revision_patch.schema.json")
+    canonical_schema_sha256 = sha256_file(canonical_schema_path)
+    replacement = (
+        "Synthetic evidence-gated engineering profile used only for résumé "
+        "workflow tests."
+    )
+
+    revision_payload = {
+        "status": "complete",
+        "message": "Synthetic revision complete.",
+        "authorization_sha256": authorization_sha256,
+        "cannot_apply": None,
+        "technical_failure": None,
+        "patches": [
+            {
+                "issue_id": "qa.001",
+                "target_source_id": "professional_summary",
+                "replacement_text": replacement,
+            }
+        ],
+    }
+
+    def mocked_provider(**kwargs: Any) -> dict[str, Any]:
+        invocation_calls.append(kwargs)
+        request_body = kwargs["body"]
+        assert kwargs["path"] == "/api/chat"
+        assert isinstance(request_body, dict)
+        schema = request_body["format"]
+        schema_file = (
+            tmp_path / ollama_writer_module.OLLAMA_REVISION_TRANSPORT_SCHEMA_FILENAME
+        )
+        assert isinstance(schema, dict)
+        assert json.loads(schema_file.read_text(encoding="utf-8")) == schema
+        assert schema["properties"]["authorization_sha256"]["enum"] == [
+            authorization_sha256
+        ]
+        patch_array = next(
+            branch
+            for branch in schema["properties"]["patches"]["oneOf"]
+            if branch.get("type") == "array"
+        )
+        assert patch_array["minItems"] == 1
+        assert patch_array["maxItems"] == 1
+        patch_properties = patch_array["items"]["properties"]
+        assert patch_properties["issue_id"]["enum"] == ["qa.001"]
+        assert patch_properties["target_source_id"]["enum"] == [
+            "professional_summary"
+        ]
+        prompt = request_body["messages"][1]["content"]
+        assert "skill_groups." not in prompt
+        assert "education.coursework" not in prompt
+        assert authorization_sha256 in prompt
+        return {
+            "model": request_body["model"],
+            "created_at": "2026-08-03T12:00:00Z",
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 100,
+            "eval_count": 50,
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(revision_payload),
+            },
+        }
+
+    monkeypatch.setattr(
+        ollama_writer_module,
+        "run_ollama_request",
+        mocked_provider,
+    )
+
+    revised = ollama_writer_module.invoke_ollama_revision(
+        current_tailored_content=extracted["content"],
+        extracted_resume=extracted,
+        approved_analysis=analysis,
+        qa_result=qa,
+        company="Synthetic Systems",
+        role="Evidence Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+        attempt_number=1,
+    )
+
+    assert len(invocation_calls) == 1
+    assert revised["professional_summary"] == replacement
+    assert revised["professional_summary"] != extracted["content"][
+        "professional_summary"
+    ]
+    assert validate_revision_scope(
+        initial_content=extracted["content"],
+        revised_content=revised,
+        qa_result=qa,
+        approved_analysis=analysis,
+    ) == target_map
+    assert sha256_file(canonical_schema_path) == canonical_schema_sha256
+    metadata = json.loads(
+        (
+            tmp_path
+            / ollama_writer_module.OLLAMA_REVISION_RESPONSE_METADATA_FILENAME
+        ).read_text(encoding="utf-8")
+    )
+    assert metadata["validation_result"] == "PASS"
+    assert metadata["validation_path"] == "pass"
+    assert metadata["response"]["filename"] == (
+        ollama_writer_module.OLLAMA_REVISION_RESPONSE_FILENAME
+    )
+
+    with pytest.raises(OllamaRevisionContractError, match="Exactly one"):
+        ollama_writer_module.invoke_ollama_revision(
+            current_tailored_content=revised,
+            extracted_resume=extracted,
+            approved_analysis=analysis,
+            qa_result=qa,
+            company="Synthetic Systems",
+            role="Evidence Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+            attempt_number=2,
+        )
+
+    structured_analysis = copy.deepcopy(analysis)
+    structured_analysis["recommended_edits"].append(
+        {
+            **copy.deepcopy(analysis["recommended_edits"][0]),
+            "target_source_id": "skill_groups.0",
+        }
+    )
+    structured_qa = copy.deepcopy(qa)
+    structured_qa["issues"][0]["affected_content_id"] = "skill_groups.0"
+    with pytest.raises(
+        OllamaRevisionContractError,
+        match="structured_target_requires_new_analysis",
+    ):
+        ollama_writer_module.invoke_ollama_revision(
+            current_tailored_content=revised,
+            extracted_resume=extracted,
+            approved_analysis=structured_analysis,
+            qa_result=structured_qa,
+            company="Synthetic Systems",
+            role="Evidence Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+            attempt_number=1,
+        )
+    assert len(invocation_calls) == 1

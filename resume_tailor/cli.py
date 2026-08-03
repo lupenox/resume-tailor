@@ -434,6 +434,100 @@ def _elapsed_label(elapsed_seconds: float) -> str:
     return f"{seconds}s"
 
 
+def _initial_generation_metadata(
+    *,
+    response_metadata: dict[str, Any],
+    writer_provider: str,
+    ollama_model: str,
+    tailored_content_path: Path,
+) -> tuple[dict[str, Any], bool]:
+    """Build run metadata for provider-backed or deterministic generation.
+
+    A deterministic-only Ollama entrypoint deliberately has no provider response
+    artifact.  Keep that absence honest while retaining the local execution
+    envelope and the authenticated tailored-content reference.
+    """
+    execution = response_metadata.get("execution")
+    if not isinstance(execution, dict):
+        # Compatibility with the initial hybrid metadata key used while the
+        # deterministic compiler was introduced.
+        execution = response_metadata.get("hybrid")
+    if not isinstance(execution, dict):
+        execution = {}
+
+    invoked_value = execution.get("ollama_invoked")
+    if not isinstance(invoked_value, bool):
+        invoked_value = response_metadata.get("ollama_invoked")
+    ollama_invoked = (
+        invoked_value
+        if isinstance(invoked_value, bool)
+        else writer_provider == "ollama"
+    )
+    deterministic_only = writer_provider == "ollama" and not ollama_invoked
+
+    provider_value = response_metadata.get("provider")
+    provider = (
+        provider_value
+        if isinstance(provider_value, str) and provider_value
+        else writer_provider
+    )
+    model_value = response_metadata.get("model")
+    model = (
+        None
+        if deterministic_only
+        else (
+            model_value
+            if isinstance(model_value, str)
+            else ollama_model if writer_provider == "ollama" else None
+        )
+    )
+    envelope_type = response_metadata.get("response_envelope_type")
+    if not isinstance(envelope_type, str):
+        envelope_type = (
+            "deterministic-local-patches"
+            if deterministic_only
+            else "provider-response-metadata-unavailable"
+        )
+    output_format = response_metadata.get("output_format")
+    if not isinstance(output_format, str):
+        output_format = (
+            "deterministic-json"
+            if deterministic_only
+            else "structured-output"
+        )
+    execution_mode = response_metadata.get("execution_mode")
+    if not isinstance(execution_mode, str):
+        hybrid_execution_mode = execution.get("execution_mode")
+        execution_mode = (
+            hybrid_execution_mode
+            if isinstance(hybrid_execution_mode, str)
+            else "deterministic_only" if deterministic_only else "provider"
+        )
+
+    initial: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+        "response_envelope_type": envelope_type,
+        "output_format": output_format,
+        "execution_mode": execution_mode,
+        "tailored_content": {
+            "filename": tailored_content_path.name,
+            "sha256": sha256_file(tailored_content_path),
+        },
+    }
+    if writer_provider == "ollama":
+        initial["ollama_invoked"] = ollama_invoked
+    runtime = response_metadata.get("runtime")
+    if isinstance(runtime, str):
+        initial["runtime"] = runtime
+    response = response_metadata.get("response")
+    if isinstance(response, dict):
+        initial["response"] = dict(response)
+    if execution:
+        initial["execution"] = dict(execution)
+    return initial, deterministic_only
+
+
 def _apify_progress_message(
     phase: str,
     elapsed_seconds: float,
@@ -1331,19 +1425,27 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         metadata["stage"] = f"{writer_provider}-tailoring-preflight"
         hooks.progress(
             "antigravity_tailoring",
-            f"Authenticating the approved tailoring inputs before {writer_name}.",
+            (
+                "Authenticating the approved inputs before local tailoring."
+                if writer_provider == "ollama"
+                else f"Authenticating the approved tailoring inputs before {writer_name}."
+            ),
         )
         _update_metadata(metadata, metadata_path, run_directory=run_directory)
         try:
-            preflight_tailoring_inputs(
-                master_content=extracted["content"],
-                extracted_resume=extracted,
-                job_description=job_description,
-                job_requirements=job_requirements,
-                approved_analysis=analysis,
-                company=company,
-                role=role,
-            )
+            # The Ollama writer entrypoint owns its authenticated preflight so
+            # deterministic-only calls cannot bypass it and prose calls do not
+            # run it twice. Antigravity retains its existing CLI preflight.
+            if writer_provider == "antigravity":
+                preflight_tailoring_inputs(
+                    master_content=extracted["content"],
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    approved_analysis=analysis,
+                    company=company,
+                    role=role,
+                )
             metadata[f"{writer_provider}_tailoring_preflight"] = (
                 verify_tailoring_run_artifacts(
                     run_directory,
@@ -1380,11 +1482,18 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             tailored_content = antigravity_reprocess_inputs.tailored_content
         else:
             metadata["stage"] = f"{writer_provider}-tailoring"
-            hooks.progress(
-                "antigravity_tailoring",
-                f"{writer_name} is writing the complete tailored résumé content "
-                "from the approved schema-constrained edits.",
-            )
+            if writer_provider == "ollama":
+                hooks.progress(
+                    "antigravity_tailoring",
+                    "Python is compiling approved edits locally. Gemma 4 12B "
+                    "will be invoked only if prose authoring is required.",
+                )
+            else:
+                hooks.progress(
+                    "antigravity_tailoring",
+                    f"{writer_name} is writing the complete tailored résumé content "
+                    "from the approved schema-constrained edits.",
+                )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
             if writer_provider == "ollama":
                 tailored_content = invoke_ollama(
@@ -1433,19 +1542,23 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             raise IntegrityError(
                 f"The initial {writer_name} response metadata is unavailable."
             )
-        metadata["revision_cycle"]["initial"] = {
-            "provider": writer_provider,
-            "model": ollama_model if writer_provider == "ollama" else None,
-            "response": dict(initial_response_metadata["response"]),
-            "response_envelope_type": initial_response_metadata[
-                "response_envelope_type"
-            ],
-            "output_format": initial_response_metadata["output_format"],
-            "tailored_content": {
-                "filename": initial_content_path.name,
-                "sha256": sha256_file(initial_content_path),
-            },
-        }
+        initial_generation, deterministic_only = _initial_generation_metadata(
+            response_metadata=initial_response_metadata,
+            writer_provider=writer_provider,
+            ollama_model=ollama_model,
+            tailored_content_path=initial_content_path,
+        )
+        metadata["revision_cycle"]["initial"] = initial_generation
+        if deterministic_only:
+            metadata["writer"].update(
+                {
+                    "provider": "deterministic",
+                    "name": "Deterministic local compiler",
+                    "model": None,
+                    "runtime": "local",
+                    "ollama_invoked": False,
+                }
+            )
 
         metadata["stage"] = "local-evidence-check"
         hooks.progress(
@@ -2020,7 +2133,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                         analytics_application_id,
                         run_identifier=run_directory.name,
                         artifact_reference=artifact_reference,
-                        writer_provider=writer_provider,
+                        writer_provider=str(
+                            metadata.get("writer", {}).get(
+                                "provider",
+                                writer_provider,
+                            )
+                        ),
                         qa_outcome=qa_outcome,
                     ),
                 )
