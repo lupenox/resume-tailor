@@ -249,6 +249,7 @@ def invoke_analysis(
             timeout_seconds=timeout_seconds,
             model=model,
             progress_handler=progress_handler,
+            status_handler=None,
         )
     raise InputError(f"Unsupported analysis provider: {provider!r}.")
 

@@ -1459,6 +1459,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                         "job_requirement_id_count"
                     ],
                     "generated_from_source_and_requirement_catalogs": True,
+                    "architecture": "two_phase_coverage_and_edits",
                 }
                 _update_metadata(metadata, metadata_path, run_directory=run_directory)
 
@@ -1469,18 +1470,8 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 "several minutes; no unreliable ETA is shown.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            raw_analysis = invoke_analysis(
-                provider=analysis_provider,
-                extracted_resume=extracted,
-                job_description=job_description,
-                job_requirements=job_requirements,
-                company=company,
-                role=role,
-                run_directory=run_directory,
-                timeout_seconds=timeout_seconds,
-                transport_artifact=transport_artifact,
-                model=ollama_model,
-                progress_handler=lambda elapsed, alive: hooks.progress(
+            def _analysis_progress(elapsed: float, alive: bool) -> None:
+                hooks.progress(
                     "codex_analysis",
                     (
                         f"{analysis_label} analysis is still running"
@@ -1494,8 +1485,40 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     + f" — elapsed {_elapsed_label(elapsed)}.",
                     elapsed_seconds=max(0, int(elapsed)),
                     provider_process_alive=alive,
-                ),
-            )
+                )
+
+            if analysis_provider == "gemma_local":
+                from .gemma_analysis import invoke_gemma_analysis
+
+                raw_analysis = invoke_gemma_analysis(
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    model=ollama_model,
+                    progress_handler=_analysis_progress,
+                    status_handler=lambda status: hooks.progress(
+                        "codex_analysis",
+                        f"{analysis_label}: {status}.",
+                    ),
+                )
+            else:
+                raw_analysis = invoke_analysis(
+                    provider=analysis_provider,
+                    extracted_resume=extracted,
+                    job_description=job_description,
+                    job_requirements=job_requirements,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    transport_artifact=transport_artifact,
+                    model=ollama_model,
+                    progress_handler=_analysis_progress,
+                )
             analysis, analysis_issues = resolve_analysis_evidence(
                 raw_analysis,
                 extracted,

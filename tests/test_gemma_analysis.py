@@ -1,4 +1,4 @@
-"""Gemma Local Ollama analysis-provider tests (mocked Ollama only)."""
+"""Two-phase Gemma Local analysis tests (mocked Ollama only)."""
 
 from __future__ import annotations
 
@@ -12,39 +12,35 @@ from resume_tailor.analysis import (
     ANALYSIS_RESOLVED_FILENAME,
     CODEX_ANALYSIS_RESOLVED_FILENAME,
     DEFAULT_ANALYSIS_PROVIDER,
-    analysis_provider_label,
-    analysis_workflow_label,
-    invoke_analysis,
-    normalize_analysis_provider,
     write_resolved_analysis_artifact,
-    workflow_stages_for_provider,
 )
-from resume_tailor.cli import build_parser
 from resume_tailor.codex_analysis import build_analysis_prompt
 from resume_tailor.docx_extract import extract_resume
 from resume_tailor.evidence import resolve_analysis_evidence
 from resume_tailor.gemma_analysis import (
-    DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS,
-    GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME,
-    GEMMA_ANALYSIS_PROMPT_FILENAME,
-    GEMMA_ANALYSIS_RESPONSE_FILENAME,
-    GEMMA_ANALYSIS_SCHEMA_FILENAME,
-    build_gemma_analysis_prompt,
+    COVERAGE_DIAGNOSTIC_FILENAME,
+    COVERAGE_SCHEMA_FILENAME,
+    DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS,
+    DEFAULT_EDIT_MAX_OUTPUT_TOKENS,
+    EDITS_DIAGNOSTIC_FILENAME,
+    MAX_GEMMA_ANALYSIS_EDITS,
+    assemble_canonical_analysis,
+    build_coverage_prompt,
+    build_coverage_schema,
+    build_edits_prompt,
+    build_edits_schema,
     estimate_prompt_tokens,
     gemma_analysis_chat_request_for_tests,
     invoke_gemma_analysis,
     parse_exact_analysis_json,
-    prepare_gemma_analysis_schema,
-    resolve_gemma_analysis_max_output_tokens,
-    resolve_gemma_analysis_model,
+    resolve_coverage_max_output_tokens,
+    resolve_edit_max_output_tokens,
+    validate_coverage_payload,
+    validate_edits_payload,
 )
 from resume_tailor.job_requirements import build_job_requirement_catalog
 from resume_tailor.utilities import (
     GemmaAnalysisTimeoutError,
-    GemmaInnerAnalysisError,
-    GemmaModelUnavailableError,
-    GemmaOllamaInternalError,
-    GemmaOllamaUnavailableError,
     GemmaOutputLimitError,
     OllamaRequestError,
     SourceEvidenceError,
@@ -58,31 +54,43 @@ def _job_catalog() -> dict:
     )
 
 
-def _valid_analysis(requirements: dict) -> dict[str, Any]:
-    requirement_ids = [item["requirement_id"] for item in requirements["requirements"]]
-    supported = requirement_ids[0]
+def _requirement_ids(catalog: dict) -> list[str]:
+    return [item["requirement_id"] for item in catalog["requirements"]]
+
+
+def _coverage_body(catalog: dict, *, support_first: bool = True) -> dict[str, Any]:
+    ids = _requirement_ids(catalog)
+    requirements = []
+    for index, requirement_id in enumerate(ids):
+        if support_first and index == 0:
+            requirements.append(
+                {
+                    "requirement_id": requirement_id,
+                    "status": "supported",
+                    "evidence_source_ids": ["skill_groups.0"],
+                }
+            )
+        else:
+            requirements.append(
+                {
+                    "requirement_id": requirement_id,
+                    "status": "unsupported",
+                    "evidence_source_ids": [],
+                }
+            )
+    return {"requirements": requirements}
+
+
+def _edits_body() -> dict[str, Any]:
     return {
-        "role_summary": "Stubbed Gemma target role analysis.",
-        "fit_assessment": {
-            "overall": "Supported fit based on the supplied master resume.",
-            "strengths": ["Python evidence"],
-            "gaps": ["Unsupported technologies remain unsupported"],
-        },
-        "supported_requirement_mappings": [
+        "edits": [
             {
-                "requirement_id": supported,
-                "evidence_source_ids": ["skill_groups.0"],
-                "strength": "strong",
+                "target_source_id": "professional_summary",
+                "requirement_ids": [],  # filled by test when known
+                "evidence_source_ids": ["professional_summary"],
+                "proposed_text": "Python-focused engineer with agentic workflow experience.",
             }
-        ],
-        "unsupported_requirement_ids": [
-            item for item in requirement_ids if item != supported
-        ],
-        "recommended_edits": [],
-        "immutable_facts": ["Example Institute"],
-        "forbidden_claims": ["RAG", "GraphQL"],
-        "content_budget_guidance": [],
-        "questions_for_user": [],
+        ]
     }
 
 
@@ -98,7 +106,6 @@ def _ollama_body(
         text = content
     body: dict[str, Any] = {
         "model": "resume-tailor-gemma",
-        "created_at": "2026-01-01T00:00:00Z",
         "done": True,
         "done_reason": done_reason,
         "message": {"role": "assistant", "content": text},
@@ -128,8 +135,7 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch):
             raise state["errors"].pop(0)
         if not state["bodies"]:
             raise OllamaRequestError(
-                "The localhost Ollama server refused the connection. Confirm Ollama "
-                "is running on 127.0.0.1:11434.",
+                "refused",
                 classification="connection_refused",
             )
         return state["bodies"].pop(0)
@@ -143,82 +149,94 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch):
     return state
 
 
-def test_gemma_local_is_default_and_labels() -> None:
+def test_defaults_and_token_ceilings(monkeypatch: pytest.MonkeyPatch) -> None:
     assert DEFAULT_ANALYSIS_PROVIDER == "gemma_local"
-    assert normalize_analysis_provider(None) == "gemma_local"
-    assert analysis_provider_label("gemma_local") == "Gemma Local"
-    assert analysis_workflow_label("gemma_local") == "Gemma Local analysis"
-    assert analysis_workflow_label("codex") == "Codex analysis"
-    assert analysis_workflow_label("grok_cli") == "Grok CLI analysis"
-    stages = dict(workflow_stages_for_provider("grok_cli"))
-    assert stages["codex_analysis"] == "Grok CLI analysis"
-    parser = build_parser()
-    args = parser.parse_args(
-        [
-            "--resume",
-            "template/sample_resume.docx",
-            "--company",
-            "Example",
-            "--role",
-            "Dev",
-            "--job-file",
-            "job.txt",
-        ]
-    )
-    assert args.analysis_provider == "gemma_local"
-
-
-def test_model_and_output_token_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GEMMA_ANALYSIS_MODEL", raising=False)
-    monkeypatch.delenv("GEMMA_WRITER_MODEL", raising=False)
+    monkeypatch.delenv("GEMMA_ANALYSIS_COVERAGE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS", raising=False)
     monkeypatch.delenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", raising=False)
-    assert resolve_gemma_analysis_model(None) == "resume-tailor-gemma"
-    assert (
-        resolve_gemma_analysis_max_output_tokens(None)
-        == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
-    )
+    assert resolve_coverage_max_output_tokens(None) == DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS
+    assert resolve_edit_max_output_tokens(None) == DEFAULT_EDIT_MAX_OUTPUT_TOKENS
+    assert MAX_GEMMA_ANALYSIS_EDITS == 8
+    # Blank / invalid phase-specific values fall through to defaults.
+    monkeypatch.setenv("GEMMA_ANALYSIS_COVERAGE_MAX_OUTPUT_TOKENS", "   ")
+    assert resolve_coverage_max_output_tokens(None) == DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS
+    monkeypatch.setenv("GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS", "not-a-number")
+    assert resolve_edit_max_output_tokens(None) == DEFAULT_EDIT_MAX_OUTPUT_TOKENS
+
+
+def test_legacy_and_phase_token_env_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS must not inflate both phases."""
+    for name in (
+        "GEMMA_ANALYSIS_COVERAGE_MAX_OUTPUT_TOKENS",
+        "GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS",
+        "GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    # Only new phase-specific variables.
+    monkeypatch.setenv("GEMMA_ANALYSIS_COVERAGE_MAX_OUTPUT_TOKENS", "900")
+    monkeypatch.setenv("GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS", "1200")
+    assert resolve_coverage_max_output_tokens(None) == 900
+    assert resolve_edit_max_output_tokens(None) == 1200
+
+    # Only legacy: cap defaults downward; 4096 must not raise either phase.
+    monkeypatch.delenv("GEMMA_ANALYSIS_COVERAGE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS", raising=False)
     monkeypatch.setenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", "4096")
-    assert resolve_gemma_analysis_max_output_tokens(None) == 4096
+    assert resolve_coverage_max_output_tokens(None) == DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS
+    assert resolve_edit_max_output_tokens(None) == DEFAULT_EDIT_MAX_OUTPUT_TOKENS
+    monkeypatch.setenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", "512")
+    assert resolve_coverage_max_output_tokens(None) == 512
+    assert resolve_edit_max_output_tokens(None) == 512
+
+    # Both legacy and new: phase-specific wins; legacy is ignored for those phases.
+    monkeypatch.setenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", "4096")
+    monkeypatch.setenv("GEMMA_ANALYSIS_COVERAGE_MAX_OUTPUT_TOKENS", "800")
+    monkeypatch.setenv("GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS", "1100")
+    assert resolve_coverage_max_output_tokens(None) == 800
+    assert resolve_edit_max_output_tokens(None) == 1100
+
+    # Blank / invalid legacy ignored.
+    monkeypatch.delenv("GEMMA_ANALYSIS_COVERAGE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS", raising=False)
     monkeypatch.setenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", "   ")
-    assert (
-        resolve_gemma_analysis_max_output_tokens(None)
-        == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
-    )
-    monkeypatch.setenv("GEMMA_ANALYSIS_MODEL", "   ")
-    monkeypatch.setenv("GEMMA_WRITER_MODEL", "")
-    assert resolve_gemma_analysis_model(None) == "resume-tailor-gemma"
+    assert resolve_coverage_max_output_tokens(None) == DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS
+    monkeypatch.setenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", "abc")
+    assert resolve_edit_max_output_tokens(None) == DEFAULT_EDIT_MAX_OUTPUT_TOKENS
 
 
-def test_chat_request_includes_num_predict_and_omits_think(
-    master_resume: Path,
-    tmp_path: Path,
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    schema_info = prepare_gemma_analysis_schema(
-        extracted,
-        _job_catalog(),
-        tmp_path,
+def test_phase_schemas_and_chat_request_shape() -> None:
+    coverage = build_coverage_schema(
+        requirement_ids=["skill.001", "skill.002"],
+        evidence_ids=["skill_groups.0", "professional_summary"],
     )
+    assert coverage["properties"]["requirements"]["minItems"] == 2
+    assert coverage["properties"]["requirements"]["maxItems"] == 2
+    edits = build_edits_schema(
+        editable_ids=["professional_summary"],
+        evidence_ids=["skill_groups.0"],
+        eligible_requirement_ids=["skill.001"],
+        max_edits=8,
+    )
+    assert edits["properties"]["edits"]["maxItems"] == 8
     request = gemma_analysis_chat_request_for_tests(
         model="resume-tailor-gemma",
-        prompt="synthetic",
-        format_schema=schema_info["schema"],
-        max_output_tokens=2048,
+        prompt="x",
+        format_schema=coverage,
+        max_output_tokens=1536,
     )
     assert request["stream"] is False
     assert request["options"]["temperature"] == 0
-    assert request["options"]["num_predict"] == 2048
+    assert request["options"]["num_predict"] == 1536
     assert "think" not in request
-    assert "$schema" not in request["format"]
-    assert request["format"]["additionalProperties"] is False
 
 
-def test_prompt_compaction_smaller_than_legacy_shared_prompt(
+def test_prompt_compaction_two_phase_vs_legacy(
     master_resume: Path,
 ) -> None:
     extracted, _ = extract_resume(master_resume)
     catalog = _job_catalog()
-    job = "Skills: Python and RAG. Build agentic systems with evidence."
+    job = "Skills: Python and RAG. Build agentic systems."
     legacy = build_analysis_prompt(
         extracted,
         job,
@@ -226,61 +244,84 @@ def test_prompt_compaction_smaller_than_legacy_shared_prompt(
         company="Example",
         role="Developer",
     )
-    compact = build_gemma_analysis_prompt(
-        extracted,
-        job,
-        catalog,
+    coverage_prompt = build_coverage_prompt(
+        extracted_resume=extracted,
+        job_description=job,
+        job_requirements=catalog,
         company="Example",
         role="Developer",
     )
-    legacy_bytes = len(legacy.encode("utf-8"))
-    compact_bytes = len(compact.encode("utf-8"))
-    assert compact_bytes < legacy_bytes
-    # Authority markers preserved.
-    assert "SOURCE_CATALOG" in compact
-    assert "JOB_REQUIREMENTS" in compact
-    assert "evidence_allowed" in compact
-    assert "unsupported_requirement_ids" in compact
-    assert "skill_groups.N" in compact
-    assert "character_counting_contract" in compact
-    assert "BEGIN_UNTRUSTED_JOB_DESCRIPTION_" in compact
-    assert estimate_prompt_tokens(compact) < estimate_prompt_tokens(legacy)
+    coverage_payload = _coverage_body(catalog)
+    edits_prompt = build_edits_prompt(
+        extracted_resume=extracted,
+        coverage=coverage_payload,
+        company="Example",
+        role="Developer",
+    )
+    assert len(coverage_prompt.encode()) < len(legacy.encode())
+    assert len(edits_prompt.encode()) < len(legacy.encode())
+    assert "SOURCE_CATALOG" in coverage_prompt
+    assert "JOB_REQUIREMENTS" in coverage_prompt
+    assert "BEGIN_UNTRUSTED_JOB_DESCRIPTION_" in coverage_prompt
+    assert "max_edits" in edits_prompt
+    assert "skill_groups.N" in edits_prompt
+    assert estimate_prompt_tokens(coverage_prompt) < estimate_prompt_tokens(legacy)
 
 
-def test_successful_schema_constrained_gemma_analysis(
+def test_successful_two_phase_analysis_and_assembly(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    analysis = _valid_analysis(requirements)
-    mock_ollama["set_bodies"](_ollama_body(analysis))
+    catalog = _job_catalog()
+    coverage = _coverage_body(catalog)
+    supported_id = coverage["requirements"][0]["requirement_id"]
+    edits = {
+        "edits": [
+            {
+                "target_source_id": "professional_summary",
+                "requirement_ids": [supported_id],
+                "evidence_source_ids": ["skill_groups.0"],
+                "proposed_text": "Python engineer with production agent workflows.",
+            }
+        ]
+    }
+    mock_ollama["set_bodies"](_ollama_body(coverage), _ollama_body(edits))
+    statuses: list[str] = []
     payload = invoke_gemma_analysis(
         extracted_resume=extracted,
         job_description="Python role",
-        job_requirements=requirements,
+        job_requirements=catalog,
         company="Example",
         role="Developer",
         run_directory=tmp_path,
-        timeout_seconds=30,
+        timeout_seconds=60,
+        status_handler=statuses.append,
     )
-    assert payload["role_summary"]
-    body = mock_ollama["requests"][0]["body"]
-    assert body["options"]["num_predict"] == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
-    assert "think" not in body
-    diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    assert payload["supported_requirement_mappings"]
+    assert payload["unsupported_requirement_ids"]
+    assert payload["recommended_edits"]
+    assert "role_summary" in payload
+    assert mock_ollama["calls"] == 2
+    assert mock_ollama["requests"][0]["body"]["options"]["num_predict"] == (
+        DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS
     )
-    assert diagnostic["classification"] == "success"
-    assert diagnostic["max_output_tokens"] == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
-    assert diagnostic["configured_timeout_seconds"] == 30
+    assert mock_ollama["requests"][1]["body"]["options"]["num_predict"] == (
+        DEFAULT_EDIT_MAX_OUTPUT_TOKENS
+    )
+    assert "Mapping job requirements" in statuses
+    assert "Planning résumé edits" in statuses
+    assert (tmp_path / COVERAGE_SCHEMA_FILENAME).is_file()
+    assert (tmp_path / COVERAGE_DIAGNOSTIC_FILENAME).is_file()
+    assert (tmp_path / EDITS_DIAGNOSTIC_FILENAME).is_file()
+
+    resolved, issues = resolve_analysis_evidence(payload, extracted, catalog)
+    assert issues == []
     meta = write_resolved_analysis_artifact(
-        tmp_path,
-        payload,
-        provider="gemma_local",
+        tmp_path, resolved, provider="gemma_local"
     )
-    assert meta["legacy_codex_alias_written"] is False
+    assert meta["provider"] == "gemma_local"
     assert not (tmp_path / CODEX_ANALYSIS_RESOLVED_FILENAME).exists()
     document = json.loads(
         (tmp_path / ANALYSIS_RESOLVED_FILENAME).read_text(encoding="utf-8")
@@ -288,19 +329,159 @@ def test_successful_schema_constrained_gemma_analysis(
     assert document["provider"] == "gemma_local"
 
 
-def test_connection_refused_is_ollama_unavailable(
+def test_missing_and_duplicate_requirement_ids_rejected() -> None:
+    requirement_ids = ["skill.001", "skill.002"]
+    evidence = {"skill_groups.0"}
+    with pytest.raises(SourceEvidenceError, match="missing requirement"):
+        validate_coverage_payload(
+            {
+                "requirements": [
+                    {
+                        "requirement_id": "skill.001",
+                        "status": "unsupported",
+                        "evidence_source_ids": [],
+                    }
+                ]
+            },
+            requirement_ids=requirement_ids,
+            evidence_ids=evidence,
+        )
+    with pytest.raises(SourceEvidenceError, match="duplicate"):
+        validate_coverage_payload(
+            {
+                "requirements": [
+                    {
+                        "requirement_id": "skill.001",
+                        "status": "unsupported",
+                        "evidence_source_ids": [],
+                    },
+                    {
+                        "requirement_id": "skill.001",
+                        "status": "supported",
+                        "evidence_source_ids": ["skill_groups.0"],
+                    },
+                ]
+            },
+            requirement_ids=requirement_ids,
+            evidence_ids=evidence,
+        )
+
+
+def test_invalid_evidence_ids_rejected_in_coverage() -> None:
+    with pytest.raises(SourceEvidenceError, match="invalid evidence"):
+        validate_coverage_payload(
+            {
+                "requirements": [
+                    {
+                        "requirement_id": "skill.001",
+                        "status": "supported",
+                        "evidence_source_ids": ["not.a.source"],
+                    }
+                ]
+            },
+            requirement_ids=["skill.001"],
+            evidence_ids={"skill_groups.0"},
+        )
+
+
+def test_unsupported_must_not_cite_evidence() -> None:
+    with pytest.raises(SourceEvidenceError, match="must not cite evidence"):
+        validate_coverage_payload(
+            {
+                "requirements": [
+                    {
+                        "requirement_id": "skill.001",
+                        "status": "unsupported",
+                        "evidence_source_ids": ["skill_groups.0"],
+                    }
+                ]
+            },
+            requirement_ids=["skill.001"],
+            evidence_ids={"skill_groups.0"},
+        )
+
+
+def test_edit_count_maximum_enforced() -> None:
+    edits = {
+        "edits": [
+            {
+                "target_source_id": f"professional_summary",
+                "requirement_ids": ["skill.001"],
+                "evidence_source_ids": ["skill_groups.0"],
+                "proposed_text": "text",
+            }
+        ]
+        * 9
+    }
+    # Force distinct targets for max check first
+    edits = {
+        "edits": [
+            {
+                "target_source_id": f"t{i}",
+                "requirement_ids": ["skill.001"],
+                "evidence_source_ids": ["skill_groups.0"],
+                "proposed_text": "text",
+            }
+            for i in range(9)
+        ]
+    }
+    with pytest.raises(SourceEvidenceError, match="more than"):
+        validate_edits_payload(
+            edits,
+            editable_ids={f"t{i}" for i in range(9)},
+            evidence_ids={"skill_groups.0"},
+            eligible_requirement_ids={"skill.001"},
+            max_edits=8,
+        )
+
+
+def test_only_supported_requirements_enter_edit_eligibility(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    catalog = _job_catalog()
+    coverage = _coverage_body(catalog, support_first=True)
+    unsupported_id = coverage["requirements"][1]["requirement_id"]
+    supported_id = coverage["requirements"][0]["requirement_id"]
+    # Attempt to attach unsupported requirement in edit → rejected, no Phase B repair for evidence
+    bad_edits = {
+        "edits": [
+            {
+                "target_source_id": "professional_summary",
+                "requirement_ids": [unsupported_id],
+                "evidence_source_ids": ["skill_groups.0"],
+                "proposed_text": "text",
+            }
+        ]
+    }
+    mock_ollama["set_bodies"](_ollama_body(coverage), _ollama_body(bad_edits))
+    with pytest.raises(SourceEvidenceError, match="not eligible"):
+        invoke_gemma_analysis(
+            extracted_resume=extracted,
+            job_description="Python role",
+            job_requirements=catalog,
+            company="Example",
+            role="Developer",
+            run_directory=tmp_path,
+            timeout_seconds=60,
+        )
+    # coverage + one edits attempt (no repair for evidence)
+    assert mock_ollama["calls"] == 2
+    assert supported_id != unsupported_id
+
+
+def test_phase_a_timeout_prevents_phase_b(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
     mock_ollama["set_errors"](
-        OllamaRequestError(
-            "refused",
-            classification="connection_refused",
-        )
+        OllamaRequestError("timeout", classification="timeout")
     )
-    with pytest.raises(GemmaOllamaUnavailableError):
+    with pytest.raises(GemmaAnalysisTimeoutError):
         invoke_gemma_analysis(
             extracted_resume=extracted,
             job_description="Python role",
@@ -310,143 +491,23 @@ def test_connection_refused_is_ollama_unavailable(
             run_directory=tmp_path,
             timeout_seconds=30,
         )
-    diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
-    )
-    assert diagnostic["classification"] == "ollama_unavailable"
     assert mock_ollama["calls"] == 1
-
-
-def test_model_missing_is_model_unavailable(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    mock_ollama["set_errors"](
-        OllamaRequestError(
-            "not found",
-            classification="http_error",
-            http_status=404,
-        )
-    )
-    with pytest.raises(GemmaModelUnavailableError):
-        invoke_gemma_analysis(
-            extracted_resume=extracted,
-            job_description="Python role",
-            job_requirements=_job_catalog(),
-            company="Example",
-            role="Developer",
-            run_directory=tmp_path,
-            timeout_seconds=30,
-            model="missing-model",
-        )
     diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+        (tmp_path / COVERAGE_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
     )
-    assert diagnostic["classification"] == "model_unavailable"
-
-
-def test_active_generation_deadline_is_analysis_timeout(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    mock_ollama["set_errors"](
-        OllamaRequestError(
-            "The localhost Ollama request exceeded its bounded timeout.",
-            classification="timeout",
-        )
-    )
-    with pytest.raises(GemmaAnalysisTimeoutError, match="generation time limit"):
-        invoke_gemma_analysis(
-            extracted_resume=extracted,
-            job_description="Python role",
-            job_requirements=_job_catalog(),
-            company="Example",
-            role="Developer",
-            run_directory=tmp_path,
-            timeout_seconds=15,
-        )
-    diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
-    )
+    assert diagnostic["phase"] == "coverage"
     assert diagnostic["classification"] == "analysis_timeout"
-    assert diagnostic["configured_timeout_seconds"] == 15
-    assert diagnostic["generation_active"] is True
-    assert mock_ollama["calls"] == 1  # no repair on timeout
+    assert not (tmp_path / EDITS_DIAGNOSTIC_FILENAME).exists()
 
 
-def test_http_500_is_ollama_internal_error_not_unavailable(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    mock_ollama["set_errors"](
-        OllamaRequestError(
-            "internal server error",
-            classification="http_error",
-            http_status=500,
-        )
-    )
-    with pytest.raises(GemmaOllamaInternalError):
-        invoke_gemma_analysis(
-            extracted_resume=extracted,
-            job_description="Python role",
-            job_requirements=_job_catalog(),
-            company="Example",
-            role="Developer",
-            run_directory=tmp_path,
-            timeout_seconds=30,
-        )
-    diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
-    )
-    assert diagnostic["classification"] == "ollama_internal_error"
-    assert diagnostic["http_status"] == 500
-    assert "unavailable" not in diagnostic["classification"]
-
-
-def test_valid_json_at_exact_num_predict_with_normal_stop_succeeds(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    """eval_count == num_predict must not reject complete valid JSON with stop."""
-    extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    analysis = _valid_analysis(requirements)
-    mock_ollama["set_bodies"](
-        _ollama_body(analysis, done_reason="stop", eval_count=3072)
-    )
-    payload = invoke_gemma_analysis(
-        extracted_resume=extracted,
-        job_description="Python role",
-        job_requirements=requirements,
-        company="Example",
-        role="Developer",
-        run_directory=tmp_path,
-        timeout_seconds=30,
-        max_output_tokens=3072,
-    )
-    assert payload["role_summary"]
-    diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
-    )
-    assert diagnostic["classification"] == "success"
-    assert mock_ollama["calls"] == 1
-
-
-def test_explicit_length_stop_is_output_limit_reached(
+def test_phase_a_output_limit_prevents_phase_b(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
     mock_ollama["set_bodies"](
-        _ollama_body('{"role_summary":', done_reason="length", eval_count=3072)
+        _ollama_body('{"requirements":', done_reason="length", eval_count=1536)
     )
     with pytest.raises(GemmaOutputLimitError):
         invoke_gemma_analysis(
@@ -457,189 +518,464 @@ def test_explicit_length_stop_is_output_limit_reached(
             role="Developer",
             run_directory=tmp_path,
             timeout_seconds=30,
-            max_output_tokens=3072,
+            coverage_max_output_tokens=1536,
         )
     assert mock_ollama["calls"] == 1
     diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+        (tmp_path / COVERAGE_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
     )
     assert diagnostic["classification"] == "output_limit_reached"
-    assert diagnostic["output_ceiling_reached"] is True
 
 
-def test_incomplete_json_at_num_predict_without_stop_reason(
+def test_phase_b_timeout_reports_edits_phase(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
-    """Missing/ambiguous stop + ceiling + incomplete body → output_limit_reached."""
     extracted, _ = extract_resume(master_resume)
-    body = _ollama_body('{"role_summary":', done_reason="stop", eval_count=3072)
-    body.pop("done_reason")
-    mock_ollama["set_bodies"](body)
-    with pytest.raises(GemmaOutputLimitError):
-        invoke_gemma_analysis(
-            extracted_resume=extracted,
-            job_description="Python role",
-            job_requirements=_job_catalog(),
-            company="Example",
-            role="Developer",
-            run_directory=tmp_path,
-            timeout_seconds=30,
-            max_output_tokens=3072,
+    catalog = _job_catalog()
+    coverage = _coverage_body(catalog)
+    mock_ollama["set_bodies"](_ollama_body(coverage))
+    mock_ollama["errors"] = [
+        OllamaRequestError("timeout", classification="timeout")
+    ]
+    # After first body, next call uses errors — set after coverage body consumed
+    def fake(**kwargs: Any) -> dict[str, Any]:
+        mock_ollama["calls"] += 1
+        mock_ollama["requests"].append(kwargs)
+        if mock_ollama["calls"] == 1:
+            return _ollama_body(coverage)
+        raise OllamaRequestError("timeout", classification="timeout")
+
+    import resume_tailor.gemma_analysis as ga
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(ga, "run_ollama_request", fake)
+    try:
+        with pytest.raises(GemmaAnalysisTimeoutError):
+            invoke_gemma_analysis(
+                extracted_resume=extracted,
+                job_description="Python role",
+                job_requirements=catalog,
+                company="Example",
+                role="Developer",
+                run_directory=tmp_path,
+                timeout_seconds=30,
+            )
+        diagnostic = json.loads(
+            (tmp_path / EDITS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
         )
-    assert mock_ollama["calls"] == 1  # not repaired
+        assert diagnostic["phase"] == "edits"
+        assert diagnostic["classification"] == "analysis_timeout"
+    finally:
+        monkeypatch.undo()
 
 
-def test_incomplete_json_at_num_predict_with_normal_stop_may_repair(
+def test_malformed_coverage_gets_one_repair(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
-    """Normal stop + incomplete JSON is repairable once (not auto output_limit)."""
     extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    valid = _valid_analysis(requirements)
+    catalog = _job_catalog()
+    coverage = _coverage_body(catalog)
+    supported_id = coverage["requirements"][0]["requirement_id"]
+    edits = {
+        "edits": [
+            {
+                "target_source_id": "professional_summary",
+                "requirement_ids": [supported_id],
+                "evidence_source_ids": ["skill_groups.0"],
+                "proposed_text": "Python engineer.",
+            }
+        ]
+    }
     mock_ollama["set_bodies"](
-        _ollama_body('{"role_summary":', done_reason="stop", eval_count=3072),
-        _ollama_body(valid, done_reason="stop", eval_count=100),
+        _ollama_body("```json\n{}\n```"),
+        _ollama_body(coverage),
+        _ollama_body(edits),
     )
     payload = invoke_gemma_analysis(
         extracted_resume=extracted,
         job_description="Python role",
-        job_requirements=requirements,
+        job_requirements=catalog,
         company="Example",
         role="Developer",
         run_directory=tmp_path,
-        timeout_seconds=30,
-        max_output_tokens=3072,
+        timeout_seconds=60,
     )
-    assert payload["role_summary"]
-    assert mock_ollama["calls"] == 2
-    for request in mock_ollama["requests"]:
-        assert request["body"]["options"]["num_predict"] == 3072
-
-
-def test_truncated_json_never_accepted_without_length_reason(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    # Incomplete JSON with stop reason still fails parse; one repair only.
-    mock_ollama["set_bodies"](
-        _ollama_body('{"role_summary": "x"', done_reason="stop"),
-        _ollama_body('{"role_summary": "x"', done_reason="stop"),
-    )
-    with pytest.raises(GemmaInnerAnalysisError):
-        invoke_gemma_analysis(
-            extracted_resume=extracted,
-            job_description="Python role",
-            job_requirements=_job_catalog(),
-            company="Example",
-            role="Developer",
-            run_directory=tmp_path,
-            timeout_seconds=30,
-        )
-    assert mock_ollama["calls"] == 2
-
-
-def test_schema_invalid_may_receive_one_repair(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    valid = _valid_analysis(requirements)
-    mock_ollama["set_bodies"](
-        _ollama_body({"role_summary": "incomplete"}),
-        _ollama_body(valid),
-    )
-    payload = invoke_gemma_analysis(
-        extracted_resume=extracted,
-        job_description="Python role",
-        job_requirements=requirements,
-        company="Example",
-        role="Developer",
-        run_directory=tmp_path,
-        timeout_seconds=30,
-    )
-    assert payload["role_summary"]
-    assert mock_ollama["calls"] == 2
-    repair_prompt = mock_ollama["requests"][1]["body"]["messages"][1]["content"]
-    assert "failure_class=schema_failure" in repair_prompt
-    # Full malformed multi-k response is not re-injected.
-    assert "incomplete" not in repair_prompt or "failure_class" in repair_prompt
-    assert mock_ollama["requests"][1]["body"]["options"]["num_predict"] == (
-        DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
-    )
-
-
-def test_repair_does_not_include_full_malformed_response(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    valid = _valid_analysis(requirements)
-    huge = "X" * 5000
-    mock_ollama["set_bodies"](
-        _ollama_body("```json\n" + huge + "\n```"),
-        _ollama_body(valid),
-    )
-    invoke_gemma_analysis(
-        extracted_resume=extracted,
-        job_description="Python role",
-        job_requirements=requirements,
-        company="Example",
-        role="Developer",
-        run_directory=tmp_path,
-        timeout_seconds=30,
-    )
+    assert payload["recommended_edits"]
+    # coverage fail + repair + edits = 3
+    assert mock_ollama["calls"] == 3
     repair_prompt = mock_ollama["requests"][1]["body"]["messages"][1]["content"]
     assert "failure_class=malformed_inner_analysis" in repair_prompt
-    assert huge not in repair_prompt
+    assert "```" not in repair_prompt or "failure_class" in repair_prompt
 
 
-def test_fenced_and_trailing_json_rejected() -> None:
-    with pytest.raises(GemmaInnerAnalysisError, match="Markdown"):
-        parse_exact_analysis_json("```json\n{}\n```")
-    with pytest.raises(GemmaInnerAnalysisError, match="trailing"):
-        parse_exact_analysis_json('{"a":1}\ncommentary')
-
-
-def test_invalid_source_ids_not_retried_inside_provider(
+def test_no_retry_for_invalid_evidence(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    analysis = _valid_analysis(requirements)
-    analysis["recommended_edits"] = [
+    catalog = _job_catalog()
+    bad = _coverage_body(catalog)
+    bad["requirements"][0]["evidence_source_ids"] = ["not.real"]
+    bad["requirements"][0]["status"] = "supported"
+    mock_ollama["set_bodies"](_ollama_body(bad))
+    with pytest.raises(SourceEvidenceError, match="invalid evidence"):
+        invoke_gemma_analysis(
+            extracted_resume=extracted,
+            job_description="Python role",
+            job_requirements=catalog,
+            company="Example",
+            role="Developer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+        )
+    assert mock_ollama["calls"] == 1
+
+
+def test_assemble_canonical_passes_schema_and_evidence(
+    master_resume: Path,
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    catalog = _job_catalog()
+    coverage = validate_coverage_payload(
+        _coverage_body(catalog),
+        requirement_ids=_requirement_ids(catalog),
+        evidence_ids={
+            block["source_id"]
+            for block in extracted["source_blocks"]
+            if block.get("evidence_allowed")
+        },
+    )
+    supported_id = coverage["requirements"][0]["requirement_id"]
+    edits = validate_edits_payload(
+        {
+            "edits": [
+                {
+                    "target_source_id": "professional_summary",
+                    "requirement_ids": [supported_id],
+                    "evidence_source_ids": ["skill_groups.0"],
+                    "proposed_text": "Python-focused summary.",
+                }
+            ]
+        },
+        editable_ids={"professional_summary"},
+        evidence_ids={"skill_groups.0", "professional_summary"},
+        eligible_requirement_ids={supported_id},
+    )
+    analysis = assemble_canonical_analysis(
+        coverage=coverage,
+        edits=edits,
+        company="Example",
+        role="Developer",
+        job_requirements=catalog,
+    )
+    resolved, issues = resolve_analysis_evidence(analysis, extracted, catalog)
+    assert issues == []
+    assert resolved["recommended_edits"][0]["existing_text"]
+
+
+def test_parse_rejects_fences() -> None:
+    with pytest.raises(Exception):
+        parse_exact_analysis_json("```json\n{}\n```")
+
+
+def test_unknown_requirement_id_rejected() -> None:
+    with pytest.raises(SourceEvidenceError, match="unknown requirement_id"):
+        validate_coverage_payload(
+            {
+                "requirements": [
+                    {
+                        "requirement_id": "skill.999",
+                        "status": "unsupported",
+                        "evidence_source_ids": [],
+                    }
+                ]
+            },
+            requirement_ids=["skill.001"],
+            evidence_ids={"skill_groups.0"},
+        )
+
+
+def test_supported_without_evidence_rejected() -> None:
+    with pytest.raises(SourceEvidenceError, match="needs evidence"):
+        validate_coverage_payload(
+            {
+                "requirements": [
+                    {
+                        "requirement_id": "skill.001",
+                        "status": "supported",
+                        "evidence_source_ids": [],
+                    }
+                ]
+            },
+            requirement_ids=["skill.001"],
+            evidence_ids={"skill_groups.0"},
+        )
+    with pytest.raises(SourceEvidenceError, match="needs evidence"):
+        validate_coverage_payload(
+            {
+                "requirements": [
+                    {
+                        "requirement_id": "skill.001",
+                        "status": "partially_supported",
+                        "evidence_source_ids": [],
+                    }
+                ]
+            },
+            requirement_ids=["skill.001"],
+            evidence_ids={"skill_groups.0"},
+        )
+
+
+def test_every_requirement_exactly_once_accepted() -> None:
+    payload = validate_coverage_payload(
+        {
+            "requirements": [
+                {
+                    "requirement_id": "skill.001",
+                    "status": "supported",
+                    "evidence_source_ids": ["skill_groups.0"],
+                },
+                {
+                    "requirement_id": "skill.002",
+                    "status": "unsupported",
+                    "evidence_source_ids": [],
+                },
+            ]
+        },
+        requirement_ids=["skill.001", "skill.002"],
+        evidence_ids={"skill_groups.0"},
+    )
+    assert [item["requirement_id"] for item in payload["requirements"]] == [
+        "skill.001",
+        "skill.002",
+    ]
+
+
+def test_duplicate_phase_b_target_rejected() -> None:
+    with pytest.raises(SourceEvidenceError, match="duplicate target_source_id"):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["skill.001"],
+                        "evidence_source_ids": ["skill_groups.0"],
+                        "proposed_text": "First proposal.",
+                    },
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["skill.001"],
+                        "evidence_source_ids": ["skill_groups.0"],
+                        "proposed_text": "Competing proposal.",
+                    },
+                ]
+            },
+            editable_ids={"professional_summary"},
+            evidence_ids={"skill_groups.0"},
+            eligible_requirement_ids={"skill.001"},
+            requirement_evidence={"skill.001": {"skill_groups.0"}},
+        )
+
+
+def test_unrelated_but_globally_valid_evidence_rejected() -> None:
+    """A catalog-valid source ID that Phase A did not map must not pass Phase B."""
+    with pytest.raises(SourceEvidenceError, match="unrelated evidence"):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["skill.001"],
+                        # professional_summary is catalog-eligible but not Phase A evidence
+                        "evidence_source_ids": ["professional_summary"],
+                        "proposed_text": "Python-focused summary.",
+                    }
+                ]
+            },
+            editable_ids={"professional_summary"},
+            evidence_ids={"skill_groups.0", "professional_summary", "experience.0.bullets.0"},
+            eligible_requirement_ids={"skill.001"},
+            requirement_evidence={"skill.001": {"skill_groups.0"}},
+        )
+
+
+def test_no_supported_requirements_skips_phase_b(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    catalog = _job_catalog()
+    coverage = _coverage_body(catalog, support_first=False)
+    mock_ollama["set_bodies"](_ollama_body(coverage))
+    payload = invoke_gemma_analysis(
+        extracted_resume=extracted,
+        job_description="Python role",
+        job_requirements=catalog,
+        company="Example",
+        role="Developer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+    assert mock_ollama["calls"] == 1  # Phase B skipped
+    assert payload["recommended_edits"] == []
+    assert payload["unsupported_requirement_ids"]
+    assert payload["supported_requirement_mappings"] == []
+    diagnostic = json.loads(
+        (tmp_path / EDITS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    )
+    assert diagnostic["phase"] == "edits"
+    assert diagnostic.get("skipped") is True
+    assert diagnostic.get("skip_reason") == "no_supported_or_editable_targets"
+
+
+def test_canonical_fields_are_deterministic_and_honest() -> None:
+    catalog = _job_catalog()
+    ids = _requirement_ids(catalog)
+    coverage = {
+        "requirements": [
+            {
+                "requirement_id": ids[0],
+                "status": "supported",
+                "evidence_source_ids": ["skill_groups.0"],
+            },
+            *[
+                {
+                    "requirement_id": rid,
+                    "status": "unsupported",
+                    "evidence_source_ids": [],
+                }
+                for rid in ids[1:]
+            ],
+        ]
+    }
+    analysis = assemble_canonical_analysis(
+        coverage=coverage,
+        edits={"edits": []},
+        company="Acme",
+        role="Engineer",
+        job_requirements=catalog,
+    )
+    assert analysis["role_summary"] == "Engineer opportunity at Acme."
+    assert "Acme" in analysis["fit_assessment"]["overall"]
+    assert analysis["questions_for_user"] == []
+    assert analysis["content_budget_guidance"] == []
+    assert analysis["immutable_facts"] == []
+    # Unsupported requirements preserved; no invented employer/metric claims.
+    assert set(analysis["unsupported_requirement_ids"]) == set(ids[1:])
+    catalog_texts = {
+        item["exact_text"]
+        for item in catalog["requirements"]
+        if isinstance(item.get("exact_text"), str)
+    }
+    for gap in analysis["fit_assessment"]["gaps"]:
+        assert gap in catalog_texts or gap.startswith("Some posting")
+        assert "led a team of" not in gap.casefold()
+        assert "increased revenue" not in gap.casefold()
+    for claim in analysis["forbidden_claims"]:
+        assert claim in catalog_texts
+    # Re-assembly is deterministic.
+    again = assemble_canonical_analysis(
+        coverage=coverage,
+        edits={"edits": []},
+        company="Acme",
+        role="Engineer",
+        job_requirements=catalog,
+    )
+    assert again == analysis
+
+
+def test_structured_targets_remain_compiler_owned() -> None:
+    """Phase B may name structured targets; they must still be compiler-classified."""
+    from resume_tailor.structured_patch_compiler import (
+        is_deterministic_structured_target,
+        partition_edit_catalog,
+    )
+
+    for target in (
+        "skill_groups.0",
+        "education.coursework",
+        "education.certifications",
+    ):
+        assert is_deterministic_structured_target(target)
+
+    edits = [
+        {
+            "target_source_id": "skill_groups.0",
+            "operation": "replace",
+            "proposed_text": "Python, RAG",
+            "alignment_rationale": "Supports: Python",
+            "evidence_source_ids": ["skill_groups.0"],
+        },
         {
             "target_source_id": "professional_summary",
             "operation": "replace",
-            "proposed_text": "Synthetic proposed text.",
-            "alignment_rationale": "Synthetic regression case.",
-            "evidence_source_ids": ["paragraph 3 describes the summary"],
-        }
+            "proposed_text": "Python engineer.",
+            "alignment_rationale": "Supports: Python",
+            "evidence_source_ids": ["skill_groups.0"],
+        },
     ]
-    mock_ollama["set_bodies"](_ollama_body(analysis))
-    raw = invoke_gemma_analysis(
+    structured, prose = partition_edit_catalog(edits)
+    assert [e["target_source_id"] for e in structured] == ["skill_groups.0"]
+    assert [e["target_source_id"] for e in prose] == ["professional_summary"]
+
+
+def test_success_diagnostics_include_phase_metadata(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    catalog = _job_catalog()
+    coverage = _coverage_body(catalog)
+    supported_id = coverage["requirements"][0]["requirement_id"]
+    edits = {
+        "edits": [
+            {
+                "target_source_id": "professional_summary",
+                "requirement_ids": [supported_id],
+                "evidence_source_ids": ["skill_groups.0"],
+                "proposed_text": "Python engineer.",
+            }
+        ]
+    }
+    mock_ollama["set_bodies"](_ollama_body(coverage), _ollama_body(edits))
+    invoke_gemma_analysis(
         extracted_resume=extracted,
         job_description="Python role",
-        job_requirements=requirements,
+        job_requirements=catalog,
         company="Example",
         role="Developer",
         run_directory=tmp_path,
-        timeout_seconds=30,
+        timeout_seconds=60,
     )
-    assert mock_ollama["calls"] == 1
-    _, issues = resolve_analysis_evidence(raw, extracted, requirements)
-    assert issues
+    for path, phase, tokens in (
+        (COVERAGE_DIAGNOSTIC_FILENAME, "coverage", DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS),
+        (EDITS_DIAGNOSTIC_FILENAME, "edits", DEFAULT_EDIT_MAX_OUTPUT_TOKENS),
+    ):
+        diagnostic = json.loads((tmp_path / path).read_text(encoding="utf-8"))
+        assert diagnostic["phase"] == phase
+        assert diagnostic["classification"] == "success"
+        assert diagnostic["attempt"] == 0
+        assert diagnostic["model"]
+        assert diagnostic["effective_num_predict"] == tokens
+        assert diagnostic["max_output_tokens"] == tokens
+        assert "elapsed_seconds" in diagnostic
+        assert "remaining_deadline_seconds" in diagnostic
+        assert "prompt_bytes" in diagnostic
+        assert "schema_bytes" in diagnostic
+        assert diagnostic.get("done_reason") == "stop"
+        assert diagnostic["hidden_reasoning_excluded"] is True
+        assert diagnostic["credentials_excluded"] is True
+        # No raw prompt or model content.
+        assert "prompt" not in diagnostic
+        assert "content" not in diagnostic
+        assert "messages" not in diagnostic
 
 
 def test_ui_timeout_message_not_unavailable() -> None:

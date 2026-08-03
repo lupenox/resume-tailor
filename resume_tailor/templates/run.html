@@ -554,7 +554,7 @@
             {% elif run.failure_kind in ["gemma_model_unavailable", "gemma_ollama_internal", "gemma_connection", "gemma_response_too_large", "gemma_transport", "gemma_inner_analysis", "gemma_structured_output"] %}
               <div class="alert alert-warning">
                 <strong>Gemma Local analysis failure</strong>
-                <span>Local Gemma analysis stopped safely. Sanitized diagnostics may be preserved under gemma-analysis-* filenames. No automatic provider fallback was attempted.</span>
+                <span>Local Gemma analysis stopped safely during requirement mapping or edit planning. Sanitized phase diagnostics may be preserved under gemma-analysis-coverage-* or gemma-analysis-edits-* filenames. No automatic provider fallback was attempted.</span>
               </div>
             {% elif run.failure_kind == "analysis_provider" %}
               <div class="alert alert-warning">
