@@ -10,6 +10,7 @@ from .antigravity_writer import (
     _write_response_metadata,
     approved_edit_catalog,
 )
+from .character_budget import CHARACTER_COUNTING_CONTRACT
 from .evidence import changed_content_ids, content_values
 from .schemas import validate_payload
 from .utilities import (
@@ -115,6 +116,9 @@ FORBIDDEN CLAIMS
 CONTENT BUDGETS
 {json.dumps(budgets, ensure_ascii=False, indent=2)}
 
+CHARACTER COUNTING CONTRACT
+{CHARACTER_COUNTING_CONTRACT}
+
 LOCALLY VALIDATED CODEX QA ISSUE CATALOG
 BEGIN_QA_ISSUES
 {json.dumps(qa_result['issues'], ensure_ascii=False, indent=2)}
@@ -133,7 +137,7 @@ NON-NEGOTIABLE RULES
 - Do not change contact information, dates, links, section structure, project
   count, bullet count, labels, names, employers, institutions, or template geometry.
 - Preserve source-supported technologies and all immutable numeric claims.
-- Respect every content budget.
+- Respect every content budget under the supplied character-counting contract.
 - Return complete with the full revised resume only if the bounded corrections
   can be made safely. Otherwise return cannot_apply for one supplied issue ID.
 - Use technical_failure only for a genuine execution or output failure.

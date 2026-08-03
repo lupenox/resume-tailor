@@ -988,3 +988,44 @@ def test_url_pipeline_continues_after_explicit_confirmation(
         'Codex analysis: type "approve" to continue: ',
         'Tailored content diff: type "approve" to continue: ',
     ]
+
+
+def test_initial_generation_metadata_preserves_sanitized_budget_repair(
+    tmp_path: Path,
+) -> None:
+    tailored_path = tmp_path / "tailored-content.initial.json"
+    tailored_path.write_text('{"synthetic":true}', encoding="utf-8")
+    repair = {
+        "attempted": True,
+        "maximum_attempts": 1,
+        "attempt_count": 1,
+        "outcome": "PASS",
+        "validation_path": "pass",
+        "violations": [
+            {
+                "edit_id": "edit.001",
+                "target_source_id": "professional_summary",
+                "actual_characters": 194,
+                "maximum_characters": 193,
+            }
+        ],
+    }
+
+    initial, deterministic_only = cli_module._initial_generation_metadata(
+        response_metadata={
+            "provider": "gemma",
+            "runtime": "ollama",
+            "model": "resume-tailor-gemma",
+            "ollama_invoked": True,
+            "response_envelope_type": "ollama-chat-message-content-json",
+            "output_format": "json-schema",
+            "budget_repair": repair,
+        },
+        writer_provider="ollama",
+        ollama_model="resume-tailor-gemma",
+        tailored_content_path=tailored_path,
+    )
+
+    assert deterministic_only is False
+    assert initial["budget_repair"] == repair
+    assert initial["tailored_content"]["sha256"] == sha256_file(tailored_path)

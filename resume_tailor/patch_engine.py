@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from .antigravity_writer import approved_edit_catalog
+from .character_budget import (
+    canonicalize_budget_text,
+    compose_rendered_text,
+    count_budget_characters,
+    mutable_text_from_composite_proposal,
+)
 from .evidence import _NUMBER_RE, changed_content_ids
 from .revision import approved_revision_targets
 from .schemas import validate_payload, validate_resume_content_payload
@@ -48,7 +54,7 @@ def duplicate_catalog_target_ids(catalog: list[dict[str, Any]]) -> list[str]:
 
 def _canonical_unicode(value: str) -> str:
     """Normalize canonically equivalent Unicode sequences for identity checks."""
-    return unicodedata.normalize("NFC", value)
+    return canonicalize_budget_text(value)
 
 
 def _normalized_claim_text(value: str) -> str:
@@ -87,6 +93,41 @@ class TargetDescriptor:
     proposed_text: str
     alignment_rationale: str
     evidence_source_ids: list[str]
+
+
+@dataclass(frozen=True)
+class CharacterBudgetViolation:
+    """Sanitized details for one hard rendered-character budget violation."""
+
+    edit_id: str
+    target_source_id: str
+    actual_characters: int
+    maximum_characters: int
+
+
+class PatchCharacterBudgetError(OllamaTailoringContractError):
+    """One or more patches exceed authenticated hard character budgets."""
+
+    validation_path = "character_budget"
+
+    def __init__(self, violations: list[CharacterBudgetViolation]) -> None:
+        if not violations:
+            raise ValueError("At least one character-budget violation is required.")
+        self.violations = tuple(violations)
+        if len(violations) == 1:
+            violation = violations[0]
+            message = (
+                f"Patch for {violation.edit_id} "
+                f"({violation.actual_characters} chars) exceeds target budget "
+                f"of {violation.maximum_characters}."
+            )
+        else:
+            ids = [violation.edit_id for violation in violations]
+            message = (
+                "Patches exceed authenticated target character budgets: "
+                f"{ids}."
+            )
+        super().__init__(message)
 
 
 def parse_target_source_id(
@@ -192,12 +233,11 @@ def resolve_target_descriptor(
     evidence_ids = edit.get("evidence_source_ids", [])
 
     kind, container, key, label = parse_target_source_id(target_id, master_content)
-    current_mutable_text = str(container[key])
-
-    if kind == "composite_labelled":
-        exact_rendered_existing_text = f"{label}: {current_mutable_text}"
-    else:
-        exact_rendered_existing_text = current_mutable_text
+    current_mutable_text = canonicalize_budget_text(str(container[key]))
+    exact_rendered_existing_text = compose_rendered_text(
+        current_mutable_text,
+        immutable_label=label if kind == "composite_labelled" else None,
+    )
 
     budgets = {
         p["content_id"]: p["content_budget"]["maximum_characters"]
@@ -248,14 +288,16 @@ def mutable_proposed_text(
             f"{descriptor.target_source_id!r} missing or invalid composite label/body"
         )
 
-    stripped = proposed.strip()
-    colon_index = stripped.find(":")
-    if colon_index == -1:
-        return proposed
-
-    candidate_prefix = stripped[:colon_index]
-    if _canonical_unicode(candidate_prefix) == _canonical_unicode(descriptor.label):
-        body = stripped[colon_index + 1:].lstrip()
+    try:
+        body = mutable_text_from_composite_proposal(
+            proposed,
+            immutable_label=descriptor.label,
+        )
+    except (TypeError, ValueError) as exc:
+        raise TargetResolutionError(
+            f"{descriptor.target_source_id!r} missing or invalid composite label/body"
+        ) from exc
+    if body != proposed:
         if not body:
             raise TargetResolutionError(
                 f"Approved edit {descriptor.edit_id} for"
@@ -263,7 +305,6 @@ def mutable_proposed_text(
                 f" text after its authenticated label prefix."
             )
         return body
-
     return proposed
 
 
@@ -366,12 +407,14 @@ def _validate_replacement_text(
     evidence_texts: list[str],
     forbidden_claims: list[Any],
     operation: str | None = None,
+    enforce_character_budget: bool = True,
 ) -> str:
     if not isinstance(replacement_text, str) or not replacement_text.strip():
         raise OllamaTailoringContractError(
             f"Patch for {edit_id} has empty replacement_text."
         )
-    if _canonical_unicode(replacement_text) == _canonical_unicode(
+    canonical_replacement = canonicalize_budget_text(replacement_text)
+    if canonical_replacement == _canonical_unicode(
         descriptor.current_mutable_text
     ):
         raise OllamaTailoringContractError(
@@ -379,7 +422,9 @@ def _validate_replacement_text(
         )
 
     if descriptor.kind == "composite_labelled" and descriptor.label is not None:
-        if normalized_text(replacement_text).startswith(normalized_text(descriptor.label)):
+        if normalized_text(canonical_replacement).startswith(
+            normalized_text(descriptor.label)
+        ):
             raise OllamaTailoringContractError(
                 f"Patch for {edit_id} illegally contains label {descriptor.label!r} "
                 "inside replacement text."
@@ -387,11 +432,16 @@ def _validate_replacement_text(
 
     effective_operation = operation or descriptor.operation
     if effective_operation == "append":
-        if not replacement_text.startswith(descriptor.current_mutable_text):
+        canonical_current = canonicalize_budget_text(
+            descriptor.current_mutable_text
+        )
+        if not canonical_replacement.startswith(canonical_current):
             raise OllamaTailoringContractError(
                 f"Append patch for {edit_id} does not preserve the original prefix."
             )
-        if len(replacement_text) <= len(descriptor.current_mutable_text):
+        if count_budget_characters(canonical_replacement) <= count_budget_characters(
+            canonical_current
+        ):
             raise OllamaTailoringContractError(
                 f"Append patch for {edit_id} did not add a nonempty suffix."
             )
@@ -400,20 +450,38 @@ def _validate_replacement_text(
             f"Patch for {edit_id} uses unsupported operation {effective_operation!r}."
         )
 
-    rendered_text = (
-        f"{descriptor.label}: {replacement_text}"
-        if descriptor.kind == "composite_labelled" and descriptor.label is not None
-        else replacement_text
+    immutable_label = (
+        descriptor.label if descriptor.kind == "composite_labelled" else None
     )
-    if len(rendered_text) > descriptor.maximum_rendered_characters:
+    rendered_text = compose_rendered_text(
+        canonical_replacement,
+        immutable_label=immutable_label,
+    )
+    actual_characters = count_budget_characters(rendered_text)
+    budget_violation = (
+        CharacterBudgetViolation(
+            edit_id=edit_id,
+            target_source_id=descriptor.target_source_id,
+            actual_characters=actual_characters,
+            maximum_characters=descriptor.maximum_rendered_characters,
+        )
+        if actual_characters > descriptor.maximum_rendered_characters
+        else None
+    )
+    if budget_violation is not None and enforce_character_budget:
+        raise PatchCharacterBudgetError([budget_violation])
+
+    if canonical_replacement != canonical_replacement.strip():
         raise OllamaTailoringContractError(
-            f"Patch for {edit_id} ({len(rendered_text)} chars) exceeds target budget "
-            f"of {descriptor.maximum_rendered_characters}."
+            f"Patch for {edit_id} contains leading or trailing whitespace. "
+            "No content was silently stripped."
         )
 
     authorized_text = " ".join(evidence_texts)
     authenticated_metrics = set(_NUMBER_RE.findall(authorized_text))
-    new_metrics = set(_NUMBER_RE.findall(replacement_text)) - authenticated_metrics
+    new_metrics = (
+        set(_NUMBER_RE.findall(canonical_replacement)) - authenticated_metrics
+    )
     if new_metrics:
         raise OllamaTailoringContractError(
             f"Patch for {edit_id} introduces unauthenticated numeric claims: "
@@ -423,18 +491,18 @@ def _validate_replacement_text(
     _validate_structured_list_items(
         edit_id=edit_id,
         target_source_id=descriptor.target_source_id,
-        replacement_text=replacement_text,
+        replacement_text=canonical_replacement,
         evidence_texts=evidence_texts,
     )
 
     for forbidden in forbidden_claims:
         if not isinstance(forbidden, str):
             continue
-        if _contains_forbidden_claim(replacement_text, forbidden):
+        if _contains_forbidden_claim(canonical_replacement, forbidden):
             raise OllamaTailoringContractError(
                 f"Patch for {edit_id} contains a forbidden claim."
             )
-    return replacement_text
+    return canonical_replacement
 
 
 def apply_patch_to_target(
@@ -533,6 +601,8 @@ def validate_and_apply_patches(
 
     seen_edit_ids: set[str] = set()
     seen_target_ids: set[str] = set()
+    validated_patches: list[dict[str, Any]] = []
+    budget_violations: list[CharacterBudgetViolation] = []
     forbidden_claims = approved_analysis.get("forbidden_claims", [])
     if not isinstance(forbidden_claims, list):
         forbidden_claims = []
@@ -572,17 +642,27 @@ def validate_and_apply_patches(
                 f"approved operation {descriptor.operation!r}."
             )
 
-        _validate_replacement_text(
-            edit_id=edit_id,
-            descriptor=descriptor,
-            replacement_text=patch.get("replacement_text"),
-            evidence_texts=authorized_evidence_texts_for_edit(
-                edit,
-                descriptor,
-                extracted_resume,
-            ),
-            forbidden_claims=forbidden_claims,
-        )
+        try:
+            canonical_replacement = _validate_replacement_text(
+                edit_id=edit_id,
+                descriptor=descriptor,
+                replacement_text=patch.get("replacement_text"),
+                evidence_texts=authorized_evidence_texts_for_edit(
+                    edit,
+                    descriptor,
+                    extracted_resume,
+                ),
+                forbidden_claims=forbidden_claims,
+            )
+        except PatchCharacterBudgetError as exc:
+            budget_violations.extend(exc.violations)
+            continue
+        canonical_patch = copy.deepcopy(patch)
+        canonical_patch["replacement_text"] = canonical_replacement
+        validated_patches.append(canonical_patch)
+
+    if budget_violations:
+        raise PatchCharacterBudgetError(budget_violations)
 
     if seen_edit_ids != set(descriptors_by_edit_id):
         raise OllamaTailoringContractError(
@@ -591,7 +671,7 @@ def validate_and_apply_patches(
 
     original_digest = canonical_digest(master_content)
     tailored_content = copy.deepcopy(master_content)
-    for patch in patches:
+    for patch in validated_patches:
         apply_patch_to_target(
             patch["target_source_id"],
             patch["replacement_text"],
@@ -733,6 +813,7 @@ def validate_and_apply_revision_patches(
         forbidden_claims = []
     seen_issue_ids: set[str] = set()
     seen_target_ids: set[str] = set()
+    validated_patches: list[dict[str, Any]] = []
 
     for index, patch in enumerate(patches):
         if not isinstance(patch, dict):
@@ -763,7 +844,7 @@ def validate_and_apply_revision_patches(
         descriptor = descriptors_by_target[target_id]
         edit = catalog_by_target[target_id]
         try:
-            _validate_replacement_text(
+            canonical_replacement = _validate_replacement_text(
                 edit_id=issue_id,
                 descriptor=descriptor,
                 replacement_text=patch.get("replacement_text"),
@@ -777,6 +858,9 @@ def validate_and_apply_revision_patches(
             )
         except OllamaTailoringContractError as exc:
             raise OllamaRevisionContractError(str(exc)) from exc
+        canonical_patch = copy.deepcopy(patch)
+        canonical_patch["replacement_text"] = canonical_replacement
+        validated_patches.append(canonical_patch)
 
     if seen_target_ids != set(target_map):
         raise OllamaRevisionContractError(
@@ -785,7 +869,7 @@ def validate_and_apply_revision_patches(
 
     current_digest = canonical_digest(current_tailored_content)
     revised_content = copy.deepcopy(current_tailored_content)
-    for patch in patches:
+    for patch in validated_patches:
         apply_patch_to_target(
             patch["target_source_id"],
             patch["replacement_text"],

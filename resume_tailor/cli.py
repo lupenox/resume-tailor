@@ -525,6 +525,9 @@ def _initial_generation_metadata(
         initial["response"] = dict(response)
     if execution:
         initial["execution"] = dict(execution)
+    budget_repair = response_metadata.get("budget_repair")
+    if isinstance(budget_repair, dict):
+        initial["budget_repair"] = dict(budget_repair)
     return initial, deterministic_only
 
 

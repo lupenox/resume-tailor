@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .antigravity_writer import approved_edit_catalog, preflight_tailoring_inputs
+from .character_budget import (
+    CHARACTER_COUNTING_CONTRACT,
+    canonicalize_budget_text,
+    count_budget_characters,
+    mutable_character_capacity,
+)
 from .ollama_capabilities import (
     OllamaBudget,
     OllamaModelCapabilities,
@@ -17,7 +23,10 @@ from .ollama_capabilities import (
 from .ollama_probe import probe_structured_output_support
 from .ollama_transport import OLLAMA_BASE_URL, run_ollama_request
 from .patch_engine import (
+    CharacterBudgetViolation,
+    PatchCharacterBudgetError,
     TargetResolutionError,
+    _validate_replacement_text,
     authenticated_metrics_for_edit,
     duplicate_catalog_target_ids,
     authorized_evidence_texts_for_edit,
@@ -71,6 +80,14 @@ OLLAMA_TAILORING_TRANSPORT_SCHEMA_FILENAME = (
     "ollama-tailoring-transport.schema.json"
 )
 OLLAMA_REVISION_TRANSPORT_SCHEMA_FILENAME = "ollama-revision-transport.schema.json"
+OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME = "ollama-budget-repair-response.json"
+OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME = (
+    "ollama-budget-repair-response-envelope.json"
+)
+OLLAMA_BUDGET_REPAIR_TRANSPORT_SCHEMA_FILENAME = (
+    "ollama-budget-repair-transport.schema.json"
+)
+MAXIMUM_BUDGET_REPAIR_ATTEMPTS = 1
 
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 
@@ -103,6 +120,41 @@ def _sanitized_execution_metadata(
         for field in _EXECUTION_METADATA_FIELDS
         if field in execution
     }
+
+
+def _sanitized_budget_repair_metadata(
+    repair: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy only bounded, content-free repair telemetry."""
+    result: dict[str, Any] = {
+        "attempted": repair.get("attempted") is True,
+        "provider_invoked": repair.get("provider_invoked") is True,
+        "maximum_attempts": MAXIMUM_BUDGET_REPAIR_ATTEMPTS,
+        "attempt_count": repair.get("attempt_count", 0),
+        "outcome": repair.get("outcome"),
+        "validation_path": repair.get("validation_path"),
+    }
+    violations = repair.get("violations")
+    if isinstance(violations, list):
+        result["violations"] = [
+            {
+                "edit_id": item.get("edit_id"),
+                "target_source_id": item.get("target_source_id"),
+                "actual_characters": item.get("actual_characters"),
+                "maximum_characters": item.get("maximum_characters"),
+            }
+            for item in violations
+            if isinstance(item, Mapping)
+        ]
+    for field in ("response", "schema"):
+        reference = repair.get(field)
+        if isinstance(reference, Mapping):
+            result[field] = {
+                key: reference.get(key)
+                for key in ("filename", "sha256")
+                if key in reference
+            }
+    return result
 
 
 def validate_ollama_model_name(value: str) -> str:
@@ -387,6 +439,17 @@ def build_ollama_tailoring_prompt(
             descriptor = resolve_target_descriptor(
                 edit, master_content, extracted_resume
             )
+            mutable_proposal = canonicalize_budget_text(
+                mutable_proposed_text(edit, descriptor)
+            )
+            maximum_replacement_characters = mutable_character_capacity(
+                descriptor.maximum_rendered_characters,
+                immutable_label=(
+                    descriptor.label
+                    if descriptor.kind == "composite_labelled"
+                    else None
+                ),
+            )
             target_descriptors.append(
                 {
                     "edit_id": descriptor.edit_id,
@@ -396,7 +459,14 @@ def build_ollama_tailoring_prompt(
                     "exact_rendered_existing_text": descriptor.exact_rendered_existing_text,
                     "immutable_label": descriptor.label,
                     "maximum_rendered_characters": descriptor.maximum_rendered_characters,
-                    "mutable_proposed_body": mutable_proposed_text(edit, descriptor),
+                    "maximum_replacement_characters": maximum_replacement_characters,
+                    "current_replacement_characters": count_budget_characters(
+                        descriptor.current_mutable_text
+                    ),
+                    "mutable_proposed_body": mutable_proposal,
+                    "proposed_replacement_characters": count_budget_characters(
+                        mutable_proposal
+                    ),
                     "alignment_rationale": descriptor.alignment_rationale,
                     "evidence_source_ids": [
                         eid for eid in descriptor.evidence_source_ids
@@ -450,6 +520,9 @@ AUTHORIZED SOURCE EVIDENCE FOR THOSE EDITS
 PER-TARGET AUTHENTICATED METRICS
 Each target descriptor contains only metrics authenticated by that target and its cited evidence.
 
+CHARACTER COUNTING CONTRACT
+{CHARACTER_COUNTING_CONTRACT}
+
 IMMUTABLE FACTS
 {_canonical_json(approved_analysis['immutable_facts'])}
 
@@ -465,7 +538,9 @@ AUTHORING RULES
    - For "replace": replacement_text is the new complete mutable text.
    - For "append": replacement_text MUST start with the exact mutable_current_body prefix and add a nonempty suffix.
 3. STAY WITHIN CHARACTER BUDGETS.
-   - The rendered text (including label if composite) MUST NOT exceed maximum_rendered_characters.
+   - replacement_text MUST NOT exceed maximum_replacement_characters.
+   - The local validator reconstructs immutable labels and enforces the unchanged
+     maximum_rendered_characters hard limit using the same counting contract.
 4. NO UNSUPPORTED CLAIMS OR NEW METRICS.
    - Do not introduce any new numbers or metrics not present in that target descriptor's authenticated_metrics.
    - Do not introduce any unsupported technology or qualification lacking verbatim source evidence.
@@ -621,6 +696,7 @@ def _write_metadata(
     generation: dict[str, Any] | None = None,
     probe: dict[str, Any] | None = None,
     execution: Mapping[str, Any] | None = None,
+    budget_repair: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_bytes = prompt.encode("utf-8")
     metadata = {
@@ -659,6 +735,10 @@ def _write_metadata(
     }
     if execution is not None:
         metadata["execution"] = _sanitized_execution_metadata(execution)
+    if budget_repair is not None:
+        metadata["budget_repair"] = _sanitized_budget_repair_metadata(
+            budget_repair
+        )
     atomic_write_json(run_directory / metadata_filename, metadata)
     return metadata
 
@@ -885,6 +965,9 @@ def build_ollama_revision_prompt(
                 current_tailored_content,
                 extracted_resume,
             )
+            mutable_proposal = canonicalize_budget_text(
+                mutable_proposed_text(edit, descriptor)
+            )
             target_descriptors.append(
                 {
                     "target_source_id": content_id,
@@ -893,7 +976,18 @@ def build_ollama_revision_prompt(
                     "exact_rendered_existing_text": descriptor.exact_rendered_existing_text,
                     "immutable_label": descriptor.label,
                     "maximum_rendered_characters": descriptor.maximum_rendered_characters,
-                    "mutable_proposed_body": mutable_proposed_text(edit, descriptor),
+                    "maximum_replacement_characters": mutable_character_capacity(
+                        descriptor.maximum_rendered_characters,
+                        immutable_label=(
+                            descriptor.label
+                            if descriptor.kind == "composite_labelled"
+                            else None
+                        ),
+                    ),
+                    "mutable_proposed_body": mutable_proposal,
+                    "proposed_replacement_characters": count_budget_characters(
+                        mutable_proposal
+                    ),
                     "authenticated_metrics": authenticated_metrics_for_edit(
                         edit, descriptor, extracted_resume
                     ),
@@ -931,6 +1025,9 @@ IMMUTABLE FACTS
 FORBIDDEN CLAIMS
 {_canonical_json(approved_analysis.get('forbidden_claims', []))}
 
+CHARACTER COUNTING CONTRACT
+{CHARACTER_COUNTING_CONTRACT}
+
 AUTHORING RULES
 1. AUTHOR ONLY MUTABLE REVISION TARGET VALUES.
    - Author exactly one bounded replacement for every authorized target.
@@ -940,7 +1037,8 @@ AUTHORING RULES
 3. PRESERVE EVIDENCE AND BUDGET BOUNDARIES.
    - Do not add a number absent from the target's authenticated_metrics.
    - Do not add an unsupported skill absent from authorized_source_evidence.
-   - Stay within maximum_rendered_characters, including immutable labels.
+   - replacement_text MUST stay within maximum_replacement_characters.
+   - Local code reconstructs immutable labels and enforces the unchanged rendered limit.
 4. REQUIRED STRUCTURED ENVELOPE.
    - Set "authorization_sha256" to "{authorization_sha256}".
    - Return status "complete" with one patch per authorized target.
@@ -1009,6 +1107,445 @@ def _resolve_initial_payload(
         extracted_resume=extracted_resume or {},
         approved_analysis=approved_analysis,
     )
+
+
+def _budget_repair_violation_metadata(
+    violations: tuple[CharacterBudgetViolation, ...],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "edit_id": violation.edit_id,
+            "target_source_id": violation.target_source_id,
+            "actual_characters": violation.actual_characters,
+            "maximum_characters": violation.maximum_characters,
+        }
+        for violation in violations
+    ]
+
+
+def _budget_repair_summary(
+    *,
+    violations: tuple[CharacterBudgetViolation, ...],
+    outcome: str,
+    validation_path: str,
+    provider_invoked: bool,
+    response_path: Path | None = None,
+    schema_path: Path | None = None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "attempted": provider_invoked,
+        "provider_invoked": provider_invoked,
+        "maximum_attempts": MAXIMUM_BUDGET_REPAIR_ATTEMPTS,
+        "attempt_count": 1 if provider_invoked else 0,
+        "outcome": outcome,
+        "validation_path": validation_path,
+        "violations": _budget_repair_violation_metadata(violations),
+    }
+    if response_path is not None and response_path.is_file():
+        summary["response"] = {
+            "filename": response_path.name,
+            "sha256": sha256_file(response_path),
+        }
+    if schema_path is not None and schema_path.is_file():
+        summary["schema"] = {
+            "filename": schema_path.name,
+            "sha256": sha256_file(schema_path),
+        }
+    return summary
+
+
+def _budget_repair_summary_from_artifacts(
+    *,
+    run_directory: Path,
+    violations: tuple[CharacterBudgetViolation, ...],
+    fallback_validation_path: str,
+) -> dict[str, Any]:
+    response_path = run_directory / OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME
+    schema_path = run_directory / OLLAMA_BUDGET_REPAIR_TRANSPORT_SCHEMA_FILENAME
+    metadata = load_ollama_response_metadata(
+        run_directory,
+        filename=OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME,
+    )
+    validation_result = (
+        metadata.get("validation_result") if isinstance(metadata, dict) else None
+    )
+    validation_path = (
+        metadata.get("validation_path") if isinstance(metadata, dict) else None
+    )
+    return _budget_repair_summary(
+        violations=violations,
+        outcome=(
+            validation_result
+            if isinstance(validation_result, str)
+            else "REJECTED"
+        ),
+        validation_path=(
+            validation_path
+            if isinstance(validation_path, str)
+            else fallback_validation_path
+        ),
+        provider_invoked=metadata is not None,
+        response_path=response_path,
+        schema_path=schema_path,
+    )
+
+
+def _tailoring_validation_path(exc: ModelError, *, default: str) -> str:
+    if isinstance(exc, OllamaCannotApplyError):
+        return "cannot_apply"
+    if isinstance(exc, OllamaTechnicalFailureError):
+        return "technical_failure"
+    return str(getattr(exc, "validation_path", default))
+
+
+def build_ollama_budget_repair_prompt(
+    *,
+    violations: tuple[CharacterBudgetViolation, ...],
+    prose_patches: list[dict[str, Any]],
+    prose_edits: list[dict[str, Any]],
+    master_content: dict[str, Any],
+    extracted_resume: dict[str, Any],
+    approved_analysis: dict[str, Any],
+    company: str,
+    role: str,
+) -> tuple[str, list[dict[str, Any]], str]:
+    """Build one focused, prose-only hard-budget repair request."""
+    if not violations:
+        raise OllamaTailoringContractError(
+            "A focused budget repair requires at least one failing prose patch."
+        )
+    edits_by_id = {edit["edit_id"]: edit for edit in prose_edits}
+    patches_by_id = {
+        patch.get("edit_id"): patch
+        for patch in prose_patches
+        if isinstance(patch, dict) and isinstance(patch.get("edit_id"), str)
+    }
+    failing_ids = {violation.edit_id for violation in violations}
+    repair_edits = [edit for edit in prose_edits if edit["edit_id"] in failing_ids]
+    if len(repair_edits) != len(failing_ids):
+        raise OllamaTailoringContractError(
+            "A character-budget violation references an unknown prose edit."
+        )
+
+    repair_targets: list[dict[str, Any]] = []
+    for violation in violations:
+        edit = edits_by_id.get(violation.edit_id)
+        patch = patches_by_id.get(violation.edit_id)
+        if edit is None or patch is None:
+            raise OllamaTailoringContractError(
+                "A focused budget repair could not resolve its approved patch."
+            )
+        target_id = edit.get("target_source_id")
+        if (
+            not isinstance(target_id, str)
+            or target_id != violation.target_source_id
+            or is_deterministic_structured_target(target_id)
+        ):
+            raise OllamaTailoringContractError(
+                "Deterministic structured targets cannot enter Gemma budget repair."
+            )
+        if (
+            patch.get("target_source_id") != target_id
+            or patch.get("operation") != edit.get("operation", "replace")
+        ):
+            raise OllamaTailoringContractError(
+                "A focused budget repair patch does not match its approval."
+            )
+        current_proposal = patch.get("replacement_text")
+        if not isinstance(current_proposal, str):
+            raise OllamaTailoringContractError(
+                "A focused budget repair patch has no proposed text."
+            )
+        try:
+            descriptor = resolve_target_descriptor(
+                edit,
+                master_content,
+                extracted_resume,
+            )
+            maximum_replacement_characters = mutable_character_capacity(
+                descriptor.maximum_rendered_characters,
+                immutable_label=(
+                    descriptor.label
+                    if descriptor.kind == "composite_labelled"
+                    else None
+                ),
+            )
+        except (TargetResolutionError, ValueError) as exc:
+            raise OllamaTailoringContractError(
+                "A focused budget repair target cannot be resolved safely."
+            ) from exc
+        if maximum_replacement_characters != violation.maximum_characters:
+            raise OllamaTailoringContractError(
+                "A focused budget repair hard limit changed after validation."
+            )
+        evidence_texts = authorized_evidence_texts_for_edit(
+            edit,
+            descriptor,
+            extracted_resume,
+        )
+        forbidden_claims = approved_analysis.get("forbidden_claims", [])
+        if not isinstance(forbidden_claims, list):
+            forbidden_claims = []
+        canonical_proposal = _validate_replacement_text(
+            edit_id=violation.edit_id,
+            descriptor=descriptor,
+            replacement_text=current_proposal,
+            evidence_texts=evidence_texts,
+            forbidden_claims=forbidden_claims,
+            enforce_character_budget=False,
+        )
+        repair_prompt_edit = copy.deepcopy(edit)
+        repair_prompt_edit["evidence_source_ids"] = [
+            source_id
+            for source_id in descriptor.evidence_source_ids
+            if not is_deterministic_structured_target(source_id)
+        ]
+        repair_source_catalog = _authorized_source_catalog(
+            extracted_resume,
+            [repair_prompt_edit],
+        )
+        repair_targets.append(
+            {
+                "edit_id": violation.edit_id,
+                "target_source_id": target_id,
+                "operation": edit.get("operation", "replace"),
+                "current_proposed_text": canonical_proposal,
+                "current_proposed_characters": count_budget_characters(
+                    canonical_proposal
+                ),
+                "maximum_replacement_characters": (
+                    maximum_replacement_characters
+                ),
+                "required_evidence_source_ids": [
+                    block["source_id"] for block in repair_source_catalog
+                ],
+                "authorized_source_evidence": repair_source_catalog,
+                "authenticated_metrics": authenticated_metrics_for_edit(
+                    edit,
+                    descriptor,
+                    extracted_resume,
+                ),
+                "approved_alignment_rationale": descriptor.alignment_rationale,
+            }
+        )
+
+    repair_catalog_sha256 = canonical_digest(repair_edits)
+    prompt = f"""Repair only the supplied over-budget prose patches. Return exactly one
+JSON object matching the supplied structured-output schema. Do not return
+Markdown, commentary, planning, or a complete resume. This is focused budget
+repair attempt 1 of {MAXIMUM_BUDGET_REPAIR_ATTEMPTS}; no further repair is allowed.
+
+TARGET
+Company: {company}
+Role: {role}
+
+REPAIR CATALOG SHA256 DIGEST
+{repair_catalog_sha256}
+
+FAILING PROSE PATCHES, HARD LIMITS, AND AUTHORIZED EVIDENCE
+{_canonical_json(repair_targets)}
+
+FORBIDDEN CLAIMS
+{_canonical_json(approved_analysis.get('forbidden_claims', []))}
+
+CHARACTER COUNTING CONTRACT
+{CHARACTER_COUNTING_CONTRACT}
+
+NON-NEGOTIABLE REPAIR RULES
+1. Return exactly one replacement patch for every supplied edit_id and no others.
+2. Preserve the supported meaning of each current_proposed_text while shortening it
+   to at most maximum_replacement_characters under the counting contract.
+3. Do not add claims, technologies, metrics, credentials, experience, scope,
+   seniority, availability, accomplishments, or customer impact.
+4. Use only the supplied authorized_source_evidence and authenticated_metrics.
+5. Do not change edit_id, target_source_id, or operation.
+6. Structured skill groups, coursework, and certifications are Python-owned and
+   must never be returned or edited here.
+7. Set catalog_sha256 to "{repair_catalog_sha256}". Return only the expected patch
+   envelope, or cannot_apply if safe bounded repair is impossible.
+"""
+    return prompt, repair_edits, repair_catalog_sha256
+
+
+def _invoke_ollama_budget_repair(
+    *,
+    violations: tuple[CharacterBudgetViolation, ...],
+    prose_patches: list[dict[str, Any]],
+    prose_edits: list[dict[str, Any]],
+    deterministic_patches: list[dict[str, Any]],
+    full_catalog: list[dict[str, Any]],
+    full_catalog_sha256: str,
+    master_content: dict[str, Any],
+    extracted_resume: dict[str, Any],
+    approved_analysis: dict[str, Any],
+    company: str,
+    role: str,
+    run_directory: Path,
+    timeout_seconds: int,
+    model: str,
+    capabilities: OllamaModelCapabilities,
+    execution: Mapping[str, Any],
+    heartbeat_handler: Callable[[float, bool], None] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    prompt, repair_edits, repair_catalog_sha256 = (
+        build_ollama_budget_repair_prompt(
+            violations=violations,
+            prose_patches=prose_patches,
+            prose_edits=prose_edits,
+            master_content=master_content,
+            extracted_resume=extracted_resume,
+            approved_analysis=approved_analysis,
+            company=company,
+            role=role,
+        )
+    )
+    schema, schema_path = _write_tailoring_patch_transport_schema(
+        run_directory,
+        catalog=repair_edits,
+        catalog_sha256=repair_catalog_sha256,
+        filename=OLLAMA_BUDGET_REPAIR_TRANSPORT_SCHEMA_FILENAME,
+    )
+    probe = probe_structured_output_support(schema)
+    budget = plan_ollama_budget(prompt=prompt, capabilities=capabilities)
+    response_path = run_directory / OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME
+    payload, response_path, generation = _invoke_payload(
+        model=model,
+        prompt=prompt,
+        transport_schema=schema,
+        schema_path=schema_path,
+        response_filename=OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME,
+        metadata_filename=OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME,
+        run_directory=run_directory,
+        timeout_seconds=timeout_seconds,
+        capabilities=capabilities,
+        budget=budget,
+        probe=probe,
+        execution=execution,
+        heartbeat_handler=heartbeat_handler,
+    )
+    try:
+        try:
+            validate_payload(
+                payload,
+                "ollama_tailoring_patch.schema.json",
+                label="Gemma 4 12B budget repair payload",
+            )
+        except ModelError as exc:
+            raise OllamaCanonicalSchemaError(
+                "Gemma 4 12B budget repair failed canonical envelope validation."
+            ) from exc
+
+        status = payload.get("status")
+        repair_ids = {edit["edit_id"] for edit in repair_edits}
+        if status == "cannot_apply":
+            detail = payload["cannot_apply"]
+            if detail["edit_id"] not in repair_ids:
+                raise OllamaEvidenceRejectionError(
+                    "The budget repair returned an unknown approved edit ID."
+                )
+            raise OllamaCannotApplyError(
+                "The local writer could not repair approved "
+                f"{detail['edit_id']} within its hard character budget."
+            )
+        if status == "technical_failure":
+            detail = payload["technical_failure"]
+            raise OllamaTechnicalFailureError(
+                "The local writer budget repair reported technical failure "
+                f"{detail['reason_code']}. Provider prose was omitted."
+            )
+        repair_patches = payload.get("patches")
+        if not isinstance(repair_patches, list):
+            raise OllamaCanonicalSchemaError(
+                "Budget repair patch envelope 'patches' must be an array."
+            )
+        for patch in repair_patches:
+            target_id = patch.get("target_source_id")
+            if isinstance(target_id, str) and is_deterministic_structured_target(
+                target_id
+            ):
+                raise OllamaTailoringContractError(
+                    "Gemma budget repair returned a Python-owned structured target."
+                )
+        ordered_repair = combine_hybrid_patch_payload(
+            deterministic_patches=[],
+            prose_patches=repair_patches,
+            full_catalog=repair_edits,
+            full_catalog_sha256=repair_catalog_sha256,
+        )["patches"]
+        repaired_by_id = {patch["edit_id"]: patch for patch in ordered_repair}
+        repaired_prose_patches = [
+            copy.deepcopy(repaired_by_id.get(patch["edit_id"], patch))
+            for patch in prose_patches
+        ]
+        combined_payload = combine_hybrid_patch_payload(
+            deterministic_patches=deterministic_patches,
+            prose_patches=repaired_prose_patches,
+            full_catalog=full_catalog,
+            full_catalog_sha256=full_catalog_sha256,
+        )
+        tailored = validate_and_apply_patches(
+            payload=combined_payload,
+            master_content=master_content,
+            extracted_resume=extracted_resume,
+            approved_analysis=approved_analysis,
+        )
+    except ModelError as exc:
+        validation_path = _tailoring_validation_path(
+            exc,
+            default="patch_contract",
+        )
+        summary = _budget_repair_summary(
+            violations=violations,
+            outcome="REJECTED",
+            validation_path=validation_path,
+            provider_invoked=True,
+            response_path=response_path,
+            schema_path=schema_path,
+        )
+        _write_metadata(
+            run_directory=run_directory,
+            metadata_filename=OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME,
+            response_path=response_path,
+            schema_path=schema_path,
+            model=model,
+            prompt=prompt,
+            validation_result="REJECTED",
+            validation_path=validation_path,
+            validation_message=str(exc),
+            capabilities=capabilities,
+            budget=budget,
+            generation=generation,
+            probe=probe,
+            execution=execution,
+            budget_repair=summary,
+        )
+        raise
+
+    summary = _budget_repair_summary(
+        violations=violations,
+        outcome="PASS",
+        validation_path=_VALIDATION_PATH_PASS,
+        provider_invoked=True,
+        response_path=response_path,
+        schema_path=schema_path,
+    )
+    _write_metadata(
+        run_directory=run_directory,
+        metadata_filename=OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME,
+        response_path=response_path,
+        schema_path=schema_path,
+        model=model,
+        prompt=prompt,
+        validation_result="PASS",
+        validation_path=_VALIDATION_PATH_PASS,
+        capabilities=capabilities,
+        budget=budget,
+        generation=generation,
+        probe=probe,
+        execution=execution,
+        budget_repair=summary,
+    )
+    return tailored, repaired_prose_patches, summary
 
 
 def invoke_ollama(
@@ -1150,6 +1687,8 @@ def invoke_ollama(
         writer_subset_sha256=prose_catalog_sha256,
         ollama_invoked=True,
     )
+    repair_violations: tuple[CharacterBudgetViolation, ...] = ()
+    repair_summary: dict[str, Any] | None = None
 
     try:
         # The provider grammar omits canonical cross-field assertions. Apply
@@ -1211,19 +1750,50 @@ def invoke_ollama(
         )
 
         # --- Step 11: Validate and apply through the full authoritative path. ---
-        tailored = validate_and_apply_patches(
-            payload=combined_payload,
-            master_content=master_content,
-            extracted_resume=extracted_resume,
-            approved_analysis=approved_analysis,
-        )
+        try:
+            tailored = validate_and_apply_patches(
+                payload=combined_payload,
+                master_content=master_content,
+                extracted_resume=extracted_resume,
+                approved_analysis=approved_analysis,
+            )
+        except PatchCharacterBudgetError as exc:
+            # Exactly one focused prose-only attempt is permitted. The repair
+            # helper reuses the same transport/schema machinery, preserves its
+            # own artifacts, and reruns the complete authoritative transaction.
+            repair_violations = exc.violations
+            tailored, provider_patches, repair_summary = (
+                _invoke_ollama_budget_repair(
+                    violations=repair_violations,
+                    prose_patches=provider_patches,
+                    prose_edits=prose_edits,
+                    deterministic_patches=deterministic_patches,
+                    full_catalog=catalog,
+                    full_catalog_sha256=full_catalog_sha256,
+                    master_content=master_content,
+                    extracted_resume=extracted_resume,
+                    approved_analysis=approved_analysis,
+                    company=company,
+                    role=role,
+                    run_directory=run_directory,
+                    timeout_seconds=timeout_seconds,
+                    model=model,
+                    capabilities=capabilities,
+                    execution=execution,
+                    heartbeat_handler=heartbeat_handler,
+                )
+            )
     except ModelError as exc:
-        if isinstance(exc, OllamaCannotApplyError):
-            validation_path = "cannot_apply"
-        elif isinstance(exc, OllamaTechnicalFailureError):
-            validation_path = "technical_failure"
-        else:
-            validation_path = getattr(exc, "validation_path", "patch_contract")
+        validation_path = _tailoring_validation_path(
+            exc,
+            default="patch_contract",
+        )
+        if repair_violations and repair_summary is None:
+            repair_summary = _budget_repair_summary_from_artifacts(
+                run_directory=run_directory,
+                violations=repair_violations,
+                fallback_validation_path=validation_path,
+            )
         _write_metadata(
             run_directory=run_directory,
             metadata_filename=OLLAMA_RESPONSE_METADATA_FILENAME,
@@ -1239,6 +1809,7 @@ def invoke_ollama(
             generation=generation,
             probe=probe,
             execution=execution,
+            budget_repair=repair_summary,
         )
         raise
 
@@ -1256,6 +1827,7 @@ def invoke_ollama(
         generation=generation,
         probe=probe,
         execution=execution,
+        budget_repair=repair_summary,
     )
     return tailored
 

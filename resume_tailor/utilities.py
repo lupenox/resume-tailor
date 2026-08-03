@@ -644,7 +644,7 @@ def compact_json(value: Any) -> str:
 
 
 def normalized_text(value: str) -> str:
-    return " ".join(value.casefold().split())
+    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
 
 
 def flatten_strings(value: Any) -> Iterable[str]:

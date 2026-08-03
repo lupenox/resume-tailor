@@ -178,6 +178,51 @@ def test_ollama_prompt_uses_approved_plan_not_raw_job_description(
     assert "CATALOG SHA256 DIGEST" in prompt
 
 
+def test_ollama_prompt_and_validator_share_canonical_replacement_limit(
+    master_resume: Path,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _resolved_analysis(
+        extracted,
+        requirements,
+        recommended_edits=[
+            {
+                "target_source_id": "professional_summary",
+                "proposed_text": "Cafe\u0301\r\n  “quoted” value",
+                "alignment_rationale": "Synthetic canonical prompt test.",
+                "evidence_source_ids": ["professional_summary"],
+                "operation": "replace",
+            }
+        ],
+    )
+    prompt = writer.build_ollama_tailoring_prompt(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+    )
+    descriptor_json = prompt.split(
+        "APPROVED EDIT CATALOG & TARGET DESCRIPTORS\n",
+        1,
+    )[1].split("\n\nAUTHORIZED SOURCE EVIDENCE", 1)[0]
+    descriptor = json.loads(descriptor_json)[0]
+    hard_limit = next(
+        paragraph["content_budget"]["maximum_characters"]
+        for paragraph in extracted["paragraphs"]
+        if paragraph["content_id"] == "professional_summary"
+    )
+
+    assert descriptor["mutable_proposed_body"] == "Café\n  “quoted” value"
+    assert descriptor["proposed_replacement_characters"] == len(
+        descriptor["mutable_proposed_body"]
+    )
+    assert descriptor["maximum_replacement_characters"] == hard_limit
+    assert "JSON escape syntax does not add characters" in prompt
+
+
 def test_gemma_invocation_uses_schema_mode_and_canonical_validation(
     master_resume: Path,
     tmp_path: Path,
@@ -1300,3 +1345,626 @@ def test_historical_wrong_root_fixture_still_classifies_as_transport_schema(
     assert envelope["validation_path"] == "transport_schema"
     assert envelope["validation_result"] == "REJECTED"
     assert caught.value is not None
+
+
+def _set_hard_budget(
+    extracted: dict,
+    target_source_id: str,
+    maximum_characters: int,
+) -> None:
+    for paragraph in extracted["paragraphs"]:
+        if paragraph["content_id"] == target_source_id:
+            paragraph["content_budget"]["maximum_characters"] = maximum_characters
+            return
+    raise AssertionError(f"Missing synthetic target {target_source_id}")
+
+
+def _chat_response(payload: dict) -> dict[str, object]:
+    return {
+        "model": "resume-tailor-gemma:latest",
+        "done": True,
+        "done_reason": "stop",
+        "message": {"role": "assistant", "content": json.dumps(payload)},
+        "prompt_eval_count": 100,
+        "eval_count": 50,
+    }
+
+
+def _patch_payload(
+    *,
+    catalog_sha256: str,
+    patches: list[dict],
+) -> dict:
+    return {
+        "status": "complete",
+        "message": "Synthetic bounded patch response.",
+        "catalog_sha256": catalog_sha256,
+        "cannot_apply": None,
+        "technical_failure": None,
+        "patches": patches,
+    }
+
+
+def test_patch_exactly_at_hard_limit_passes_without_budget_repair(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    _set_hard_budget(extracted, "professional_summary", 193)
+    catalog = writer.approved_edit_catalog(analysis)
+    replacement = "E" * 193
+    calls: list[dict[str, object]] = []
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return _chat_response(
+            _patch_payload(
+                catalog_sha256=writer.canonical_digest(catalog),
+                patches=[
+                    {
+                        "edit_id": "edit.001",
+                        "target_source_id": "professional_summary",
+                        "operation": "replace",
+                        "replacement_text": replacement,
+                    }
+                ],
+            )
+        )
+
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    tailored = writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+
+    assert tailored["professional_summary"] == replacement
+    assert len(calls) == 1
+    assert not (tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME).exists()
+
+
+def test_one_character_over_invokes_exactly_one_focused_repair(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    _set_hard_budget(extracted, "professional_summary", 193)
+    catalog = writer.approved_edit_catalog(analysis)
+    initial_text = "O" * 194
+    repaired_text = "R" * 193
+    requests: list[dict[str, object]] = []
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        requests.append(kwargs)
+        replacement = initial_text if len(requests) == 1 else repaired_text
+        request = kwargs["body"]
+        assert isinstance(request, dict)
+        digest = request["format"]["properties"]["catalog_sha256"]["enum"][0]
+        return _chat_response(
+            _patch_payload(
+                catalog_sha256=digest,
+                patches=[
+                    {
+                        "edit_id": catalog[0]["edit_id"],
+                        "target_source_id": "professional_summary",
+                        "operation": "replace",
+                        "replacement_text": replacement,
+                    }
+                ],
+            )
+        )
+
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    tailored = writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+
+    assert tailored["professional_summary"] == repaired_text
+    assert len(requests) == 2
+    primary_metadata = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert primary_metadata["validation_result"] == "PASS"
+    assert primary_metadata["budget_repair"]["attempt_count"] == 1
+    assert primary_metadata["budget_repair"]["outcome"] == "PASS"
+    assert primary_metadata["budget_repair"]["violations"] == [
+        {
+            "edit_id": "edit.001",
+            "target_source_id": "professional_summary",
+            "actual_characters": 194,
+            "maximum_characters": 193,
+        }
+    ]
+    initial_artifact = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_FILENAME).read_text(encoding="utf-8")
+    )
+    repair_artifact = json.loads(
+        (tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert initial_text in initial_artifact["message"]["content"]
+    assert repaired_text not in initial_artifact["message"]["content"]
+    assert repaired_text in repair_artifact["message"]["content"]
+    repair_metadata = json.loads(
+        (
+            tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME
+        ).read_text(encoding="utf-8")
+    )
+    serialized_metadata = json.dumps(
+        {"primary": primary_metadata, "repair": repair_metadata},
+        sort_keys=True,
+    )
+    assert initial_text not in serialized_metadata
+    assert repaired_text not in serialized_metadata
+
+
+def test_205_character_patch_repairs_to_193_and_leaves_valid_patch_unchanged(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _resolved_analysis(
+        extracted,
+        requirements,
+        recommended_edits=[
+            {
+                "target_source_id": "professional_summary",
+                "proposed_text": "Approved synthetic summary proposal.",
+                "alignment_rationale": "Preserve evidence-backed validation meaning.",
+                "evidence_source_ids": ["professional_summary"],
+                "operation": "replace",
+            },
+            {
+                "target_source_id": "open_source.bullet",
+                "proposed_text": "Stable valid prose patch.",
+                "alignment_rationale": "Synthetic unchanged valid patch.",
+                "evidence_source_ids": ["open_source.bullet"],
+                "operation": "replace",
+            },
+        ],
+    )
+    _set_hard_budget(extracted, "professional_summary", 193)
+    _set_hard_budget(extracted, "open_source.bullet", 193)
+    catalog = writer.approved_edit_catalog(analysis)
+    initial_over = "Evidence-backed Python validation".ljust(205, "x")
+    repaired = "Evidence-backed Python validation".ljust(193, "y")
+    valid_patch = "Stable valid prose patch."
+    requests: list[dict[str, object]] = []
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        requests.append(kwargs)
+        request = kwargs["body"]
+        assert isinstance(request, dict)
+        digest = request["format"]["properties"]["catalog_sha256"]["enum"][0]
+        if len(requests) == 1:
+            patches = [
+                {
+                    "edit_id": catalog[0]["edit_id"],
+                    "target_source_id": "professional_summary",
+                    "operation": "replace",
+                    "replacement_text": initial_over,
+                },
+                {
+                    "edit_id": catalog[1]["edit_id"],
+                    "target_source_id": "open_source.bullet",
+                    "operation": "replace",
+                    "replacement_text": valid_patch,
+                },
+            ]
+        else:
+            patches = [
+                {
+                    "edit_id": catalog[0]["edit_id"],
+                    "target_source_id": "professional_summary",
+                    "operation": "replace",
+                    "replacement_text": repaired,
+                }
+            ]
+        return _chat_response(
+            _patch_payload(catalog_sha256=digest, patches=patches)
+        )
+
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    tailored = writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+
+    assert tailored["professional_summary"] == repaired
+    assert len(tailored["professional_summary"]) == 193
+    assert tailored["open_source"]["bullet"] == valid_patch
+    assert len(requests) == 2
+    repair_request = requests[1]["body"]
+    assert isinstance(repair_request, dict)
+    repair_prompt = repair_request["messages"][1]["content"]
+    assert initial_over in repair_prompt
+    assert "maximum_replacement_characters" in repair_prompt
+    assert '"required_evidence_source_ids":["professional_summary"]' in repair_prompt
+    assert "Preserve the supported meaning" in repair_prompt
+    assert "open_source.bullet" not in repair_prompt
+    assert valid_patch not in repair_prompt
+    repair_schema = repair_request["format"]
+    array_branch = next(
+        branch
+        for branch in repair_schema["properties"]["patches"]["oneOf"]
+        if branch.get("type") == "array"
+    )
+    assert array_branch["minItems"] == 1
+    assert array_branch["maxItems"] == 1
+
+
+def test_budget_repair_that_adds_forbidden_claim_is_rejected_and_preserved(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    _set_hard_budget(extracted, "professional_summary", 193)
+    catalog = writer.approved_edit_catalog(analysis)
+    responses = ["I" * 194, "Unsupported synthetic claim"]
+    calls = 0
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        request = kwargs["body"]
+        assert isinstance(request, dict)
+        digest = request["format"]["properties"]["catalog_sha256"]["enum"][0]
+        replacement = responses[calls]
+        calls += 1
+        return _chat_response(
+            _patch_payload(
+                catalog_sha256=digest,
+                patches=[
+                    {
+                        "edit_id": catalog[0]["edit_id"],
+                        "target_source_id": "professional_summary",
+                        "operation": "replace",
+                        "replacement_text": replacement,
+                    }
+                ],
+            )
+        )
+
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    with pytest.raises(OllamaTailoringContractError, match="forbidden claim"):
+        writer.invoke_ollama(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=private_job,
+            job_requirements=requirements,
+            approved_analysis=analysis,
+            company="Synthetic Systems",
+            role="Validation Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+        )
+
+    assert calls == 2
+    assert (tmp_path / writer.OLLAMA_RESPONSE_FILENAME).is_file()
+    assert (tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME).is_file()
+    primary = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    repair = json.loads(
+        (
+            tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME
+        ).read_text(encoding="utf-8")
+    )
+    assert primary["validation_result"] == "REJECTED"
+    assert primary["budget_repair"]["outcome"] == "REJECTED"
+    assert repair["validation_result"] == "REJECTED"
+    assert not list(tmp_path.glob("tailored-content*.json"))
+
+
+def test_over_budget_patch_with_existing_contract_violation_is_not_repaired(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    _set_hard_budget(extracted, "professional_summary", 20)
+    catalog = writer.approved_edit_catalog(analysis)
+    calls = 0
+
+    def fake_request(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return _chat_response(
+            _patch_payload(
+                catalog_sha256=writer.canonical_digest(catalog),
+                patches=[
+                    {
+                        "edit_id": catalog[0]["edit_id"],
+                        "target_source_id": "professional_summary",
+                        "operation": "replace",
+                        "replacement_text": (
+                            "Unsupported synthetic claim that is also over budget"
+                        ),
+                    }
+                ],
+            )
+        )
+
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    with pytest.raises(OllamaTailoringContractError, match="forbidden claim"):
+        writer.invoke_ollama(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=private_job,
+            job_requirements=requirements,
+            approved_analysis=analysis,
+            company="Synthetic Systems",
+            role="Validation Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+        )
+
+    assert calls == 1
+    assert not (tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME).exists()
+    primary = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert primary["budget_repair"]["attempted"] is False
+    assert primary["budget_repair"]["provider_invoked"] is False
+    assert primary["budget_repair"]["attempt_count"] == 0
+
+
+def test_budget_repair_still_over_limit_stops_after_one_attempt_with_diagnostics(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, analysis = _inputs(master_resume)
+    _set_hard_budget(extracted, "professional_summary", 193)
+    catalog = writer.approved_edit_catalog(analysis)
+    calls = 0
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        request = kwargs["body"]
+        assert isinstance(request, dict)
+        digest = request["format"]["properties"]["catalog_sha256"]["enum"][0]
+        return _chat_response(
+            _patch_payload(
+                catalog_sha256=digest,
+                patches=[
+                    {
+                        "edit_id": catalog[0]["edit_id"],
+                        "target_source_id": "professional_summary",
+                        "operation": "replace",
+                        "replacement_text": "B" * 194,
+                    }
+                ],
+            )
+        )
+
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    with pytest.raises(OllamaTailoringContractError, match="exceeds target budget"):
+        writer.invoke_ollama(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=private_job,
+            job_requirements=requirements,
+            approved_analysis=analysis,
+            company="Synthetic Systems",
+            role="Validation Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+        )
+
+    assert calls == 2
+    assert (tmp_path / writer.OLLAMA_RESPONSE_FILENAME).is_file()
+    assert (tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME).is_file()
+    assert (tmp_path / writer.OLLAMA_TAILORING_TRANSPORT_SCHEMA_FILENAME).is_file()
+    assert (
+        tmp_path / writer.OLLAMA_BUDGET_REPAIR_TRANSPORT_SCHEMA_FILENAME
+    ).is_file()
+    primary = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    repair = json.loads(
+        (
+            tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_METADATA_FILENAME
+        ).read_text(encoding="utf-8")
+    )
+    assert primary["validation_path"] == "character_budget"
+    assert primary["budget_repair"]["attempt_count"] == 1
+    assert repair["validation_path"] == "character_budget"
+    assert repair["budget_repair"]["maximum_attempts"] == 1
+
+
+def test_python_owned_structured_patch_never_enters_budget_repair(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _resolved_analysis(
+        extracted,
+        requirements,
+        recommended_edits=[
+            *_deterministic_edits(extracted),
+            {
+                "target_source_id": "professional_summary",
+                "proposed_text": "Updated text",
+                "alignment_rationale": "Test rationale",
+                "evidence_source_ids": [
+                    "professional_summary",
+                    "skill_groups.0",
+                ],
+                "operation": "replace",
+            },
+        ],
+    )
+    _set_hard_budget(extracted, "professional_summary", 193)
+    catalog = writer.approved_edit_catalog(analysis)
+    _, prose_edits = writer.partition_edit_catalog(catalog)
+    prose_edit = prose_edits[0]
+    requests: list[dict[str, object]] = []
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        requests.append(kwargs)
+        request = kwargs["body"]
+        assert isinstance(request, dict)
+        digest = request["format"]["properties"]["catalog_sha256"]["enum"][0]
+        replacement = "P" * (194 if len(requests) == 1 else 193)
+        return _chat_response(
+            _patch_payload(
+                catalog_sha256=digest,
+                patches=[
+                    {
+                        "edit_id": prose_edit["edit_id"],
+                        "target_source_id": prose_edit["target_source_id"],
+                        "operation": prose_edit["operation"],
+                        "replacement_text": replacement,
+                    }
+                ],
+            )
+        )
+
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    tailored = writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+
+    assert len(requests) == 2
+    repair_request = requests[1]["body"]
+    assert isinstance(repair_request, dict)
+    repair_prompt = repair_request["messages"][1]["content"]
+    assert "skill_groups.0" not in repair_prompt
+    structured_exact_text = next(
+        block["exact_text"]
+        for block in extracted["source_blocks"]
+        if block["source_id"] == "skill_groups.0"
+    )
+    assert structured_exact_text not in repair_prompt
+    assert '"source_id":"professional_summary"' in repair_prompt
+    assert prose_edit["target_source_id"] in repair_prompt
+    assert tailored["skill_groups"][0] != extracted["content"]["skill_groups"][0]
+
+
+def test_composite_205_vs_193_is_rejected_before_approval_or_provider(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    target_id = "skill_groups.2"
+    group = extracted["content"]["skill_groups"][2]
+    group["label"] = "Synthetic Skills Set"
+    assert len(group["label"]) == 20
+    source_block = next(
+        block for block in extracted["source_blocks"] if block["source_id"] == target_id
+    )
+    source_block["exact_text"] = f"{group['label']}: {group['text']}"
+    paragraph = next(
+        item for item in extracted["paragraphs"] if item["content_id"] == target_id
+    )
+    paragraph["text"] = source_block["exact_text"]
+    paragraph["content_budget"]["maximum_characters"] = 193
+
+    body = ", ".join(["JSON Schema", *(["pytest"] * 11), *(["Linux"] * 12)])
+    assert len(body) == 183
+    proposed = f"{group['label']}: {body}"
+    assert len(proposed) == 205
+    analysis = _resolved_analysis(
+        extracted,
+        requirements,
+        recommended_edits=[],
+    )
+    analysis["recommended_edits"] = [
+        {
+            "target_source_id": "professional_summary",
+            "proposed_text": "Updated text",
+            "alignment_rationale": "Synthetic prose edit.",
+            "evidence_source_ids": ["professional_summary"],
+            "operation": "replace",
+        },
+        {
+            "target_source_id": target_id,
+            "proposed_text": proposed,
+            "alignment_rationale": "Reorder authenticated synthetic skills.",
+            "evidence_source_ids": [target_id],
+            "operation": "replace",
+        },
+    ]
+    resolved, issues = resolve_analysis_evidence(
+        analysis,
+        extracted,
+        requirements,
+    )
+
+    budget_issue = next(
+        issue for issue in issues if issue.code == "structured_proposal_over_budget"
+    )
+    assert budget_issue.location == "recommended_edits[1].proposed_text"
+    assert "205 characters" in budget_issue.detail
+    assert "maximum of 193" in budget_issue.detail
+    assert writer.approved_edit_catalog(resolved)[1]["edit_id"] == "edit.002"
+
+    calls = 0
+
+    def fail_if_provider_called(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("The provider must not run for an impossible plan.")
+
+    monkeypatch.setattr(writer, "run_ollama_request", fail_if_provider_called)
+    with pytest.raises(TailoringPreflightError):
+        writer.invoke_ollama(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=private_job,
+            job_requirements=requirements,
+            approved_analysis=resolved,
+            company="Synthetic Systems",
+            role="Validation Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+        )
+
+    assert calls == 0
+    assert not (tmp_path / writer.OLLAMA_RESPONSE_FILENAME).exists()
+    assert not (tmp_path / writer.OLLAMA_BUDGET_REPAIR_RESPONSE_FILENAME).exists()

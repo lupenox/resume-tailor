@@ -7,6 +7,12 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from .character_budget import (
+    composite_label_for_source_id,
+    compose_rendered_text,
+    count_budget_characters,
+    mutable_text_from_composite_proposal,
+)
 from .utilities import flatten_strings, normalized_text
 
 
@@ -630,6 +636,48 @@ def resolve_analysis_evidence(
         paragraph["content_id"]: paragraph["content_budget"]["maximum_characters"]
         for paragraph in extracted_resume["paragraphs"]
     }
+    extracted_content = extracted_resume.get("content")
+    if not isinstance(extracted_content, dict):
+        extracted_content = {}
+    for position, edit in enumerate(resolved_edits):
+        target_id = edit.get("target_source_id")
+        proposed_text = edit.get("proposed_text")
+        if not isinstance(target_id, str) or not isinstance(proposed_text, str):
+            continue
+        immutable_label = composite_label_for_source_id(
+            extracted_content,
+            target_id,
+        )
+        maximum_characters = budgets.get(target_id)
+        if immutable_label is None or not isinstance(maximum_characters, int):
+            continue
+        try:
+            mutable_text = mutable_text_from_composite_proposal(
+                proposed_text,
+                immutable_label=immutable_label,
+            )
+        except (TypeError, ValueError):
+            continue
+        # A colon-bearing body whose prefix is not the authenticated label is
+        # handled by the existing composite-label/grounding contract. Do not
+        # let a derived budget issue mask that more specific failure class.
+        if mutable_text == proposed_text and ":" in proposed_text:
+            continue
+        rendered_text = compose_rendered_text(
+            mutable_text,
+            immutable_label=immutable_label,
+        )
+        actual_characters = count_budget_characters(rendered_text)
+        if actual_characters > maximum_characters:
+            issues.append(
+                SourceEvidenceIssue(
+                    "structured_proposal_over_budget",
+                    f"recommended_edits[{position}].proposed_text",
+                    "Codex proposed a Python-owned structured value of "
+                    f"{actual_characters} characters for a hard rendered "
+                    f"maximum of {maximum_characters}",
+                )
+            )
     seen_budget_targets: set[str] = set()
     resolved_guidance: list[dict[str, Any]] = []
     for position, guidance in enumerate(analysis.get("content_budget_guidance", [])):
@@ -855,10 +903,11 @@ def validate_tailored_content(
     }
     for content_id, value in _paragraph_values(tailored).items():
         maximum = budgets.get(content_id)
-        if maximum is not None and len(value) > maximum:
+        actual_characters = count_budget_characters(value)
+        if maximum is not None and actual_characters > maximum:
             report.issues.append(
-                f"{content_id} is {len(value)} characters; its template-derived "
-                f"budget is {maximum}."
+                f"{content_id} is {actual_characters} characters; its "
+                f"template-derived budget is {maximum}."
             )
 
     source_text = _resume_text(original)

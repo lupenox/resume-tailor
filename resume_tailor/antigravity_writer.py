@@ -17,6 +17,7 @@ from .antigravity_transport import (
     antigravity_process_failure,
     run_antigravity_prompt,
 )
+from .character_budget import CHARACTER_COUNTING_CONTRACT
 from .schemas import load_schema, schema_path, validate_payload
 from .utilities import (
     AntigravityCannotApplyError,
@@ -232,6 +233,9 @@ FORBIDDEN CLAIMS
 FORMATTING AND LENGTH CONSTRAINTS
 {json.dumps(budgets, ensure_ascii=False, indent=2)}
 
+CHARACTER COUNTING CONTRACT
+{CHARACTER_COUNTING_CONTRACT}
+
 NON-NEGOTIABLE RULES
 - Apply every approved edit and no unapproved edit. Preserve all other content.
 - The confirmed job has already been analyzed and approved. Do not reopen
@@ -249,7 +253,8 @@ NON-NEGOTIABLE RULES
 - Preserve exactly three skill groups, three projects, each project's existing
   bullet count, one open-source contribution, and one employment entry.
 - Preserve the current order and labels so content can be inserted deterministically.
-- Each logical paragraph must stay within its corresponding maximum-character budget.
+- Each logical paragraph must stay within its corresponding maximum-character
+  budget under the supplied character-counting contract.
 - Technologies in skill groups and project technology lines must already occur in
   the master resume. Reordering is allowed; invention is not.
 - Never claim RAG, GraphQL, observability, distributed production scale, IVR

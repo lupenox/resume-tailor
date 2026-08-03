@@ -6,6 +6,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .character_budget import (
+    CHARACTER_COUNTING_CONTRACT,
+    character_budget_descriptor,
+    composite_label_for_source_id,
+)
 from .schemas import (
     CodexAnalysisTransportArtifact,
     normalize_unique_arrays,
@@ -52,16 +57,24 @@ def build_analysis_prompt(
     source_blocks = extracted_resume.get("source_blocks")
     if not isinstance(source_blocks, list):
         source_blocks = source_blocks_from_paragraphs(extracted_resume["paragraphs"])
+    extracted_content = extracted_resume.get("content")
+    if not isinstance(extracted_content, dict):
+        extracted_content = {}
     trusted_source = {
         "source_sha256": extracted_resume["source"]["sha256"],
         "source_blocks": source_blocks,
+        "character_counting_contract": CHARACTER_COUNTING_CONTRACT,
         "content_budgets": [
-            {
-                "source_id": paragraph["content_id"],
-                "maximum_characters": paragraph["content_budget"][
+            character_budget_descriptor(
+                source_id=paragraph["content_id"],
+                maximum_rendered_characters=paragraph["content_budget"][
                     "maximum_characters"
                 ],
-            }
+                immutable_label=composite_label_for_source_id(
+                    extracted_content,
+                    paragraph["content_id"],
+                ),
+            )
             for paragraph in extracted_resume["paragraphs"]
         ],
     }
@@ -114,6 +127,11 @@ ANALYSIS REQUIREMENTS
   occurs in the cited résumé blocks.
 - Every recommended edit must return one target_source_id, replace or append as
   its operation, proposed_text, alignment rationale, and evidence_source_ids.
+- Count proposed_text using the supplied character_counting_contract. Every
+  proposed edit must fit its target's hard maximum. For a plain target, keep
+  proposed_text at or below maximum_mutable_characters. For a composite target,
+  maximum_mutable_characters is the exact remaining capacity after local code
+  renders immutable_rendered_prefix; never count or return that prefix yourself.
 - For composite targets, proposed_text must represent the mutable body text only;
   do not author, copy, or rewrite section or group labels.
 - Never return existing source text. Local code resolves existing_text, section

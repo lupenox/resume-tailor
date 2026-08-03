@@ -177,7 +177,7 @@ def compile_deterministic_structured_patches(
 
         # Full authoritative replacement-text validation (same as model output).
         try:
-            _validate_replacement_text(
+            replacement_text = _validate_replacement_text(
                 edit_id=edit_id,
                 descriptor=descriptor,
                 replacement_text=replacement_text,

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .character_budget import calculate_content_budget
 from .utilities import DependencyError, TemplateError, sha256_file
 
 try:
@@ -164,13 +164,7 @@ def _spacing_descriptor(paragraph: Paragraph) -> dict[str, Any]:
 
 
 def _content_budget(text: str) -> dict[str, int]:
-    length = len(text)
-    allowance = min(20, max(4, math.ceil(length * 0.03)))
-    return {
-        "original_characters": length,
-        "maximum_characters": length + allowance,
-        "original_words": len(text.split()),
-    }
+    return calculate_content_budget(text)
 
 
 def _section_map(document: DocumentObject) -> dict[str, int]:

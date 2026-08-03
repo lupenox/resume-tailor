@@ -2375,3 +2375,72 @@ def test_deterministic_only_history_exposes_envelope_without_fake_response(
             )
     finally:
         app.state.manager.shutdown()
+
+
+def test_budget_repair_diagnostics_are_conditional_downloads_without_recovery(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    output_directory = tmp_path / "budget-repair-history"
+    run_directory = output_directory / "synthetic-budget-repair-run"
+    run_directory.mkdir(parents=True)
+    atomic_write_json(
+        run_directory / "run-metadata.json",
+        {
+            "application": "resume-tailor",
+            "status": "FAILED",
+            "stage": "ollama-tailoring",
+            "failure_class": "ollama-tailoring-contract",
+            "created_at": "2026-08-03T12:00:00+00:00",
+            "company": "Synthetic Systems",
+            "role": "Evidence Engineer",
+            "job_source": "file",
+            "error": {
+                "type": "OllamaTailoringContractError",
+                "message": "Synthetic repair remained over budget.",
+            },
+        },
+    )
+    repair_artifacts = {
+        "ollama-budget-repair-response.json",
+        "ollama-budget-repair-response-envelope.json",
+        "ollama-budget-repair-transport.schema.json",
+    }
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        analytics_database_path=tmp_path / "budget-repair-history.sqlite3",
+        pipeline_runner=StubbedUIPipeline(),
+    )
+    try:
+        run_id = "history-synthetic-budget-repair-run"
+        initial = app.state.manager.snapshot(run_id)
+        assert repair_artifacts.isdisjoint(
+            {artifact["name"] for artifact in initial["artifacts"]}
+        )
+        for artifact_name in repair_artifacts:
+            with pytest.raises(InputError, match="not available"):
+                app.state.manager.resolve_artifact(run_id, artifact_name)
+
+        for artifact_name in repair_artifacts:
+            atomic_write_json(
+                run_directory / artifact_name,
+                {"synthetic": True, "artifact": artifact_name},
+            )
+
+        snapshot = app.state.manager.snapshot(run_id)
+        assert repair_artifacts <= {
+            artifact["name"] for artifact in snapshot["artifacts"]
+        }
+        for artifact_name in repair_artifacts:
+            assert app.state.manager.resolve_artifact(
+                run_id,
+                artifact_name,
+            ) == (run_directory / artifact_name).resolve()
+
+        assert snapshot["failure_kind"] == "ollama_contract"
+        assert snapshot["retry_eligible"] is False
+        assert snapshot["antigravity_retry_eligible"] is False
+        assert snapshot["antigravity_reprocess_eligible"] is False
+    finally:
+        app.state.manager.shutdown()
