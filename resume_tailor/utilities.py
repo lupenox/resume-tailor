@@ -54,6 +54,13 @@ class InputError(ResumeTailorError):
     exit_code = ExitCode.INPUT
 
 
+class RequirementExtractionError(InputError):
+    """Job requirement extraction failed due to pathological input."""
+    def __init__(self, message: str, diagnostic: dict | None = None) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic or {}
+
+
 class ModelError(ResumeTailorError):
     exit_code = ExitCode.MODEL
 

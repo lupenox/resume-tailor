@@ -18,9 +18,12 @@ from resume_tailor.codex_analysis import build_analysis_prompt
 from resume_tailor.docx_extract import extract_resume
 from resume_tailor.evidence import resolve_analysis_evidence
 from resume_tailor.gemma_analysis import (
+    DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS,
+    resolve_coverage_batch_max_output_tokens,
+    resolve_coverage_batch_size,
     COVERAGE_DIAGNOSTIC_FILENAME,
     COVERAGE_SCHEMA_FILENAME,
-    DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS,
+    DEFAULT_COVERAGE_BATCH_MAX_OUTPUT_TOKENS,
     DEFAULT_EDIT_MAX_OUTPUT_TOKENS,
     EDITS_DIAGNOSTIC_FILENAME,
     MAX_GEMMA_ANALYSIS_EDITS,
@@ -245,12 +248,11 @@ def test_prompt_compaction_two_phase_vs_legacy(
         role="Developer",
     )
     coverage_prompt = build_coverage_prompt(
-        extracted_resume=extracted,
-        job_description=job,
-        job_requirements=catalog,
-        company="Example",
-        role="Developer",
-    )
+            extracted_resume=extracted,
+            batch_requirements=catalog["requirements"],
+            company="Example",
+            role="Developer",
+        )
     coverage_payload = _coverage_body(catalog)
     edits_prompt = build_edits_prompt(
         extracted_resume=extracted,
@@ -262,7 +264,6 @@ def test_prompt_compaction_two_phase_vs_legacy(
     assert len(edits_prompt.encode()) < len(legacy.encode())
     assert "SOURCE_CATALOG" in coverage_prompt
     assert "JOB_REQUIREMENTS" in coverage_prompt
-    assert "BEGIN_UNTRUSTED_JOB_DESCRIPTION_" in coverage_prompt
     assert "max_edits" in edits_prompt
     assert "skill_groups.N" in edits_prompt
     assert estimate_prompt_tokens(coverage_prompt) < estimate_prompt_tokens(legacy)
@@ -305,14 +306,14 @@ def test_successful_two_phase_analysis_and_assembly(
     assert "role_summary" in payload
     assert mock_ollama["calls"] == 2
     assert mock_ollama["requests"][0]["body"]["options"]["num_predict"] == (
-        DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS
+        DEFAULT_COVERAGE_BATCH_MAX_OUTPUT_TOKENS
     )
     assert mock_ollama["requests"][1]["body"]["options"]["num_predict"] == (
         DEFAULT_EDIT_MAX_OUTPUT_TOKENS
     )
-    assert "Mapping job requirements" in statuses
+    assert any("Mapping job requirements" in s for s in statuses)
     assert "Planning résumé edits" in statuses
-    assert (tmp_path / COVERAGE_SCHEMA_FILENAME).is_file()
+    assert (tmp_path / "gemma-analysis-coverage-batch-001-schema.json").is_file()
     assert (tmp_path / COVERAGE_DIAGNOSTIC_FILENAME).is_file()
     assert (tmp_path / EDITS_DIAGNOSTIC_FILENAME).is_file()
 
@@ -495,7 +496,7 @@ def test_phase_a_timeout_prevents_phase_b(
     diagnostic = json.loads(
         (tmp_path / COVERAGE_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
     )
-    assert diagnostic["phase"] == "coverage"
+    assert diagnostic["phase"] in ("coverage", "coverage_summary")
     assert diagnostic["classification"] == "analysis_timeout"
     assert not (tmp_path / EDITS_DIAGNOSTIC_FILENAME).exists()
 
@@ -955,7 +956,7 @@ def test_success_diagnostics_include_phase_metadata(
         timeout_seconds=60,
     )
     for path, phase, tokens in (
-        (COVERAGE_DIAGNOSTIC_FILENAME, "coverage", DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS),
+        (COVERAGE_DIAGNOSTIC_FILENAME, "coverage_summary", DEFAULT_COVERAGE_BATCH_MAX_OUTPUT_TOKENS),
         (EDITS_DIAGNOSTIC_FILENAME, "edits", DEFAULT_EDIT_MAX_OUTPUT_TOKENS),
     ):
         diagnostic = json.loads((tmp_path / path).read_text(encoding="utf-8"))
@@ -963,13 +964,17 @@ def test_success_diagnostics_include_phase_metadata(
         assert diagnostic["classification"] == "success"
         assert diagnostic["attempt"] == 0
         assert diagnostic["model"]
-        assert diagnostic["effective_num_predict"] == tokens
-        assert diagnostic["max_output_tokens"] == tokens
-        assert "elapsed_seconds" in diagnostic
-        assert "remaining_deadline_seconds" in diagnostic
-        assert "prompt_bytes" in diagnostic
-        assert "schema_bytes" in diagnostic
-        assert diagnostic.get("done_reason") == "stop"
+        if phase == "coverage_summary":
+            assert diagnostic["effective_output_ceiling"] == tokens
+        else:
+            assert diagnostic["effective_num_predict"] == tokens
+        if phase != "coverage_summary":
+            assert diagnostic["max_output_tokens"] == tokens
+            assert "prompt_bytes" in diagnostic
+            assert "schema_bytes" in diagnostic
+        assert "elapsed_seconds" in diagnostic or "total_elapsed_seconds" in diagnostic
+        if phase != "coverage_summary":
+            assert diagnostic.get("done_reason") == "stop"
         assert diagnostic["hidden_reasoning_excluded"] is True
         assert diagnostic["credentials_excluded"] is True
         # No raw prompt or model content.

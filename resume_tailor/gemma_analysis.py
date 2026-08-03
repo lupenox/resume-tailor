@@ -73,6 +73,8 @@ GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME = COVERAGE_DIAGNOSTIC_FILENAME
 
 # Coverage output is a fixed-length array of {id, status, evidence ids}.
 # For ~40 requirements with short ID lists, ~1k tokens is ample; 1536 is headroom.
+DEFAULT_COVERAGE_BATCH_MAX_OUTPUT_TOKENS = 768
+DEFAULT_COVERAGE_BATCH_SIZE = 4
 DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS = 1536
 
 # Edit plan is at most MAX_GEMMA_ANALYSIS_EDITS short proposed_text strings.
@@ -161,6 +163,27 @@ def resolve_coverage_max_output_tokens(explicit: int | None = None) -> int:
         and _legacy_analysis_token_cap() is not None
     ):
         value = min(value, _legacy_analysis_token_cap() or value)
+    return _clamp_phase_tokens(value)
+
+def resolve_coverage_batch_size() -> int:
+    value = _parse_positive_int_env("GEMMA_ANALYSIS_COVERAGE_BATCH_SIZE")
+    if value is not None:
+        return max(1, min(8, value))
+    return DEFAULT_COVERAGE_BATCH_SIZE
+
+def resolve_coverage_batch_max_output_tokens(
+    explicit: int | None = None, legacy_cap: int | None = None
+) -> int:
+    """Resolve Phase A batched ``num_predict``."""
+    if isinstance(explicit, int) and explicit > 0:
+        return _clamp_phase_tokens(explicit)
+    phase = _parse_positive_int_env("GEMMA_ANALYSIS_COVERAGE_BATCH_MAX_OUTPUT_TOKENS")
+    if phase is not None:
+        return _clamp_phase_tokens(phase)
+    value = DEFAULT_COVERAGE_BATCH_MAX_OUTPUT_TOKENS
+    if legacy_cap is not None:
+        # Don't let legacy cap inflate batch ceiling.
+        value = min(value, legacy_cap)
     return _clamp_phase_tokens(value)
 
 
@@ -515,14 +538,12 @@ def _write_schema(path: Path, schema: dict[str, Any]) -> dict[str, Any]:
 def build_coverage_prompt(
     *,
     extracted_resume: dict[str, Any],
-    job_description: str,
-    job_requirements: dict[str, Any],
+    batch_requirements: list[dict[str, Any]],
     company: str,
     role: str,
     repair_detail: str | None = None,
 ) -> str:
     catalog = _compact_source_catalog(extracted_resume)
-    requirements = _requirement_entries(job_requirements)
     repair = ""
     if repair_detail:
         repair = (
@@ -536,9 +557,7 @@ def build_coverage_prompt(
         "SOURCE_CATALOG (immutable; evidence_source_ids only from evidence_allowed=true):\n"
         f"{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}\n"
         "JOB_REQUIREMENTS (classify every requirement_id exactly once):\n"
-        f"{json.dumps(requirements, ensure_ascii=False, separators=(',', ':'))}\n"
-        "JOB_POSTING:\n"
-        f"{_untrusted_job_block(job_description)}"
+        f"{json.dumps(batch_requirements, ensure_ascii=False, separators=(',', ':'))}\n"
         "RULES\n"
         "- status supported|partially_supported requires ≥1 real evidence_source_ids.\n"
         "- status unsupported must use empty evidence_source_ids.\n"
@@ -1182,6 +1201,11 @@ def _is_repairable_failure(exc: BaseException) -> bool:
 
 
 def _repair_detail_for(exc: BaseException) -> str:
+    from .utilities import GemmaOutputLimitError, GemmaAnalysisTimeoutError
+    if isinstance(exc, GemmaOutputLimitError):
+        return "output_limit_reached"
+    if isinstance(exc, GemmaAnalysisTimeoutError):
+        return "analysis_timeout"
     if isinstance(exc, GemmaInnerAnalysisError):
         return "malformed_inner_analysis"
     if isinstance(exc, GemmaTransportEnvelopeError):
@@ -1561,7 +1585,11 @@ def invoke_gemma_analysis(
     """Run two-phase Gemma analysis and return a canonical analysis document."""
     del max_output_tokens  # deprecated single ceiling; phases have own budgets
     selected_model = resolve_gemma_analysis_model(model)
-    coverage_tokens = resolve_coverage_max_output_tokens(coverage_max_output_tokens)
+    coverage_legacy_cap = resolve_coverage_max_output_tokens(coverage_max_output_tokens)
+    coverage_batch_size = resolve_coverage_batch_size()
+    coverage_batch_tokens = resolve_coverage_batch_max_output_tokens(
+        explicit=None, legacy_cap=coverage_legacy_cap
+    )
     edit_tokens = resolve_edit_max_output_tokens(edit_max_output_tokens)
     overall_deadline = time.monotonic() + max(1, timeout_seconds)
     connect_timeout = min(DEFAULT_CONNECT_TIMEOUT_SECONDS, max(1, timeout_seconds))
@@ -1572,45 +1600,131 @@ def invoke_gemma_analysis(
     evidence_id_set = set(evidence_ids)
     editable_id_set = set(editable_ids)
 
-    coverage_schema = build_coverage_schema(
+    # --- Phase A: Batched Coverage ---
+
+    total_requirements = len(requirement_entries)
+    batches: list[list[dict[str, Any]]] = []
+    if not requirement_entries:
+        raise CodexSchemaCompatibilityError(
+            "The job-requirement catalog is empty; analysis cannot start."
+        )
+    for i in range(0, total_requirements, coverage_batch_size):
+        batches.append(requirement_entries[i : i + coverage_batch_size])
+
+    merged_coverage_requirements: list[dict[str, Any]] = []
+    completed_batch_count = 0
+    start_time = time.monotonic()
+
+    for batch_idx, batch_entries in enumerate(batches):
+        batch_num = batch_idx + 1
+        total_batches = len(batches)
+        batch_req_ids = [item["requirement_id"] for item in batch_entries]
+
+        batch_schema = build_coverage_schema(
+            requirement_ids=batch_req_ids,
+            evidence_ids=evidence_ids,
+        )
+        batch_schema_filename = f"gemma-analysis-coverage-batch-{batch_num:03d}-schema.json"
+        batch_schema_info = _write_schema(
+            run_directory / batch_schema_filename,
+            batch_schema,
+        )
+
+        def build_batch_prompt_fn(repair: str | None) -> str:
+            return build_coverage_prompt(
+                extracted_resume=extracted_resume,
+                batch_requirements=batch_entries,
+                company=company,
+                role=role,
+                repair_detail=repair,
+            )
+
+        def validate_batch(raw: dict[str, Any]) -> dict[str, Any]:
+            return validate_coverage_payload(
+                raw,
+                requirement_ids=batch_req_ids,
+                evidence_ids=evidence_id_set,
+            )
+
+        def batch_status_handler(msg: str) -> None:
+            if status_handler is not None:
+                status_handler(f"Mapping job requirements — batch {batch_num} of {total_batches}")
+
+        # Temporarily patch module-level filenames for this batch call
+        global COVERAGE_PROMPT_FILENAME, COVERAGE_RESPONSE_FILENAME, COVERAGE_DIAGNOSTIC_FILENAME
+        orig_prompt = COVERAGE_PROMPT_FILENAME
+        orig_resp = COVERAGE_RESPONSE_FILENAME
+        orig_diag = COVERAGE_DIAGNOSTIC_FILENAME
+        COVERAGE_PROMPT_FILENAME = f"gemma-analysis-coverage-batch-{batch_num:03d}-prompt.sanitized.txt"
+        COVERAGE_RESPONSE_FILENAME = f"gemma-analysis-coverage-batch-{batch_num:03d}-response.sanitized.json"
+        COVERAGE_DIAGNOSTIC_FILENAME = f"gemma-analysis-coverage-batch-{batch_num:03d}-diagnostic.json"
+
+        try:
+            batch_result = _run_phase_with_repair(
+                phase="coverage",
+                model=selected_model,
+                build_prompt=build_batch_prompt_fn,
+                format_schema=batch_schema_info["schema"],
+                max_output_tokens=coverage_batch_tokens,
+                run_directory=run_directory,
+                overall_deadline=overall_deadline,
+                overall_timeout_seconds=timeout_seconds,
+                connect_timeout=connect_timeout,
+                progress_handler=progress_handler,
+                parse_and_validate=validate_batch,
+                status_handler=batch_status_handler,
+            )
+            merged_coverage_requirements.extend(batch_result["requirements"])
+            completed_batch_count += 1
+        except BaseException as exc:
+            # Write a failed summary diagnostic before raising
+            elapsed_time = time.monotonic() - start_time
+            _write_diagnostic(
+                run_directory / "gemma-analysis-coverage-diagnostic.json",
+                phase="coverage_summary",
+                classification=_repair_detail_for(exc),
+                model=selected_model,
+                attempt=0,
+                extra={
+                    "total_requirement_count": total_requirements,
+                    "batch_size": coverage_batch_size,
+                    "batch_count": total_batches,
+                    "completed_batch_count": completed_batch_count,
+                    "failed_batch_index": batch_idx,
+                    "failed_batch_requirement_ids": batch_req_ids,
+                    "effective_output_ceiling": coverage_batch_tokens,
+                    "total_elapsed_seconds": round(elapsed_time, 3),
+                }
+            )
+            raise
+        finally:
+            COVERAGE_PROMPT_FILENAME = orig_prompt
+            COVERAGE_RESPONSE_FILENAME = orig_resp
+            COVERAGE_DIAGNOSTIC_FILENAME = orig_diag
+
+    # Re-validate the fully merged coverage against global requirement lists
+    merged_coverage_payload = {"requirements": merged_coverage_requirements}
+    coverage = validate_coverage_payload(
+        merged_coverage_payload,
         requirement_ids=requirement_ids,
-        evidence_ids=evidence_ids,
-    )
-    coverage_schema_info = _write_schema(
-        run_directory / COVERAGE_SCHEMA_FILENAME,
-        coverage_schema,
+        evidence_ids=evidence_id_set,
     )
 
-    def build_coverage_prompt_fn(repair: str | None) -> str:
-        return build_coverage_prompt(
-            extracted_resume=extracted_resume,
-            job_description=job_description,
-            job_requirements=job_requirements,
-            company=company,
-            role=role,
-            repair_detail=repair,
-        )
-
-    def validate_coverage(raw: dict[str, Any]) -> dict[str, Any]:
-        return validate_coverage_payload(
-            raw,
-            requirement_ids=requirement_ids,
-            evidence_ids=evidence_id_set,
-        )
-
-    coverage = _run_phase_with_repair(
-        phase="coverage",
+    elapsed_time = time.monotonic() - start_time
+    _write_diagnostic(
+        run_directory / "gemma-analysis-coverage-diagnostic.json",
+        phase="coverage_summary",
+        classification="success",
         model=selected_model,
-        build_prompt=build_coverage_prompt_fn,
-        format_schema=coverage_schema_info["schema"],
-        max_output_tokens=coverage_tokens,
-        run_directory=run_directory,
-        overall_deadline=overall_deadline,
-        overall_timeout_seconds=timeout_seconds,
-        connect_timeout=connect_timeout,
-        progress_handler=progress_handler,
-        parse_and_validate=validate_coverage,
-        status_handler=status_handler,
+        attempt=0,
+        extra={
+            "total_requirement_count": total_requirements,
+            "batch_size": coverage_batch_size,
+            "batch_count": len(batches),
+            "completed_batch_count": completed_batch_count,
+            "effective_output_ceiling": coverage_batch_tokens,
+            "total_elapsed_seconds": round(elapsed_time, 3),
+        }
     )
 
     eligible_requirement_ids = [

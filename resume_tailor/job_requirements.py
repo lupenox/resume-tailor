@@ -8,7 +8,9 @@ from .job_text import (
     MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS,
     validate_confirmed_job_description,
 )
-from .utilities import InputError
+from .utilities import InputError, RequirementExtractionError, atomic_write_json
+from pathlib import Path
+import json
 
 
 CATALOG_VERSION = 1
@@ -92,9 +94,10 @@ def _structured_requirements(
     return requirements
 
 
+
 def _category_for_heading(heading: str | None) -> tuple[str, str]:
     normalized = (heading or "").casefold()
-    if "respons" in normalized or "what you" in normalized:
+    if "respons" in normalized or "what you'll do" in normalized or "what you’ll do" in normalized or "what you will do" in normalized:
         return "responsibility", "responsibility"
     if "preferred" in normalized or "nice to have" in normalized:
         return "preferred_qualification", "preferred"
@@ -102,57 +105,184 @@ def _category_for_heading(heading: str | None) -> tuple[str, str]:
         return "technology_and_skill", "skill"
     if "ai focus" in normalized:
         return "ai_focus_area", "ai_focus"
-    if "required" in normalized or "qualification" in normalized:
+    if "required" in normalized or "qualification" in normalized or "requirement" in normalized or "what we're looking" in normalized or "what we’re looking" in normalized or "successful candidates" in normalized or "what you'll need" in normalized or "what you’ll need" in normalized:
+        return "required_qualification", "required"
+    if "education" in normalized or "experience" in normalized:
         return "required_qualification", "required"
     return "unstructured_requirement", "text"
 
 
-def _unstructured_requirements(job_description: str) -> list[tuple[str, str, str]]:
-    requirements: list[tuple[str, str, str]] = []
-    counters: dict[str, int] = {}
-    heading: str | None = None
-    for raw_line in job_description.replace("\r\n", "\n").replace("\r", "\n").splitlines():
-        line = " ".join(raw_line.split())
-        if not line:
+def _unstructured_requirements(
+    job_description: str,
+    diagnostic: dict[str, Any],
+) -> list[tuple[str, str, str]]:
+    text = re.sub(r'<(p|li|hr|div|h[1-6])[^>]*>', r'\n\n', job_description, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', ' ', text)
+
+    headings = [
+        "Requirements", "Qualifications", "Required Qualifications", "Minimum Qualifications",
+        "Preferred Qualifications", "What You'll Need", r"What You[’']ll Need",
+        "What We're Looking For", r"What We[’']re Looking For", "Responsibilities", "What You'll Do",
+        r"What You[’']ll Do", "Skills", "Education", "Experience", "Overview", "Job Description",
+        "Successful Candidates Will Have", "What You Will Do"
+    ]
+    for h in headings:
+        pattern = r"([a-z.?!]|\b)(" + h + r")([A-Z])"
+        text = re.sub(pattern, r"\1\n\2\n\3", text, flags=re.IGNORECASE)
+
+    text = re.sub(r"([a-z]{2,}[.?!])([A-Z])", r"\1\n\2", text)
+
+    blocks = [b.strip() for b in text.split('\n') if b.strip()]
+    diagnostic["initial_block_count"] = len(blocks)
+    diagnostic["detected_headings"] = []
+
+    items = []
+    heading = None
+
+    local_heading_re = re.compile(
+        r"^(?:responsibilities|what you(?:'|’)ll do|what you will do|what you(?:'|’)ll need|required qualifications?|qualifications?|"
+        r"requirements?|preferred qualifications?|nice to have|skills?|"
+        r"technologies|ai focus(?: areas?)?|education|experience|"
+        r"what we(?:'|’)re looking for|successful candidates will have)\s*:?$",
+        re.I,
+    )
+    local_bullet_re = re.compile(r"^(?:[-*•‣▪◦○]|[0-9]{1,3}[.)])\s+")
+
+    for block in blocks:
+        if local_heading_re.fullmatch(block):
+            heading = block.rstrip(":")
+            if heading not in diagnostic["detected_headings"]:
+                diagnostic["detected_headings"].append(heading)
             continue
-        if _HEADING_RE.fullmatch(line):
-            heading = line.rstrip(":")
+
+        block = re.sub(r"(?<!^)(\s+[-*•‣▪◦○]\s+)", r"\n\1", block)
+        sub_blocks = [s.strip() for s in block.split('\n') if s.strip()]
+
+        for sub in sub_blocks:
+            category, prefix = _category_for_heading(heading)
+            candidate = local_bullet_re.sub("", sub).strip()
+            if not candidate:
+                continue
+
+            if category != "unstructured_requirement" and ";" in candidate and len(candidate.split(";")) > 2:
+                parts = [p.strip() for p in candidate.split(";") if p.strip()]
+                for p in parts:
+                    items.append((p, category, prefix))
+                continue
+
+            if len(candidate) > 500:
+                sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', candidate)
+                for s in sentences:
+                    if s.strip():
+                        items.append((s.strip(), category, prefix))
+            else:
+                items.append((candidate, category, prefix))
+
+    final_requirements = []
+    counters = {}
+    seen_texts = set()
+    total_len = len(job_description)
+
+    diagnostic["largest_item_length"] = 0
+    diagnostic["largest-item/source_ratio"] = 0.0
+    diagnostic["fallback_use"] = False
+    diagnostic["deduplication_count"] = 0
+
+    for item_text, cat, pref in items:
+        try:
+            norm = _safe_requirement_text(
+                item_text,
+                location="extraction",
+                maximum_characters=MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+            )
+        except InputError:
             continue
-        candidate = _BULLET_PREFIX_RE.sub("", line).strip()
-        if not candidate:
+        if not norm:
             continue
-        category, prefix = _category_for_heading(heading)
-        text = _safe_requirement_text(
-            candidate,
-            location="confirmed job text",
-            maximum_characters=MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS,
-        )
-        counters[prefix] = counters.get(prefix, 0) + 1
-        requirements.append((f"{prefix}.{counters[prefix]:03d}", category, text))
-    return requirements
+
+        if norm.casefold() in seen_texts:
+            diagnostic["deduplication_count"] += 1
+            continue
+        seen_texts.add(norm.casefold())
+
+        if len(norm) > diagnostic["largest_item_length"]:
+            diagnostic["largest_item_length"] = len(norm)
+            diagnostic["largest-item/source_ratio"] = round(len(norm) / max(total_len, 1), 3)
+
+        if len(norm) > 1500:
+            diagnostic["failure_classification"] = "item_exceeds_character_threshold"
+            raise RequirementExtractionError("Requirement exceeds maximum character threshold for an atomic item.", diagnostic)
+
+        if len(norm) > (total_len * 0.3) and len(norm) > 500:
+            diagnostic["failure_classification"] = "item_disproportionate_percentage"
+            raise RequirementExtractionError("Requirement contains disproportionate percentage of source text.", diagnostic)
+
+        counters[pref] = counters.get(pref, 0) + 1
+        req_id = f"{pref}.{counters[pref]:03d}"
+
+        final_requirements.append((req_id, cat, norm))
+
+    diagnostic["final_requirement_count"] = len(final_requirements)
+
+    if len(final_requirements) == 1 and diagnostic["largest-item/source_ratio"] > 0.8 and total_len > 1000:
+        diagnostic["failure_classification"] = "entire_posting_single_requirement"
+        raise RequirementExtractionError("The entire job posting was extracted as a single requirement.", diagnostic)
+
+    if not final_requirements:
+        diagnostic["failure_classification"] = "no_valid_requirements"
+        raise RequirementExtractionError("No deterministic job requirements could be extracted from the confirmed input.", diagnostic)
+
+    # Mark fallback if all unstructured and we have headings
+    if all(cat == "unstructured_requirement" for _, cat, _ in final_requirements):
+        diagnostic["fallback_use"] = True
+
+    return final_requirements
 
 
 def build_job_requirement_catalog(
     job_description: str,
     *,
     structured_job: dict[str, Any] | None = None,
+    run_directory: Path | None = None,
 ) -> dict[str, Any]:
     """Build an immutable, deterministic catalog from the confirmed job input."""
     validate_confirmed_job_description(job_description)
     requirements = _structured_requirements(structured_job)
     source_kind = "confirmed_structured_posting"
-    if not requirements:
-        requirements = _unstructured_requirements(job_description)
-        source_kind = "confirmed_job_text"
-    if not requirements:
-        raise InputError(
-            "No deterministic job requirements could be extracted from the confirmed input."
-        )
-    if len(requirements) > MAX_JOB_REQUIREMENTS:
-        raise InputError(
-            f"The confirmed posting contains {len(requirements):,} requirement blocks; "
-            f"the local safety limit is {MAX_JOB_REQUIREMENTS:,}."
-        )
+    diagnostic = {
+        "source_job_text_length": len(job_description),
+        "normalized_length": len(job_description.strip()),
+    }
+    try:
+        if not requirements:
+            requirements = _unstructured_requirements(job_description, diagnostic)
+            source_kind = "confirmed_job_text"
+        else:
+            diagnostic["fallback_use"] = False
+            diagnostic["final_requirement_count"] = len(requirements)
+
+        if not requirements:
+            diagnostic["failure_classification"] = "no_valid_requirements"
+            raise RequirementExtractionError(
+                "No deterministic job requirements could be extracted from the confirmed input.",
+                diagnostic
+            )
+        if len(requirements) > MAX_JOB_REQUIREMENTS:
+            diagnostic["failure_classification"] = "too_many_requirements"
+            raise RequirementExtractionError(
+                f"The confirmed posting contains {len(requirements):,} requirement blocks; "
+                f"the local safety limit is {MAX_JOB_REQUIREMENTS:,}.",
+                diagnostic
+            )
+
+        if run_directory:
+            atomic_write_json(run_directory / "requirement-extraction-diagnostic.json", diagnostic)
+
+    except RequirementExtractionError as e:
+        if run_directory:
+            atomic_write_json(run_directory / "requirement-extraction-diagnostic.json", e.diagnostic)
+        raise e
+
     catalog = {
         "version": CATALOG_VERSION,
         "job_description_sha256": job_description_sha256(job_description),

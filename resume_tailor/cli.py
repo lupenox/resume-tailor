@@ -124,7 +124,9 @@ from .utilities import (
     GrokTransportEnvelopeError,
     GrokUsageLimitError,
     InputError,
+    RequirementExtractionError,
     IntegrityError,
+    ModelError,
     OllamaBudgetError,
     OllamaCanonicalSchemaError,
     OllamaCannotApplyError,
@@ -1139,6 +1141,7 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     if fetched_job is not None and job_source == "linkedin-url"
                     else None
                 ),
+                run_directory=run_directory,
             )
         if antigravity_retry_inputs is not None:
             atomic_write_bytes(
@@ -1675,6 +1678,15 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     "was launched."
                 ) from exc
             raise
+        except RequirementExtractionError as exc:
+            diagnostic_path = run_directory / "requirement-extraction-diagnostic.json"
+            if exc.diagnostic:
+                atomic_write_json(diagnostic_path, exc.diagnostic)
+
+            error_message = "The job posting could not be divided into reliable individual requirements. No analysis provider was called."
+            if writer_provider == "ollama":
+                raise TailoringPreflightError(error_message) from exc
+            raise AntigravityTailoringPreflightError(error_message) from exc
         except InputError as exc:
             if writer_provider == "ollama":
                 raise TailoringPreflightError(str(exc)) from exc
