@@ -315,6 +315,216 @@ def test_default_pipeline_routes_approved_writing_to_local_gemma(
     assert metadata["revision_cycle"]["initial"]["provider"] == "ollama"
 
 
+def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_provider(
+    master_resume: Path,
+    job_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the real writer entrypoint and every post-writer pipeline gate."""
+    import resume_tailor.docx_render as docx_render_module
+    import resume_tailor.headless_render as headless_render_module
+    import resume_tailor.ollama_writer as ollama_writer_module
+
+    progress: list[tuple[str, str]] = []
+    provider_calls: list[str] = []
+
+    monkeypatch.setattr(
+        cli_module,
+        "_analysis_dependency_versions",
+        lambda *_args, **_kwargs: {"resume_tailor": "synthetic", "codex": "mocked"},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_tailoring_dependency_versions",
+        lambda *_args, **_kwargs: {
+            "ollama": "not-invoked",
+            "ollama_model": "not-loaded",
+            "libreoffice": "mocked",
+        },
+    )
+
+    def fake_analysis(**kwargs: object) -> dict[str, object]:
+        extracted = kwargs["extracted_resume"]
+        requirements = kwargs["job_requirements"]
+        run_directory = kwargs["run_directory"]
+        assert isinstance(extracted, dict)
+        assert isinstance(requirements, dict)
+        assert isinstance(run_directory, Path)
+        engineering = extracted["content"]["skill_groups"][2]
+        raw: dict[str, object] = {
+            "role_summary": "Synthetic deterministic tailoring run.",
+            "fit_assessment": {
+                "overall": "Synthetic evidence-backed fit.",
+                "strengths": ["Locally authenticated structured skills"],
+                "gaps": ["No unsupported claims are added"],
+            },
+            "supported_requirement_mappings": [],
+            "unsupported_requirement_ids": [
+                item["requirement_id"] for item in requirements["requirements"]
+            ],
+            "recommended_edits": [
+                {
+                    "target_source_id": "skill_groups.2",
+                    "operation": "replace",
+                    "proposed_text": (
+                        f"{engineering['label']}: FastAPI, JSON Schema, pytest, SQL"
+                    ),
+                    "alignment_rationale": (
+                        "Surface an already authenticated language in the engineering group."
+                    ),
+                    "evidence_source_ids": ["skill_groups.2", "skill_groups.0"],
+                }
+            ],
+            "immutable_facts": [],
+            "forbidden_claims": ["GraphQL"],
+            "content_budget_guidance": [],
+            "questions_for_user": [],
+        }
+        (run_directory / "codex-analysis.json").write_text(
+            json.dumps(raw),
+            encoding="utf-8",
+        )
+        return raw
+
+    monkeypatch.setattr(cli_module, "invoke_codex_analysis", fake_analysis)
+
+    def reject_provider(**_kwargs: object) -> object:
+        provider_calls.append("ollama")
+        pytest.fail("The deterministic-only pipeline invoked Ollama")
+
+    monkeypatch.setattr(
+        ollama_writer_module,
+        "run_ollama_request",
+        reject_provider,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "invoke_antigravity",
+        lambda **_kwargs: pytest.fail("The deterministic pipeline invoked Antigravity"),
+    )
+
+    def fake_render(**kwargs: object) -> None:
+        destination = kwargs["destination_path"]
+        assert isinstance(destination, Path)
+        destination.write_bytes(b"synthetic deterministic docx")
+
+    def fake_export(**kwargs: object) -> str:
+        pdf_path = kwargs["pdf_path"]
+        preview_path = kwargs["preview_path"]
+        assert isinstance(pdf_path, Path)
+        assert isinstance(preview_path, Path)
+        pdf_path.write_bytes(b"%PDF-1.4 synthetic deterministic")
+        preview_path.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic")
+        return "Synthetic deterministic resume text"
+
+    def fake_final_qa(**kwargs: object) -> dict[str, object]:
+        run_directory = kwargs["run_directory"]
+        generation = kwargs["generation"]
+        assert isinstance(run_directory, Path)
+        assert generation == "initial"
+        result: dict[str, object] = {
+            "status": "pass",
+            "summary": "Synthetic read-only QA passed.",
+            "issues": [],
+            "technical_failure": None,
+        }
+        (run_directory / "final-qa.initial.json").write_text(
+            json.dumps(result),
+            encoding="utf-8",
+        )
+        (run_directory / "final-qa.initial.md").write_text(
+            "# Synthetic read-only QA\n\nPASS\n",
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr(headless_render_module, "render_headless_docx", fake_render)
+    monkeypatch.setattr(docx_render_module, "export_and_validate_pdf", fake_export)
+    monkeypatch.setattr(cli_module, "invoke_final_qa", fake_final_qa)
+
+    parser = build_parser()
+    output_dir = tmp_path / "deterministic-output"
+    args = parser.parse_args(
+        [
+            "--resume",
+            str(master_resume),
+            "--job-file",
+            str(job_file),
+            "--company",
+            "Synthetic Systems",
+            "--role",
+            "Evidence Engineer",
+            "--output-dir",
+            str(output_dir),
+            "--analytics-db",
+            str(tmp_path / "deterministic-analytics.sqlite3"),
+            "--timeout",
+            "30s",
+            "--yes",
+        ]
+    )
+    hooks = PipelineHooks(
+        progress_handler=lambda stage, message, _payload: progress.append(
+            (stage, message)
+        )
+    )
+
+    run = run_pipeline(args, hooks=hooks)
+
+    assert provider_calls == []
+    assert {stage for stage, _message in progress} >= {
+        "evidence_validation",
+        "rendering",
+        "final_qa",
+        "complete",
+    }
+    assert not any("Gemma 4 12B is writing" in message for _, message in progress)
+    assert not (run / "ollama-response.json").exists()
+
+    response_metadata = json.loads(
+        (run / "ollama-response-envelope.json").read_text(encoding="utf-8")
+    )
+    assert response_metadata["provider"] == "deterministic"
+    assert response_metadata["runtime"] == "local"
+    assert response_metadata["model"] is None
+    assert response_metadata["response_envelope_type"] == "deterministic-local-patches"
+    assert response_metadata["output_format"] == "deterministic-json"
+    assert response_metadata["execution"]["execution_mode"] == "deterministic_only"
+    assert response_metadata["execution"]["ollama_invoked"] is False
+    assert response_metadata.get("response") is None
+
+    metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["status"] == "COMPLETE"
+    assert metadata["writer"] == {
+        "provider": "deterministic",
+        "name": "Deterministic local compiler",
+        "model": None,
+        "document_format": "headless",
+        "runtime": "local",
+        "ollama_invoked": False,
+    }
+    initial = metadata["revision_cycle"]["initial"]
+    assert initial["provider"] == "deterministic"
+    assert initial["runtime"] == "local"
+    assert initial["model"] is None
+    assert initial["ollama_invoked"] is False
+    assert initial["execution_mode"] == "deterministic-local"
+    assert initial["execution"] == response_metadata["execution"]
+    assert "response" not in initial
+    tailored_reference = initial["tailored_content"]
+    assert tailored_reference["filename"] == "tailored-content.initial.json"
+    assert sha256_file(run / tailored_reference["filename"]) == tailored_reference[
+        "sha256"
+    ]
+    tailored = json.loads(
+        (run / tailored_reference["filename"]).read_text(encoding="utf-8")
+    )
+    assert tailored["skill_groups"][2]["text"] == (
+        "FastAPI, JSON Schema, pytest, SQL"
+    )
+
+
 def test_default_gemma_artifact_preflight_failure_is_provider_specific(
     master_resume: Path,
     job_file: Path,

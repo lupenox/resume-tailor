@@ -30,6 +30,14 @@ from .patch_engine import (
 )
 from .revision import approved_revision_targets, build_revision_prompt
 from .schemas import _jsonschema_module, load_schema, parse_json_text, validate_payload
+from .structured_patch_compiler import (
+    combine_hybrid_patch_payload,
+    compile_deterministic_structured_patches,
+    deterministic_only_metadata,
+    hybrid_execution_metadata,
+    is_deterministic_structured_target,
+    partition_edit_catalog,
+)
 from .utilities import (
     ModelError,
     AntigravityTailoringPreflightError,
@@ -71,6 +79,30 @@ _TRUNCATION_DONE_REASONS = frozenset({"length", "limit", "max_tokens"})
 
 #: Sanitized validation-path identifier recorded when nothing failed.
 _VALIDATION_PATH_PASS = "pass"
+
+_EXECUTION_METADATA_FIELDS = (
+    "execution_mode",
+    "deterministic_patch_count",
+    "gemma_patch_count",
+    "deterministic_target_ids",
+    "prose_target_ids",
+    "full_catalog_digest",
+    "writer_subset_digest",
+    "ollama_invoked",
+    "writer_skipped",
+    "writer_skipped_reason",
+)
+
+
+def _sanitized_execution_metadata(
+    execution: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy only the content-free hybrid execution telemetry contract."""
+    return {
+        field: copy.deepcopy(execution[field])
+        for field in _EXECUTION_METADATA_FIELDS
+        if field in execution
+    }
 
 
 def validate_ollama_model_name(value: str) -> str:
@@ -247,6 +279,7 @@ def _authorized_source_catalog(
         block
         for block in extracted_resume["source_blocks"]
         if block.get("source_id") in authorized_ids
+        and not is_deterministic_structured_target(str(block.get("source_id")))
     ]
 
 
@@ -308,34 +341,49 @@ def build_ollama_tailoring_prompt(
     approved_analysis: dict[str, Any],
     company: str,
     role: str,
+    prose_edits: list[dict[str, Any]] | None = None,
+    prose_catalog_sha256: str | None = None,
+    preflighted_catalog: list[dict[str, Any]] | None = None,
 ) -> str:
-    try:
-        edits = preflight_tailoring_inputs(
-            master_content=master_content,
-            extracted_resume=extracted_resume,
-            job_description=job_description,
-            job_requirements=job_requirements,
-            approved_analysis=approved_analysis,
-            company=company,
-            role=role,
-        )
-    except AntigravityTailoringPreflightError as exc:
-        raise TailoringPreflightError(
-            "Local Ollama tailoring preflight failed. No writer request was launched."
-        ) from exc
+    if preflighted_catalog is None:
+        try:
+            edits = preflight_tailoring_inputs(
+                master_content=master_content,
+                extracted_resume=extracted_resume,
+                job_description=job_description,
+                job_requirements=job_requirements,
+                approved_analysis=approved_analysis,
+                company=company,
+                role=role,
+            )
+        except AntigravityTailoringPreflightError as exc:
+            raise TailoringPreflightError(
+                "Local Ollama tailoring preflight failed. No writer request was launched."
+            ) from exc
+    else:
+        # ``invoke_ollama()`` authenticates once at its entrypoint and passes
+        # that exact catalog through so prompt construction cannot rerun or
+        # diverge from the authoritative preflight result.
+        edits = preflighted_catalog
 
-    catalog = approved_edit_catalog(approved_analysis)
-    duplicate_targets = duplicate_catalog_target_ids(catalog)
+    duplicate_targets = duplicate_catalog_target_ids(edits)
     if duplicate_targets:
         raise TailoringPreflightError(
             "Local Ollama tailoring preflight failed: the approved edit catalog "
             f"repeats target source IDs {duplicate_targets}. No writer request was launched."
         )
-    catalog_sha256 = canonical_digest(catalog)
+
+    # When prose_edits is supplied, build the prompt from prose edits only.
+    if prose_edits is not None:
+        prompt_catalog = prose_edits
+        catalog_sha256 = prose_catalog_sha256 or canonical_digest(prose_edits)
+    else:
+        prompt_catalog = edits
+        catalog_sha256 = canonical_digest(prompt_catalog)
 
     target_descriptors: list[dict[str, Any]] = []
     try:
-        for edit in catalog:
+        for edit in prompt_catalog:
             descriptor = resolve_target_descriptor(
                 edit, master_content, extracted_resume
             )
@@ -350,7 +398,10 @@ def build_ollama_tailoring_prompt(
                     "maximum_rendered_characters": descriptor.maximum_rendered_characters,
                     "mutable_proposed_body": mutable_proposed_text(edit, descriptor),
                     "alignment_rationale": descriptor.alignment_rationale,
-                    "evidence_source_ids": descriptor.evidence_source_ids,
+                    "evidence_source_ids": [
+                        eid for eid in descriptor.evidence_source_ids
+                        if not is_deterministic_structured_target(eid)
+                    ],
                     "authenticated_metrics": authenticated_metrics_for_edit(
                         edit, descriptor, extracted_resume
                     ),
@@ -362,13 +413,27 @@ def build_ollama_tailoring_prompt(
             "cannot be resolved safely. No writer request was launched."
         ) from exc
 
-    source_catalog = _authorized_source_catalog(extracted_resume, edits)
+    # Build source catalog from prose edits only when partitioned.
+    source_catalog = _authorized_source_catalog(
+        extracted_resume,
+        prose_edits if prose_edits is not None else edits,
+    )
+
+    # Structured-list targets are compiled locally; only prose targets here.
+    prose_authority_note = ""
+    if prose_edits is not None:
+        prose_authority_note = (
+            "\nIMPORTANT: All supplied targets are prose targets. Structured lists "
+            "(skill groups, coursework, certifications) are compiled locally and are "
+            "outside the model's authority. Return exactly one patch per supplied "
+            "prose edit.\n"
+        )
 
     return f"""Author target-only edits for the approved resume tailoring now. Return exactly one
 JSON object matching the supplied structured-output schema. Do not return
 Markdown, commentary, planning, questions, or JSON fences. Do not return or rewrite
 the complete resume.
-
+{prose_authority_note}
 TARGET
 Company: {company}
 Role: {role}
@@ -394,8 +459,8 @@ FORBIDDEN CLAIMS
 AUTHORING RULES
 1. AUTHOR ONLY MUTABLE TARGET VALUES.
    - Author one bounded replacement for each supplied edit in APPROVED EDIT CATALOG.
-   - For composite targets with labels (e.g. skill_groups or coursework), return ONLY the mutable body text.
-     NEVER include or rewrite the label (e.g. do NOT write 'Software & Data:').
+   - For composite targets with labels, return ONLY the mutable body text.
+     NEVER include or rewrite the label.
 2. OPERATION SEMANTICS.
    - For "replace": replacement_text is the new complete mutable text.
    - For "append": replacement_text MUST start with the exact mutable_current_body prefix and add a nonempty suffix.
@@ -555,6 +620,7 @@ def _write_metadata(
     budget: OllamaBudget,
     generation: dict[str, Any] | None = None,
     probe: dict[str, Any] | None = None,
+    execution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_bytes = prompt.encode("utf-8")
     metadata = {
@@ -564,6 +630,7 @@ def _write_metadata(
         "model": model,
         "endpoint": OLLAMA_BASE_URL,
         "local_only": True,
+        "ollama_invoked": True,
         "execution_mode": "chat",
         "output_format": "json-schema",
         "response_envelope_type": "ollama-chat-message-content-json",
@@ -590,7 +657,40 @@ def _write_metadata(
             "sha256": sha256_file(response_path),
         },
     }
+    if execution is not None:
+        metadata["execution"] = _sanitized_execution_metadata(execution)
     atomic_write_json(run_directory / metadata_filename, metadata)
+    return metadata
+
+
+def _write_deterministic_metadata(
+    *,
+    run_directory: Path,
+    execution: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist an honest no-provider envelope for deterministic execution."""
+    metadata = {
+        "version": 2,
+        "provider": "deterministic",
+        "runtime": "local",
+        "model": None,
+        "endpoint": None,
+        "local_only": True,
+        "ollama_invoked": False,
+        "execution_mode": "deterministic-local",
+        "output_format": "deterministic-json",
+        "response_envelope_type": "deterministic-local-patches",
+        "validation_result": "PASS",
+        "validation_path": _VALIDATION_PATH_PASS,
+        "validation_message": None,
+        "content_logged": False,
+        "schema": None,
+        # There is deliberately no fabricated provider response artifact. The
+        # CLI records the separately authenticated tailored-content artifact.
+        "response": None,
+        "execution": _sanitized_execution_metadata(execution),
+    }
+    atomic_write_json(run_directory / OLLAMA_RESPONSE_METADATA_FILENAME, metadata)
     return metadata
 
 
@@ -663,6 +763,7 @@ def _invoke_payload(
     capabilities: OllamaModelCapabilities,
     budget: OllamaBudget,
     probe: dict[str, Any] | None = None,
+    execution: Mapping[str, Any] | None = None,
     heartbeat_handler: Callable[[float, bool], None] | None = None,
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     response_path = run_directory / response_filename
@@ -703,6 +804,7 @@ def _invoke_payload(
             capabilities=capabilities,
             budget=budget,
             probe=probe,
+            execution=execution,
         )
         raise
     atomic_write_json(response_path, _response_artifact(body))
@@ -737,6 +839,7 @@ def _invoke_payload(
             budget=budget,
             generation=generation,
             probe=probe,
+            execution=execution,
         )
         raise
     if generation["context_window_exceeded"]:
@@ -923,7 +1026,70 @@ def invoke_ollama(
     capability_overrides: Mapping[str, Any] | None = None,
     heartbeat_handler: Callable[[float, bool], None] | None = None,
 ) -> dict[str, Any]:
+    # --- Step 1: Authenticate once and use that exact full catalog. ---
+    try:
+        catalog = preflight_tailoring_inputs(
+            master_content=master_content,
+            extracted_resume=extracted_resume,
+            job_description=job_description,
+            job_requirements=job_requirements,
+            approved_analysis=approved_analysis,
+            company=company,
+            role=role,
+        )
+    except AntigravityTailoringPreflightError as exc:
+        raise TailoringPreflightError(
+            "Local Ollama tailoring preflight failed. No writer request was launched."
+        ) from exc
+
+    # --- Step 2: Reject duplicate targets before compilation or transport. ---
+    duplicate_targets = duplicate_catalog_target_ids(catalog)
+    if duplicate_targets:
+        raise TailoringPreflightError(
+            "Local Ollama tailoring preflight failed: the approved edit catalog "
+            f"repeats target source IDs {duplicate_targets}. No writer request was launched."
+        )
+    full_catalog_sha256 = canonical_digest(catalog)
+
+    # --- Step 3: Partition into deterministic + prose. ---
+    deterministic_edits, prose_edits = partition_edit_catalog(catalog)
+
+    # --- Step 4: Compile and prevalidate deterministic patches. ---
+    deterministic_patches = compile_deterministic_structured_patches(
+        deterministic_edits=deterministic_edits,
+        master_content=master_content,
+        extracted_resume=extracted_resume,
+        approved_analysis=approved_analysis,
+    )
+
+    # --- Deterministic-only run: no provider invocation. ---
+    if not prose_edits:
+        combined_payload = combine_hybrid_patch_payload(
+            deterministic_patches=deterministic_patches,
+            prose_patches=[],
+            full_catalog=catalog,
+            full_catalog_sha256=full_catalog_sha256,
+        )
+        tailored = validate_and_apply_patches(
+            payload=combined_payload,
+            master_content=master_content,
+            extracted_resume=extracted_resume,
+            approved_analysis=approved_analysis,
+        )
+        execution = deterministic_only_metadata(
+            deterministic_patches=deterministic_patches,
+            deterministic_edits=deterministic_edits,
+            full_catalog_sha256=full_catalog_sha256,
+        )
+        _write_deterministic_metadata(
+            run_directory=run_directory,
+            execution=execution,
+        )
+        return tailored
+
+    # --- Step 5–7: Build prose-only prompt, schema, and transport. ---
     model = validate_ollama_model_name(model)
+    prose_catalog_sha256 = canonical_digest(prose_edits)
     prompt = build_ollama_tailoring_prompt(
         master_content=master_content,
         extracted_resume=extracted_resume,
@@ -932,23 +1098,29 @@ def invoke_ollama(
         approved_analysis=approved_analysis,
         company=company,
         role=role,
+        prose_edits=prose_edits,
+        prose_catalog_sha256=prose_catalog_sha256,
+        preflighted_catalog=catalog,
     )
-    catalog = approved_edit_catalog(approved_analysis)
-    duplicate_targets = duplicate_catalog_target_ids(catalog)
-    if duplicate_targets:
-        raise TailoringPreflightError(
-            "Local Ollama tailoring preflight failed: the approved edit catalog "
-            f"repeats target source IDs {duplicate_targets}. No writer request was launched."
-        )
-    catalog_sha256 = canonical_digest(catalog)
+
+    # --- Step 8: Writer-subset transport schema. ---
     schema, transport_path = _write_tailoring_patch_transport_schema(
         run_directory,
-        catalog=catalog,
-        catalog_sha256=catalog_sha256,
+        catalog=prose_edits,
+        catalog_sha256=prose_catalog_sha256,
     )
     probe = probe_structured_output_support(schema)
     capabilities = capabilities_for_model(model, overrides=capability_overrides)
     budget = plan_ollama_budget(prompt=prompt, capabilities=capabilities)
+    pending_execution = hybrid_execution_metadata(
+        deterministic_patches=deterministic_patches,
+        prose_patches=[],
+        deterministic_edits=deterministic_edits,
+        prose_edits=prose_edits,
+        full_catalog_sha256=full_catalog_sha256,
+        writer_subset_sha256=prose_catalog_sha256,
+        ollama_invoked=True,
+    )
     payload, response_path, generation = _invoke_payload(
         model=model,
         prompt=prompt,
@@ -961,16 +1133,97 @@ def invoke_ollama(
         capabilities=capabilities,
         budget=budget,
         probe=probe,
+        execution=pending_execution,
         heartbeat_handler=heartbeat_handler,
     )
+
+    provider_patches = payload.get("patches")
+    returned_prose_patches = (
+        provider_patches if isinstance(provider_patches, list) else []
+    )
+    execution = hybrid_execution_metadata(
+        deterministic_patches=deterministic_patches,
+        prose_patches=returned_prose_patches,
+        deterministic_edits=deterministic_edits,
+        prose_edits=prose_edits,
+        full_catalog_sha256=full_catalog_sha256,
+        writer_subset_sha256=prose_catalog_sha256,
+        ollama_invoked=True,
+    )
+
     try:
+        # The provider grammar omits canonical cross-field assertions. Apply
+        # the complete schema before interpreting status or normalizing the
+        # prose-only response into the full hybrid payload.
+        try:
+            validate_payload(
+                payload,
+                "ollama_tailoring_patch.schema.json",
+                label="Gemma 4 12B patch payload",
+            )
+        except ModelError as exc:
+            raise OllamaCanonicalSchemaError(
+                "Gemma 4 12B output failed canonical patch envelope validation."
+            ) from exc
+
+        # --- Step 9: Reject any provider-authored structured target. ---
+        for provider_patch in returned_prose_patches:
+            target_id = provider_patch.get("target_source_id")
+            if isinstance(target_id, str) and is_deterministic_structured_target(
+                target_id
+            ):
+                raise OllamaTailoringContractError(
+                    "Provider response contains a deterministic structured "
+                    "target that was not authorized."
+                )
+
+        prose_status = payload.get("status")
+        if prose_status == "cannot_apply":
+            detail = payload["cannot_apply"]
+            prose_edit_ids = {edit["edit_id"] for edit in prose_edits}
+            if detail["edit_id"] not in prose_edit_ids:
+                raise OllamaEvidenceRejectionError(
+                    "The local writer returned an unknown approved edit ID in cannot_apply."
+                )
+            raise OllamaCannotApplyError(
+                "The local writer could not apply approved "
+                f"{detail['edit_id']} ({detail['reason_code']})."
+            )
+        if prose_status == "technical_failure":
+            detail = payload["technical_failure"]
+            raise OllamaTechnicalFailureError(
+                "The local writer reported technical failure "
+                f"{detail['reason_code']}. Provider prose was omitted."
+            )
+
+        # Extract validated prose patches from provider response.
+        if not isinstance(provider_patches, list):
+            raise OllamaCanonicalSchemaError(
+                "Provider patch envelope 'patches' field must be an array."
+            )
+
+        # --- Step 10: Combine prose + deterministic, full-catalog order. ---
+        combined_payload = combine_hybrid_patch_payload(
+            deterministic_patches=deterministic_patches,
+            prose_patches=provider_patches,
+            full_catalog=catalog,
+            full_catalog_sha256=full_catalog_sha256,
+        )
+
+        # --- Step 11: Validate and apply through the full authoritative path. ---
         tailored = validate_and_apply_patches(
-            payload=payload,
+            payload=combined_payload,
             master_content=master_content,
             extracted_resume=extracted_resume,
             approved_analysis=approved_analysis,
         )
     except ModelError as exc:
+        if isinstance(exc, OllamaCannotApplyError):
+            validation_path = "cannot_apply"
+        elif isinstance(exc, OllamaTechnicalFailureError):
+            validation_path = "technical_failure"
+        else:
+            validation_path = getattr(exc, "validation_path", "patch_contract")
         _write_metadata(
             run_directory=run_directory,
             metadata_filename=OLLAMA_RESPONSE_METADATA_FILENAME,
@@ -979,14 +1232,16 @@ def invoke_ollama(
             model=model,
             prompt=prompt,
             validation_result="REJECTED",
-            validation_path=getattr(exc, "validation_path", "patch_contract"),
+            validation_path=validation_path,
             validation_message=str(exc),
             capabilities=capabilities,
             budget=budget,
             generation=generation,
             probe=probe,
+            execution=execution,
         )
         raise
+
     _write_metadata(
         run_directory=run_directory,
         metadata_filename=OLLAMA_RESPONSE_METADATA_FILENAME,
@@ -1000,6 +1255,7 @@ def invoke_ollama(
         budget=budget,
         generation=generation,
         probe=probe,
+        execution=execution,
     )
     return tailored
 
@@ -1031,6 +1287,20 @@ def invoke_ollama_revision(
         raise OllamaRevisionContractError(
             "A local writer revision requires authenticated material QA findings."
         )
+
+    # --- Reject structured revision targets before provider invocation. ---
+    target_map = approved_revision_targets(
+        qa_result=qa_result,
+        approved_analysis=approved_analysis,
+    )
+    for revision_target_id in target_map:
+        if is_deterministic_structured_target(revision_target_id):
+            raise OllamaRevisionContractError(
+                "Revision of deterministic structured target "
+                f"{revision_target_id!r} requires new analysis; "
+                "structured_target_requires_new_analysis."
+            )
+
     model = validate_ollama_model_name(model)
     prompt = build_ollama_revision_prompt(
         current_tailored_content=current_tailored_content,
@@ -1039,10 +1309,6 @@ def invoke_ollama_revision(
         qa_result=qa_result,
         company=company,
         role=role,
-    )
-    target_map = approved_revision_targets(
-        qa_result=qa_result,
-        approved_analysis=approved_analysis,
     )
     authorization_sha256 = canonical_digest(target_map)
     schema, transport_path = _write_revision_patch_transport_schema(

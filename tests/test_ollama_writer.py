@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -23,10 +24,12 @@ from resume_tailor.ollama_probe import (
 from resume_tailor.utilities import (
     OllamaBudgetError,
     OllamaCanonicalSchemaError,
+    OllamaCannotApplyError,
     OllamaMalformedJSONError,
     OllamaOutputTruncationError,
     OllamaResponseEnvelopeError,
     OllamaTailoringContractError,
+    OllamaTechnicalFailureError,
     OllamaTransportSchemaError,
     TailoringPreflightError,
 )
@@ -36,7 +39,12 @@ FIXTURE_DIRECTORY = Path(__file__).resolve().parent / "fixtures"
 WRONG_ROOT_FIXTURE = FIXTURE_DIRECTORY / "ollama_wrong_root_resume_response.json"
 
 
-def _resolved_analysis(extracted: dict, requirements: dict) -> dict:
+def _resolved_analysis(
+    extracted: dict,
+    requirements: dict,
+    *,
+    recommended_edits: list[dict] | None = None,
+) -> dict:
     analysis = {
         "role_summary": "Synthetic role",
         "fit_assessment": {"overall": "Fit", "strengths": [], "gaps": []},
@@ -46,7 +54,17 @@ def _resolved_analysis(extracted: dict, requirements: dict) -> dict:
         "ats_keyword_assessment": [],
         "supported_ats_keywords": [],
         "missing_or_unsupported_requirements": [],
-        "recommended_edits": [],
+        "recommended_edits": recommended_edits
+        if recommended_edits is not None
+        else [
+            {
+                "target_source_id": "professional_summary",
+                "proposed_text": "Updated text",
+                "alignment_rationale": "Test rationale",
+                "evidence_source_ids": ["professional_summary"],
+                "operation": "replace",
+            }
+        ],
         "immutable_facts": [],
         "forbidden_claims": ["Unsupported synthetic claim"],
         "content_budget_guidance": [],
@@ -63,6 +81,38 @@ def _resolved_analysis(extracted: dict, requirements: dict) -> dict:
     )
     assert issues == []
     return resolved
+
+
+def _deterministic_edits(extracted: dict) -> list[dict]:
+    group = extracted["content"]["skill_groups"][0]
+    items = [item.strip() for item in group["text"].split(",")]
+    reordered = ", ".join([*items[1:], items[0]])
+    return [
+        {
+            "target_source_id": "skill_groups.0",
+            "proposed_text": f"{group['label']}: {reordered}",
+            "alignment_rationale": "Reorder authenticated synthetic skills.",
+            "evidence_source_ids": ["skill_groups.0"],
+            "operation": "replace",
+        }
+    ]
+
+
+def _mixed_analysis(extracted: dict, requirements: dict) -> dict:
+    return _resolved_analysis(
+        extracted,
+        requirements,
+        recommended_edits=[
+            *_deterministic_edits(extracted),
+            {
+                "target_source_id": "professional_summary",
+                "proposed_text": "Updated text",
+                "alignment_rationale": "Test rationale",
+                "evidence_source_ids": ["professional_summary"],
+                "operation": "replace",
+            },
+        ],
+    )
 
 
 def _inputs(master_resume: Path) -> tuple[dict, str, dict, dict]:
@@ -164,7 +214,7 @@ def test_gemma_invocation_uses_schema_mode_and_canonical_validation(
         timeout_seconds=30,
     )
 
-    assert tailored == extracted["content"]
+    assert tailored != extracted["content"]
     request = observed["body"]
     assert isinstance(request, dict)
     assert request["model"] == "resume-tailor-gemma"
@@ -198,6 +248,205 @@ def test_gemma_invocation_uses_schema_mode_and_canonical_validation(
     assert envelope["structured_output_probe"]["supported"] is True
     assert envelope["structured_output_probe"]["provider_called"] is False
     assert envelope["generation"]["truncated"] is False
+    assert envelope["ollama_invoked"] is True
+    assert envelope["execution"]["execution_mode"] == "prose_only"
+    assert envelope["execution"]["deterministic_patch_count"] == 0
+    assert envelope["execution"]["gemma_patch_count"] == 1
+    assert envelope["execution"]["ollama_invoked"] is True
+
+
+def test_mixed_run_persists_sanitized_hybrid_execution_metadata(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _mixed_analysis(extracted, requirements)
+    catalog = writer.approved_edit_catalog(analysis)
+    deterministic_edits, prose_edits = writer.partition_edit_catalog(catalog)
+    full_digest = writer.canonical_digest(catalog)
+    prose_digest = writer.canonical_digest(prose_edits)
+    provider_calls = 0
+    preflight_calls = 0
+    real_preflight = writer.preflight_tailoring_inputs
+
+    def tracked_preflight(**kwargs: object) -> list[dict]:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return real_preflight(**kwargs)
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        nonlocal provider_calls
+        provider_calls += 1
+        response = _complete(
+            patches=[
+                {
+                    "edit_id": prose_edits[0]["edit_id"],
+                    "target_source_id": prose_edits[0]["target_source_id"],
+                    "operation": prose_edits[0]["operation"],
+                    "replacement_text": prose_edits[0]["proposed_text"],
+                }
+            ]
+        )
+        response["catalog_sha256"] = prose_digest
+        return {
+            "model": "resume-tailor-gemma:latest",
+            "done": True,
+            "done_reason": "stop",
+            "message": {"role": "assistant", "content": json.dumps(response)},
+            "prompt_eval_count": 100,
+            "eval_count": 50,
+        }
+
+    monkeypatch.setattr(writer, "preflight_tailoring_inputs", tracked_preflight)
+    monkeypatch.setattr(writer, "run_ollama_request", fake_request)
+    tailored = writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+
+    assert preflight_calls == 1
+    assert provider_calls == 1
+    assert tailored["skill_groups"][0] != extracted["content"]["skill_groups"][0]
+    assert tailored["professional_summary"] == "Updated text"
+    metadata = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    execution = metadata["execution"]
+    assert execution == {
+        "execution_mode": "hybrid",
+        "deterministic_patch_count": 1,
+        "gemma_patch_count": 1,
+        "deterministic_target_ids": [
+            edit["target_source_id"] for edit in deterministic_edits
+        ],
+        "prose_target_ids": [edit["target_source_id"] for edit in prose_edits],
+        "full_catalog_digest": full_digest,
+        "writer_subset_digest": prose_digest,
+        "ollama_invoked": True,
+    }
+    serialized_execution = json.dumps(execution, sort_keys=True)
+    for private_value in (
+        private_job,
+        "Updated text",
+        extracted["content"]["skill_groups"][0]["label"],
+        extracted["content"]["professional_summary"],
+        "Test rationale",
+    ):
+        assert private_value not in serialized_execution
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_error", "validation_path"),
+    [
+        ("cannot_apply", OllamaCannotApplyError, "cannot_apply"),
+        ("technical_failure", OllamaTechnicalFailureError, "technical_failure"),
+    ],
+)
+def test_provider_failure_status_preserves_response_and_execution_telemetry(
+    status: str,
+    expected_error: type[Exception],
+    validation_path: str,
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _mixed_analysis(extracted, requirements)
+    original = copy.deepcopy(extracted["content"])
+    catalog = writer.approved_edit_catalog(analysis)
+    deterministic_edits, prose_edits = writer.partition_edit_catalog(catalog)
+    full_digest = writer.canonical_digest(catalog)
+    prose_digest = writer.canonical_digest(prose_edits)
+    provider_marker = f"SYNTHETIC_PROVIDER_{status.upper()}_MARKER"
+    response = {
+        "status": status,
+        "message": provider_marker,
+        "catalog_sha256": prose_digest,
+        "cannot_apply": (
+            {
+                "edit_id": prose_edits[0]["edit_id"],
+                "reason_code": "unsupported_claim_risk",
+                "reason": provider_marker,
+            }
+            if status == "cannot_apply"
+            else None
+        ),
+        "technical_failure": (
+            {
+                "reason_code": "other_technical_failure",
+                "reason": provider_marker,
+            }
+            if status == "technical_failure"
+            else None
+        ),
+        "patches": None,
+    }
+
+    monkeypatch.setattr(
+        writer,
+        "run_ollama_request",
+        lambda **kwargs: {
+            "model": "resume-tailor-gemma:latest",
+            "done": True,
+            "done_reason": "stop",
+            "message": {"role": "assistant", "content": json.dumps(response)},
+            "prompt_eval_count": 100,
+            "eval_count": 50,
+        },
+    )
+
+    with pytest.raises(expected_error):
+        writer.invoke_ollama(
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            job_description=private_job,
+            job_requirements=requirements,
+            approved_analysis=analysis,
+            company="Synthetic Systems",
+            role="Validation Engineer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+        )
+
+    assert extracted["content"] == original
+    response_path = tmp_path / writer.OLLAMA_RESPONSE_FILENAME
+    assert response_path.is_file()
+    assert provider_marker in response_path.read_text(encoding="utf-8")
+    metadata = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["validation_result"] == "REJECTED"
+    assert metadata["validation_path"] == validation_path
+    assert metadata["response"] == {
+        "filename": writer.OLLAMA_RESPONSE_FILENAME,
+        "sha256": writer.sha256_file(response_path),
+    }
+    assert metadata["execution"] == {
+        "execution_mode": "hybrid",
+        "deterministic_patch_count": 1,
+        "gemma_patch_count": 0,
+        "deterministic_target_ids": [
+            edit["target_source_id"] for edit in deterministic_edits
+        ],
+        "prose_target_ids": [edit["target_source_id"] for edit in prose_edits],
+        "full_catalog_digest": full_digest,
+        "writer_subset_digest": prose_digest,
+        "ollama_invoked": True,
+    }
+    assert provider_marker not in json.dumps(metadata, sort_keys=True)
+    assert not list(tmp_path.glob("tailored-content*.json"))
 
 
 def test_ollama_invalid_json_is_rejected_and_recorded(
@@ -258,6 +507,206 @@ def test_ollama_preflight_failure_is_provider_neutral_and_makes_no_request(
             company="Synthetic Systems",
             role="Validation Engineer",
         )
+
+
+@pytest.mark.parametrize(
+    "failure_case",
+    [
+        "missing_company",
+        "missing_role",
+        "invalid_job_requirements",
+        "mismatched_master_extraction",
+        "unresolved_approved_analysis",
+    ],
+)
+def test_deterministic_entrypoint_preflight_rejects_before_compile_or_provider(
+    failure_case: str,
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _resolved_analysis(
+        extracted,
+        requirements,
+        recommended_edits=_deterministic_edits(extracted),
+    )
+    master_content = extracted["content"]
+    company = "Synthetic Systems"
+    role = "Validation Engineer"
+    supplied_requirements = requirements
+    supplied_analysis = analysis
+
+    if failure_case == "missing_company":
+        company = ""
+    elif failure_case == "missing_role":
+        role = ""
+    elif failure_case == "invalid_job_requirements":
+        supplied_requirements = {}
+    elif failure_case == "mismatched_master_extraction":
+        master_content = copy.deepcopy(master_content)
+        master_content["professional_summary"] = "Mismatched synthetic summary."
+    else:
+        supplied_analysis = copy.deepcopy(analysis)
+        supplied_analysis["recommended_edits"][0].pop("resolved_evidence")
+
+    real_preflight = writer.preflight_tailoring_inputs
+    preflight_calls = 0
+
+    def tracked_preflight(**kwargs: object) -> list[dict]:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return real_preflight(**kwargs)
+
+    monkeypatch.setattr(writer, "preflight_tailoring_inputs", tracked_preflight)
+    monkeypatch.setattr(
+        writer,
+        "compile_deterministic_structured_patches",
+        lambda **kwargs: pytest.fail("compilation ran before preflight passed"),
+    )
+    monkeypatch.setattr(
+        writer,
+        "run_ollama_request",
+        lambda **kwargs: pytest.fail("provider ran before preflight passed"),
+    )
+
+    with pytest.raises(TailoringPreflightError, match="No writer request"):
+        writer.invoke_ollama(
+            master_content=master_content,
+            extracted_resume=extracted,
+            job_description=private_job,
+            job_requirements=supplied_requirements,
+            approved_analysis=supplied_analysis,
+            company=company,
+            role=role,
+            run_directory=tmp_path,
+            timeout_seconds=30,
+            model="invalid model name",
+        )
+
+    assert preflight_calls == 1
+    assert not (tmp_path / writer.OLLAMA_RESPONSE_FILENAME).exists()
+    assert not (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).exists()
+
+
+def test_deterministic_only_metadata_is_complete_and_has_no_provider_artifact(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _resolved_analysis(
+        extracted,
+        requirements,
+        recommended_edits=_deterministic_edits(extracted),
+    )
+    expected_catalog = writer.approved_edit_catalog(analysis)
+    real_preflight = writer.preflight_tailoring_inputs
+    preflight_calls = 0
+
+    def tracked_preflight(**kwargs: object) -> list[dict]:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return real_preflight(**kwargs)
+
+    monkeypatch.setattr(writer, "preflight_tailoring_inputs", tracked_preflight)
+    monkeypatch.setattr(
+        writer,
+        "approved_edit_catalog",
+        lambda *_args, **_kwargs: pytest.fail(
+            "writer re-derived the catalog after authoritative preflight"
+        ),
+    )
+    monkeypatch.setattr(
+        writer,
+        "run_ollama_request",
+        lambda **kwargs: pytest.fail("deterministic-only run invoked Ollama"),
+    )
+
+    tailored = writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+        # An unused provider model must not affect deterministic execution.
+        model="invalid model name",
+    )
+
+    assert preflight_calls == 1
+    assert tailored["skill_groups"][0] != extracted["content"]["skill_groups"][0]
+    assert not (tmp_path / writer.OLLAMA_RESPONSE_FILENAME).exists()
+    metadata = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["provider"] == "deterministic"
+    assert metadata["runtime"] == "local"
+    assert metadata["model"] is None
+    assert metadata["ollama_invoked"] is False
+    assert metadata["execution_mode"] == "deterministic-local"
+    assert metadata["response_envelope_type"] == "deterministic-local-patches"
+    assert metadata["output_format"] == "deterministic-json"
+    assert metadata["response"] is None
+    assert metadata["validation_result"] == "PASS"
+    assert metadata["validation_path"] == "pass"
+    assert metadata["execution"] == {
+        "execution_mode": "deterministic_only",
+        "deterministic_patch_count": 1,
+        "gemma_patch_count": 0,
+        "deterministic_target_ids": ["skill_groups.0"],
+        "prose_target_ids": [],
+        "full_catalog_digest": writer.canonical_digest(expected_catalog),
+        "writer_subset_digest": None,
+        "ollama_invoked": False,
+        "writer_skipped": True,
+        "writer_skipped_reason": "all_targets_deterministic",
+    }
+
+
+def test_empty_catalog_is_a_deterministic_noop_without_provider_artifacts(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, private_job, requirements, _ = _inputs(master_resume)
+    analysis = _resolved_analysis(extracted, requirements, recommended_edits=[])
+    monkeypatch.setattr(
+        writer,
+        "run_ollama_request",
+        lambda **kwargs: pytest.fail("empty catalog invoked Ollama"),
+    )
+
+    tailored = writer.invoke_ollama(
+        master_content=extracted["content"],
+        extracted_resume=extracted,
+        job_description=private_job,
+        job_requirements=requirements,
+        approved_analysis=analysis,
+        company="Synthetic Systems",
+        role="Validation Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+        model="invalid model name",
+    )
+
+    assert tailored == extracted["content"]
+    assert tailored is not extracted["content"]
+    assert not (tmp_path / writer.OLLAMA_RESPONSE_FILENAME).exists()
+    metadata = json.loads(
+        (tmp_path / writer.OLLAMA_RESPONSE_METADATA_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["response"] is None
+    assert metadata["execution"]["deterministic_patch_count"] == 0
+    assert metadata["execution"]["gemma_patch_count"] == 0
+    assert metadata["execution"]["writer_skipped_reason"] == "empty_catalog"
 
 
 def _fixture_body() -> dict:

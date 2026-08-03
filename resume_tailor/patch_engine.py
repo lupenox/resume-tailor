@@ -311,6 +311,53 @@ def authenticated_metrics_for_edit(
     )
 
 
+class StructuredItemGroundingError(OllamaTailoringContractError):
+    """A structured-list item lacks exact authenticated source evidence."""
+
+
+_STRUCTURED_LIST_TARGET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^skill_groups\.\d+$"),
+    re.compile(r"^education\.coursework$"),
+    re.compile(r"^education\.certifications$"),
+)
+_STRUCTURED_LIST_DELIMITERS = re.compile(r"\s*[,•]\s*")
+
+
+def _validate_structured_list_items(
+    *,
+    edit_id: str,
+    target_source_id: str,
+    replacement_text: str,
+    evidence_texts: list[str],
+) -> None:
+    """Require every structured-list item to occur in authenticated evidence.
+
+    The check is deliberately lexical: each comma- or bullet-delimited item
+    must occur as the same normalized phrase in the target's authorized source
+    evidence.  It does not use fuzzy matching, aliases, semantic similarity,
+    or provider judgment.
+    """
+    if not any(
+        pattern.fullmatch(target_source_id)
+        for pattern in _STRUCTURED_LIST_TARGET_PATTERNS
+    ):
+        return
+
+    normalized_evidence = normalized_text(" ".join(evidence_texts))
+    for item in _STRUCTURED_LIST_DELIMITERS.split(replacement_text):
+        candidate = item.strip().rstrip(".")
+        if candidate and normalized_text(candidate) not in normalized_evidence:
+            item_kind = (
+                "skill item"
+                if re.fullmatch(r"skill_groups\.\d+", target_source_id)
+                else "structured item"
+            )
+            raise StructuredItemGroundingError(
+                f"Patch for {edit_id} adds {item_kind} {candidate!r} to "
+                f"{target_source_id!r} without authenticated source evidence."
+            )
+
+
 def _validate_replacement_text(
     *,
     edit_id: str,
@@ -373,15 +420,12 @@ def _validate_replacement_text(
             f"{sorted(new_metrics)}."
         )
 
-    if re.fullmatch(r"skill_groups\.\d+", descriptor.target_source_id):
-        normalized_evidence = normalized_text(authorized_text)
-        for item in re.split(r"\s*[,•]\s*", replacement_text):
-            candidate = item.strip().rstrip(".")
-            if candidate and normalized_text(candidate) not in normalized_evidence:
-                raise OllamaTailoringContractError(
-                    f"Patch for {edit_id} adds skill item {candidate!r} without "
-                    "authenticated source evidence."
-                )
+    _validate_structured_list_items(
+        edit_id=edit_id,
+        target_source_id=descriptor.target_source_id,
+        replacement_text=replacement_text,
+        evidence_texts=evidence_texts,
+    )
 
     for forbidden in forbidden_claims:
         if not isinstance(forbidden, str):

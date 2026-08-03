@@ -22,7 +22,10 @@ from resume_tailor.patch_engine import (
     mutable_proposed_text,
     validate_and_apply_patches,
 )
-from resume_tailor.utilities import TailoringPreflightError
+from resume_tailor.utilities import (
+    OllamaTailoringContractError,
+    TailoringPreflightError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +724,64 @@ def test_24_downstream_validation_unchanged(master_resume: Path):
     }
     from resume_tailor.utilities import OllamaTailoringContractError
     with pytest.raises(OllamaTailoringContractError, match="without authenticated source evidence"):
+        validate_and_apply_patches(
+            payload=payload,
+            master_content=extracted["content"],
+            extracted_resume=extracted,
+            approved_analysis=analysis,
+        )
+
+
+@pytest.mark.parametrize(
+    ("target_source_id", "unsupported_item"),
+    [
+        ("skill_groups.2", "COBOL"),
+        ("education.coursework", "Quantum Cryptography"),
+        ("education.certifications", "CISSP"),
+    ],
+)
+def test_24b_full_payload_rejects_unsupported_structured_item(
+    master_resume: Path,
+    target_source_id: str,
+    unsupported_item: str,
+) -> None:
+    """The final applicator grounds every Python-owned list target itself."""
+    extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(
+        master_resume,
+        unsupported_item,
+    )
+    analysis = copy.deepcopy(analysis)
+    analysis["recommended_edits"] = [
+        {
+            "target_source_id": target_source_id,
+            "operation": "replace",
+            "proposed_text": unsupported_item,
+            "alignment_rationale": "Synthetic unsupported structured item.",
+            "evidence_source_ids": [target_source_id],
+            "resolved_evidence": [],
+        }
+    ]
+    catalog = writer.approved_edit_catalog(analysis)
+    payload = {
+        "status": "complete",
+        "message": "Complete",
+        "catalog_sha256": writer.canonical_digest(catalog),
+        "cannot_apply": None,
+        "technical_failure": None,
+        "patches": [
+            {
+                "edit_id": catalog[0]["edit_id"],
+                "target_source_id": target_source_id,
+                "operation": "replace",
+                "replacement_text": unsupported_item,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        OllamaTailoringContractError,
+        match=rf"{target_source_id!s}.*without authenticated source evidence",
+    ):
         validate_and_apply_patches(
             payload=payload,
             master_content=extracted["content"],
