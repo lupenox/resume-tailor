@@ -108,7 +108,9 @@ from .utilities import (
     GemmaConnectionError,
     GemmaInnerAnalysisError,
     GemmaModelUnavailableError,
+    GemmaOllamaInternalError,
     GemmaOllamaUnavailableError,
+    GemmaOutputLimitError,
     GemmaResponseTooLargeError,
     GemmaStructuredOutputError,
     GemmaTransportEnvelopeError,
@@ -2408,6 +2410,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["analysis_failure_classification"] = exc.classification
         if isinstance(exc, GemmaAnalysisTimeoutError):
             metadata["failure_class"] = "gemma-analysis-timeout"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaOllamaInternalError):
+            metadata["failure_class"] = "gemma-ollama-internal-error"
+            metadata["analysis_failure_classification"] = exc.classification
+        if isinstance(exc, GemmaOutputLimitError):
+            metadata["failure_class"] = "gemma-output-limit"
             metadata["analysis_failure_classification"] = exc.classification
         if isinstance(exc, GemmaConnectionError):
             metadata["failure_class"] = "gemma-connection-failure"

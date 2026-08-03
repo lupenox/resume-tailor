@@ -536,7 +536,22 @@
                 <strong>Grok CLI analysis failure</strong>
                 <span>Grok analysis stopped safely. Sanitized diagnostics may be preserved under grok-analysis-* filenames. No automatic provider fallback was attempted.</span>
               </div>
-            {% elif run.failure_kind in ["gemma_ollama_unavailable", "gemma_model_unavailable", "gemma_timeout", "gemma_connection", "gemma_response_too_large", "gemma_transport", "gemma_inner_analysis", "gemma_structured_output"] %}
+            {% elif run.failure_kind == "gemma_timeout" %}
+              <div class="alert alert-warning">
+                <strong>Gemma Local analysis timed out</strong>
+                <span>Gemma Local analysis exceeded its generation time limit. Ollama was running and generated output until the deadline; this is not an unavailable Ollama service. No automatic provider fallback occurred. Start a new run or explicitly select another analysis provider.</span>
+              </div>
+            {% elif run.failure_kind == "gemma_output_limit" %}
+              <div class="alert alert-warning">
+                <strong>Gemma Local output limit reached</strong>
+                <span>Generation hit the configured analysis token ceiling before a complete valid response was produced. Truncated JSON was not accepted. No automatic provider fallback occurred.</span>
+              </div>
+            {% elif run.failure_kind == "gemma_ollama_unavailable" %}
+              <div class="alert alert-warning">
+                <strong>Local Ollama unavailable</strong>
+                <span>Confirm Ollama is running on 127.0.0.1:11434, then start a new run with Gemma Local selected. No automatic provider fallback was attempted.</span>
+              </div>
+            {% elif run.failure_kind in ["gemma_model_unavailable", "gemma_ollama_internal", "gemma_connection", "gemma_response_too_large", "gemma_transport", "gemma_inner_analysis", "gemma_structured_output"] %}
               <div class="alert alert-warning">
                 <strong>Gemma Local analysis failure</strong>
                 <span>Local Gemma analysis stopped safely. Sanitized diagnostics may be preserved under gemma-analysis-* filenames. No automatic provider fallback was attempted.</span>

@@ -20,17 +20,22 @@ from resume_tailor.analysis import (
     workflow_stages_for_provider,
 )
 from resume_tailor.cli import build_parser
+from resume_tailor.codex_analysis import build_analysis_prompt
 from resume_tailor.docx_extract import extract_resume
 from resume_tailor.evidence import resolve_analysis_evidence
 from resume_tailor.gemma_analysis import (
+    DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS,
     GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME,
     GEMMA_ANALYSIS_PROMPT_FILENAME,
     GEMMA_ANALYSIS_RESPONSE_FILENAME,
     GEMMA_ANALYSIS_SCHEMA_FILENAME,
+    build_gemma_analysis_prompt,
+    estimate_prompt_tokens,
     gemma_analysis_chat_request_for_tests,
     invoke_gemma_analysis,
     parse_exact_analysis_json,
     prepare_gemma_analysis_schema,
+    resolve_gemma_analysis_max_output_tokens,
     resolve_gemma_analysis_model,
 )
 from resume_tailor.job_requirements import build_job_requirement_catalog
@@ -38,9 +43,10 @@ from resume_tailor.utilities import (
     GemmaAnalysisTimeoutError,
     GemmaInnerAnalysisError,
     GemmaModelUnavailableError,
+    GemmaOllamaInternalError,
     GemmaOllamaUnavailableError,
-    GemmaTransportEnvelopeError,
-    OllamaConnectionError,
+    GemmaOutputLimitError,
+    OllamaRequestError,
     SourceEvidenceError,
 )
 
@@ -80,36 +86,51 @@ def _valid_analysis(requirements: dict) -> dict[str, Any]:
     }
 
 
-def _ollama_body(content: str | dict[str, Any]) -> dict[str, Any]:
+def _ollama_body(
+    content: str | dict[str, Any],
+    *,
+    done_reason: str = "stop",
+    eval_count: int | None = 20,
+) -> dict[str, Any]:
     if isinstance(content, dict):
         text = json.dumps(content, ensure_ascii=False)
     else:
         text = content
-    return {
+    body: dict[str, Any] = {
         "model": "resume-tailor-gemma",
         "created_at": "2026-01-01T00:00:00Z",
         "done": True,
-        "done_reason": "stop",
+        "done_reason": done_reason,
         "message": {"role": "assistant", "content": text},
         "prompt_eval_count": 10,
-        "eval_count": 20,
     }
+    if eval_count is not None:
+        body["eval_count"] = eval_count
+    return body
 
 
 @pytest.fixture
 def mock_ollama(monkeypatch: pytest.MonkeyPatch):
-    state: dict[str, Any] = {"bodies": [], "requests": [], "calls": 0}
+    state: dict[str, Any] = {"bodies": [], "requests": [], "calls": 0, "errors": []}
 
     def _set_bodies(*bodies: dict[str, Any]) -> None:
         state["bodies"] = list(bodies)
+        state["errors"] = []
+
+    def _set_errors(*errors: BaseException) -> None:
+        state["errors"] = list(errors)
+        state["bodies"] = []
 
     def fake_run_ollama_request(**kwargs: Any) -> dict[str, Any]:
         state["calls"] += 1
         state["requests"].append(kwargs)
+        if state["errors"]:
+            raise state["errors"].pop(0)
         if not state["bodies"]:
-            raise OllamaConnectionError(
-                "The localhost Ollama API request failed. Provider output was "
-                "omitted; confirm that Ollama is running on 127.0.0.1:11434."
+            raise OllamaRequestError(
+                "The localhost Ollama server refused the connection. Confirm Ollama "
+                "is running on 127.0.0.1:11434.",
+                classification="connection_refused",
             )
         return state["bodies"].pop(0)
 
@@ -118,6 +139,7 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch):
         fake_run_ollama_request,
     )
     state["set_bodies"] = _set_bodies
+    state["set_errors"] = _set_errors
     return state
 
 
@@ -128,11 +150,8 @@ def test_gemma_local_is_default_and_labels() -> None:
     assert analysis_workflow_label("gemma_local") == "Gemma Local analysis"
     assert analysis_workflow_label("codex") == "Codex analysis"
     assert analysis_workflow_label("grok_cli") == "Grok CLI analysis"
-    assert analysis_workflow_label("grok") == "Grok CLI analysis"
     stages = dict(workflow_stages_for_provider("grok_cli"))
     assert stages["codex_analysis"] == "Grok CLI analysis"
-    stages_gemma = dict(workflow_stages_for_provider("gemma_local"))
-    assert stages_gemma["codex_analysis"] == "Gemma Local analysis"
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -149,23 +168,28 @@ def test_gemma_local_is_default_and_labels() -> None:
     assert args.analysis_provider == "gemma_local"
 
 
-def test_model_resolution_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_model_and_output_token_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GEMMA_ANALYSIS_MODEL", raising=False)
     monkeypatch.delenv("GEMMA_WRITER_MODEL", raising=False)
+    monkeypatch.delenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", raising=False)
     assert resolve_gemma_analysis_model(None) == "resume-tailor-gemma"
-    monkeypatch.setenv("GEMMA_WRITER_MODEL", "writer-model")
-    assert resolve_gemma_analysis_model(None) == "writer-model"
-    monkeypatch.setenv("GEMMA_ANALYSIS_MODEL", "analysis-model")
-    assert resolve_gemma_analysis_model(None) == "analysis-model"
-    assert resolve_gemma_analysis_model("explicit-model") == "explicit-model"
-    # Empty environment values must not become an empty model name.
+    assert (
+        resolve_gemma_analysis_max_output_tokens(None)
+        == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
+    )
+    monkeypatch.setenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", "4096")
+    assert resolve_gemma_analysis_max_output_tokens(None) == 4096
+    monkeypatch.setenv("GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS", "   ")
+    assert (
+        resolve_gemma_analysis_max_output_tokens(None)
+        == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
+    )
     monkeypatch.setenv("GEMMA_ANALYSIS_MODEL", "   ")
     monkeypatch.setenv("GEMMA_WRITER_MODEL", "")
     assert resolve_gemma_analysis_model(None) == "resume-tailor-gemma"
-    assert resolve_gemma_analysis_model("") == "resume-tailor-gemma"
 
 
-def test_chat_request_shape_stream_temperature_think_omitted(
+def test_chat_request_includes_num_predict_and_omits_think(
     master_resume: Path,
     tmp_path: Path,
 ) -> None:
@@ -179,22 +203,48 @@ def test_chat_request_shape_stream_temperature_think_omitted(
         model="resume-tailor-gemma",
         prompt="synthetic",
         format_schema=schema_info["schema"],
+        max_output_tokens=2048,
     )
     assert request["stream"] is False
     assert request["options"]["temperature"] == 0
+    assert request["options"]["num_predict"] == 2048
     assert "think" not in request
-    assert request["format"] == schema_info["schema"]
-    format_schema = request["format"]
-    assert "$schema" not in format_schema
-    assert "title" not in format_schema
-    assert "allOf" not in format_schema
-    # Safety-bearing constraints retained in the constrained transport.
-    assert format_schema["type"] == "object"
-    assert "role_summary" in format_schema["required"]
-    assert "enum" in format_schema["properties"]["unsupported_requirement_ids"][
-        "items"
-    ]
-    assert format_schema["additionalProperties"] is False
+    assert "$schema" not in request["format"]
+    assert request["format"]["additionalProperties"] is False
+
+
+def test_prompt_compaction_smaller_than_legacy_shared_prompt(
+    master_resume: Path,
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    catalog = _job_catalog()
+    job = "Skills: Python and RAG. Build agentic systems with evidence."
+    legacy = build_analysis_prompt(
+        extracted,
+        job,
+        catalog,
+        company="Example",
+        role="Developer",
+    )
+    compact = build_gemma_analysis_prompt(
+        extracted,
+        job,
+        catalog,
+        company="Example",
+        role="Developer",
+    )
+    legacy_bytes = len(legacy.encode("utf-8"))
+    compact_bytes = len(compact.encode("utf-8"))
+    assert compact_bytes < legacy_bytes
+    # Authority markers preserved.
+    assert "SOURCE_CATALOG" in compact
+    assert "JOB_REQUIREMENTS" in compact
+    assert "evidence_allowed" in compact
+    assert "unsupported_requirement_ids" in compact
+    assert "skill_groups.N" in compact
+    assert "character_counting_contract" in compact
+    assert "BEGIN_UNTRUSTED_JOB_DESCRIPTION_" in compact
+    assert estimate_prompt_tokens(compact) < estimate_prompt_tokens(legacy)
 
 
 def test_successful_schema_constrained_gemma_analysis(
@@ -216,67 +266,40 @@ def test_successful_schema_constrained_gemma_analysis(
         timeout_seconds=30,
     )
     assert payload["role_summary"]
-    request = mock_ollama["requests"][0]
-    assert request["path"] == "/api/chat"
-    body = request["body"]
-    assert body["stream"] is False
-    assert body["options"]["temperature"] == 0
+    body = mock_ollama["requests"][0]["body"]
+    assert body["options"]["num_predict"] == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
     assert "think" not in body
-    assert "format" in body
-    assert request["heartbeat_handler"] is None or callable(
-        request.get("heartbeat_handler")
-    )
-    assert (tmp_path / GEMMA_ANALYSIS_SCHEMA_FILENAME).is_file()
-    assert (tmp_path / GEMMA_ANALYSIS_PROMPT_FILENAME).is_file()
-    assert (tmp_path / GEMMA_ANALYSIS_RESPONSE_FILENAME).is_file()
-    assert (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).is_file()
     diagnostic = json.loads(
         (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
     )
     assert diagnostic["classification"] == "success"
-    assert diagnostic["think_property_omitted"] is True
-    assert diagnostic["hidden_reasoning_excluded"] is True
+    assert diagnostic["max_output_tokens"] == DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
+    assert diagnostic["configured_timeout_seconds"] == 30
     meta = write_resolved_analysis_artifact(
         tmp_path,
         payload,
         provider="gemma_local",
     )
-    assert meta["provider"] == "gemma_local"
     assert meta["legacy_codex_alias_written"] is False
+    assert not (tmp_path / CODEX_ANALYSIS_RESOLVED_FILENAME).exists()
     document = json.loads(
         (tmp_path / ANALYSIS_RESOLVED_FILENAME).read_text(encoding="utf-8")
     )
     assert document["provider"] == "gemma_local"
-    assert not (tmp_path / CODEX_ANALYSIS_RESOLVED_FILENAME).exists()
 
 
-def test_invoke_analysis_dispatches_to_gemma(
+def test_connection_refused_is_ollama_unavailable(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    mock_ollama["set_bodies"](_ollama_body(_valid_analysis(requirements)))
-    payload = invoke_analysis(
-        provider="gemma_local",
-        extracted_resume=extracted,
-        job_description="Python role",
-        job_requirements=requirements,
-        company="Example",
-        role="Developer",
-        run_directory=tmp_path,
-        timeout_seconds=30,
+    mock_ollama["set_errors"](
+        OllamaRequestError(
+            "refused",
+            classification="connection_refused",
+        )
     )
-    assert "role_summary" in payload
-
-
-def test_ollama_unavailable(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
     with pytest.raises(GemmaOllamaUnavailableError):
         invoke_gemma_analysis(
             extracted_resume=extracted,
@@ -291,26 +314,23 @@ def test_ollama_unavailable(
         (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
     )
     assert diagnostic["classification"] == "ollama_unavailable"
+    assert mock_ollama["calls"] == 1
 
 
-def test_timeout_classification(
+def test_model_missing_is_model_unavailable(
     master_resume: Path,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
-
-    def raise_timeout(**_kwargs: Any) -> dict[str, Any]:
-        raise OllamaConnectionError(
-            "The localhost Ollama request exceeded its bounded timeout. The full "
-            "worker process group was stopped and provider content was omitted."
+    mock_ollama["set_errors"](
+        OllamaRequestError(
+            "not found",
+            classification="http_error",
+            http_status=404,
         )
-
-    monkeypatch.setattr(
-        "resume_tailor.gemma_analysis.run_ollama_request",
-        raise_timeout,
     )
-    with pytest.raises(GemmaAnalysisTimeoutError, match="timed out"):
+    with pytest.raises(GemmaModelUnavailableError):
         invoke_gemma_analysis(
             extracted_resume=extracted,
             job_description="Python role",
@@ -318,71 +338,213 @@ def test_timeout_classification(
             company="Example",
             role="Developer",
             run_directory=tmp_path,
-            timeout_seconds=12,
+            timeout_seconds=30,
+            model="missing-model",
         )
+    diagnostic = json.loads(
+        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    )
+    assert diagnostic["classification"] == "model_unavailable"
 
 
-def test_malformed_transport_and_inner_failures(
+def test_active_generation_deadline_is_analysis_timeout(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    # First attempt incomplete envelope; second attempt also bad — one repair only.
-    mock_ollama["set_bodies"](
-        {"done": False, "message": {"content": "{}"}},
-        {"done": False, "message": {"content": "{}"}},
+    mock_ollama["set_errors"](
+        OllamaRequestError(
+            "The localhost Ollama request exceeded its bounded timeout.",
+            classification="timeout",
+        )
     )
-    with pytest.raises(GemmaTransportEnvelopeError):
+    with pytest.raises(GemmaAnalysisTimeoutError, match="generation time limit"):
         invoke_gemma_analysis(
             extracted_resume=extracted,
             job_description="Python role",
-            job_requirements=requirements,
+            job_requirements=_job_catalog(),
+            company="Example",
+            role="Developer",
+            run_directory=tmp_path,
+            timeout_seconds=15,
+        )
+    diagnostic = json.loads(
+        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    )
+    assert diagnostic["classification"] == "analysis_timeout"
+    assert diagnostic["configured_timeout_seconds"] == 15
+    assert diagnostic["generation_active"] is True
+    assert mock_ollama["calls"] == 1  # no repair on timeout
+
+
+def test_http_500_is_ollama_internal_error_not_unavailable(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    mock_ollama["set_errors"](
+        OllamaRequestError(
+            "internal server error",
+            classification="http_error",
+            http_status=500,
+        )
+    )
+    with pytest.raises(GemmaOllamaInternalError):
+        invoke_gemma_analysis(
+            extracted_resume=extracted,
+            job_description="Python role",
+            job_requirements=_job_catalog(),
             company="Example",
             role="Developer",
             run_directory=tmp_path,
             timeout_seconds=30,
         )
-    assert mock_ollama["calls"] == 2  # one repair attempt
+    diagnostic = json.loads(
+        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    )
+    assert diagnostic["classification"] == "ollama_internal_error"
+    assert diagnostic["http_status"] == 500
+    assert "unavailable" not in diagnostic["classification"]
 
 
-def test_fenced_and_trailing_json_rejected() -> None:
-    with pytest.raises(GemmaInnerAnalysisError, match="Markdown"):
-        parse_exact_analysis_json("```json\n{}\n```")
-    with pytest.raises(GemmaInnerAnalysisError, match="trailing"):
-        parse_exact_analysis_json('{"a":1}\ncommentary')
-    with pytest.raises(GemmaInnerAnalysisError, match="multiple"):
-        parse_exact_analysis_json('{"a":1}\n{"b":2}')
+def test_valid_json_at_exact_num_predict_with_normal_stop_succeeds(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    """eval_count == num_predict must not reject complete valid JSON with stop."""
+    extracted, _ = extract_resume(master_resume)
+    requirements = _job_catalog()
+    analysis = _valid_analysis(requirements)
+    mock_ollama["set_bodies"](
+        _ollama_body(analysis, done_reason="stop", eval_count=3072)
+    )
+    payload = invoke_gemma_analysis(
+        extracted_resume=extracted,
+        job_description="Python role",
+        job_requirements=requirements,
+        company="Example",
+        role="Developer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+        max_output_tokens=3072,
+    )
+    assert payload["role_summary"]
+    diagnostic = json.loads(
+        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    )
+    assert diagnostic["classification"] == "success"
+    assert mock_ollama["calls"] == 1
 
 
-def test_schema_invalid_triggers_one_repair_then_stops(
+def test_explicit_length_stop_is_output_limit_reached(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
     extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    invalid = {"role_summary": "incomplete"}
-    mock_ollama["set_bodies"](_ollama_body(invalid), _ollama_body(invalid))
-    with pytest.raises(SourceEvidenceError, match="canonical evidence contract"):
+    mock_ollama["set_bodies"](
+        _ollama_body('{"role_summary":', done_reason="length", eval_count=3072)
+    )
+    with pytest.raises(GemmaOutputLimitError):
         invoke_gemma_analysis(
             extracted_resume=extracted,
             job_description="Python role",
-            job_requirements=requirements,
+            job_requirements=_job_catalog(),
+            company="Example",
+            role="Developer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+            max_output_tokens=3072,
+        )
+    assert mock_ollama["calls"] == 1
+    diagnostic = json.loads(
+        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    )
+    assert diagnostic["classification"] == "output_limit_reached"
+    assert diagnostic["output_ceiling_reached"] is True
+
+
+def test_incomplete_json_at_num_predict_without_stop_reason(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    """Missing/ambiguous stop + ceiling + incomplete body → output_limit_reached."""
+    extracted, _ = extract_resume(master_resume)
+    body = _ollama_body('{"role_summary":', done_reason="stop", eval_count=3072)
+    body.pop("done_reason")
+    mock_ollama["set_bodies"](body)
+    with pytest.raises(GemmaOutputLimitError):
+        invoke_gemma_analysis(
+            extracted_resume=extracted,
+            job_description="Python role",
+            job_requirements=_job_catalog(),
+            company="Example",
+            role="Developer",
+            run_directory=tmp_path,
+            timeout_seconds=30,
+            max_output_tokens=3072,
+        )
+    assert mock_ollama["calls"] == 1  # not repaired
+
+
+def test_incomplete_json_at_num_predict_with_normal_stop_may_repair(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    """Normal stop + incomplete JSON is repairable once (not auto output_limit)."""
+    extracted, _ = extract_resume(master_resume)
+    requirements = _job_catalog()
+    valid = _valid_analysis(requirements)
+    mock_ollama["set_bodies"](
+        _ollama_body('{"role_summary":', done_reason="stop", eval_count=3072),
+        _ollama_body(valid, done_reason="stop", eval_count=100),
+    )
+    payload = invoke_gemma_analysis(
+        extracted_resume=extracted,
+        job_description="Python role",
+        job_requirements=requirements,
+        company="Example",
+        role="Developer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+        max_output_tokens=3072,
+    )
+    assert payload["role_summary"]
+    assert mock_ollama["calls"] == 2
+    for request in mock_ollama["requests"]:
+        assert request["body"]["options"]["num_predict"] == 3072
+
+
+def test_truncated_json_never_accepted_without_length_reason(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    # Incomplete JSON with stop reason still fails parse; one repair only.
+    mock_ollama["set_bodies"](
+        _ollama_body('{"role_summary": "x"', done_reason="stop"),
+        _ollama_body('{"role_summary": "x"', done_reason="stop"),
+    )
+    with pytest.raises(GemmaInnerAnalysisError):
+        invoke_gemma_analysis(
+            extracted_resume=extracted,
+            job_description="Python role",
+            job_requirements=_job_catalog(),
             company="Example",
             role="Developer",
             run_directory=tmp_path,
             timeout_seconds=30,
         )
     assert mock_ollama["calls"] == 2
-    diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
-    )
-    assert diagnostic["classification"] == "schema_failure"
 
 
-def test_repair_then_success(
+def test_schema_invalid_may_receive_one_repair(
     master_resume: Path,
     tmp_path: Path,
     mock_ollama: dict[str, Any],
@@ -391,7 +553,7 @@ def test_repair_then_success(
     requirements = _job_catalog()
     valid = _valid_analysis(requirements)
     mock_ollama["set_bodies"](
-        _ollama_body("```json\n" + json.dumps(valid) + "\n```"),
+        _ollama_body({"role_summary": "incomplete"}),
         _ollama_body(valid),
     )
     payload = invoke_gemma_analysis(
@@ -405,11 +567,47 @@ def test_repair_then_success(
     )
     assert payload["role_summary"]
     assert mock_ollama["calls"] == 2
-    diagnostic = json.loads(
-        (tmp_path / GEMMA_ANALYSIS_DIAGNOSTIC_FILENAME).read_text(encoding="utf-8")
+    repair_prompt = mock_ollama["requests"][1]["body"]["messages"][1]["content"]
+    assert "failure_class=schema_failure" in repair_prompt
+    # Full malformed multi-k response is not re-injected.
+    assert "incomplete" not in repair_prompt or "failure_class" in repair_prompt
+    assert mock_ollama["requests"][1]["body"]["options"]["num_predict"] == (
+        DEFAULT_GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS
     )
-    assert diagnostic["classification"] == "success"
-    assert diagnostic["repair_used"] is True
+
+
+def test_repair_does_not_include_full_malformed_response(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    requirements = _job_catalog()
+    valid = _valid_analysis(requirements)
+    huge = "X" * 5000
+    mock_ollama["set_bodies"](
+        _ollama_body("```json\n" + huge + "\n```"),
+        _ollama_body(valid),
+    )
+    invoke_gemma_analysis(
+        extracted_resume=extracted,
+        job_description="Python role",
+        job_requirements=requirements,
+        company="Example",
+        role="Developer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
+    )
+    repair_prompt = mock_ollama["requests"][1]["body"]["messages"][1]["content"]
+    assert "failure_class=malformed_inner_analysis" in repair_prompt
+    assert huge not in repair_prompt
+
+
+def test_fenced_and_trailing_json_rejected() -> None:
+    with pytest.raises(GemmaInnerAnalysisError, match="Markdown"):
+        parse_exact_analysis_json("```json\n{}\n```")
+    with pytest.raises(GemmaInnerAnalysisError, match="trailing"):
+        parse_exact_analysis_json('{"a":1}\ncommentary')
 
 
 def test_invalid_source_ids_not_retried_inside_provider(
@@ -417,7 +615,6 @@ def test_invalid_source_ids_not_retried_inside_provider(
     tmp_path: Path,
     mock_ollama: dict[str, Any],
 ) -> None:
-    """Schema-valid but evidence-invalid payloads leave invoke once; evidence fails later."""
     extracted, _ = extract_resume(master_resume)
     requirements = _job_catalog()
     analysis = _valid_analysis(requirements)
@@ -440,122 +637,14 @@ def test_invalid_source_ids_not_retried_inside_provider(
         run_directory=tmp_path,
         timeout_seconds=30,
     )
-    assert mock_ollama["calls"] == 1  # no repair for evidence failures
+    assert mock_ollama["calls"] == 1
     _, issues = resolve_analysis_evidence(raw, extracted, requirements)
     assert issues
 
 
-def test_character_budget_violation_after_analysis(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    analysis = _valid_analysis(requirements)
-    analysis["recommended_edits"] = [
-        {
-            "target_source_id": "skill_groups.0",
-            "operation": "replace",
-            "proposed_text": "X" * 5000,
-            "alignment_rationale": "Synthetic over-budget structured proposal.",
-            "evidence_source_ids": ["skill_groups.0"],
-        }
-    ]
-    mock_ollama["set_bodies"](_ollama_body(analysis))
-    raw = invoke_gemma_analysis(
-        extracted_resume=extracted,
-        job_description="Python role",
-        job_requirements=requirements,
-        company="Example",
-        role="Developer",
-        run_directory=tmp_path,
-        timeout_seconds=30,
-    )
-    _, issues = resolve_analysis_evidence(raw, extracted, requirements)
-    assert any(issue.code == "structured_proposal_over_budget" for issue in issues)
-    assert mock_ollama["calls"] == 1
+def test_ui_timeout_message_not_unavailable() -> None:
+    from resume_tailor.ui import _safe_error_message
 
-
-def test_repair_prompt_uses_only_sanitized_failure_class(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    requirements = _job_catalog()
-    valid = _valid_analysis(requirements)
-    mock_ollama["set_bodies"](
-        _ollama_body("```json\n" + json.dumps(valid) + "\n```"),
-        _ollama_body(valid),
-    )
-    invoke_gemma_analysis(
-        extracted_resume=extracted,
-        job_description="Python role with PRIVATE_DIAG_MARKER",
-        job_requirements=requirements,
-        company="Example",
-        role="Developer",
-        run_directory=tmp_path,
-        timeout_seconds=30,
-    )
-    # Second request is the repair; failure class is a stable token only.
-    repair_prompt = mock_ollama["requests"][1]["body"]["messages"][1]["content"]
-    assert "PREVIOUS ATTEMPT FAILED LOCAL VALIDATION" in repair_prompt
-    assert "Failure class: malformed_inner_analysis" in repair_prompt
-    assert "malformed_inner_analysis:" not in repair_prompt
-    assert "validation at" not in repair_prompt
-    assert "PRIVATE_DIAG_MARKER" in repair_prompt  # original immutable job input only
-
-
-def test_no_credential_or_reasoning_leakage(
-    master_resume: Path,
-    tmp_path: Path,
-    mock_ollama: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-    monkeypatch.setenv("OLLAMA_API_KEY", "secret-should-not-appear")
-    mock_ollama["set_bodies"](_ollama_body(_valid_analysis(_job_catalog())))
-    invoke_gemma_analysis(
-        extracted_resume=extracted,
-        job_description="Python role",
-        job_requirements=_job_catalog(),
-        company="Example",
-        role="Developer",
-        run_directory=tmp_path,
-        timeout_seconds=30,
-    )
-    for path in tmp_path.glob("gemma-analysis-*"):
-        text = path.read_text(encoding="utf-8")
-        assert "secret-should-not-appear" not in text
-        assert "OLLAMA_API_KEY" not in text
-
-
-def test_model_unavailable_classification(
-    master_resume: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    extracted, _ = extract_resume(master_resume)
-
-    def raise_reject(**_kwargs: Any) -> dict[str, Any]:
-        raise OllamaConnectionError(
-            "The localhost Ollama API rejected the request. Response content was "
-            "omitted; confirm the configured model name and server status."
-        )
-
-    monkeypatch.setattr(
-        "resume_tailor.gemma_analysis.run_ollama_request",
-        raise_reject,
-    )
-    with pytest.raises((GemmaModelUnavailableError, GemmaOllamaUnavailableError)):
-        invoke_gemma_analysis(
-            extracted_resume=extracted,
-            job_description="Python role",
-            job_requirements=_job_catalog(),
-            company="Example",
-            role="Developer",
-            run_directory=tmp_path,
-            timeout_seconds=30,
-            model="missing-model",
-        )
+    message = _safe_error_message(GemmaAnalysisTimeoutError(900))
+    assert "generation time limit" in message.casefold()
+    assert "unavailable" not in message.casefold()

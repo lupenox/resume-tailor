@@ -218,15 +218,15 @@ class GemmaModelUnavailableError(GemmaAnalysisError):
 
 
 class GemmaAnalysisTimeoutError(GemmaAnalysisError):
-    """The Gemma analysis request exceeded its bounded timeout."""
+    """The Gemma analysis request exceeded its generation time limit."""
 
-    classification = "timeout"
+    classification = "analysis_timeout"
 
     def __init__(self, timeout_seconds: int) -> None:
         super().__init__(
-            f"Gemma analysis timed out after {timeout_seconds}s. The localhost "
-            "request was stopped. Retry with a larger bounded --timeout only "
-            "after confirming Ollama is responsive."
+            "Gemma Local analysis exceeded its generation time limit. Ollama was "
+            f"running and the request was stopped after {timeout_seconds}s. No "
+            "automatic provider fallback was attempted."
         )
 
 
@@ -234,6 +234,36 @@ class GemmaConnectionError(GemmaAnalysisError):
     """A bounded localhost Ollama connection failure during analysis."""
 
     classification = "connection_failure"
+
+
+class GemmaOllamaInternalError(GemmaAnalysisError):
+    """Ollama returned an HTTP 500 (or similar) not caused by a local timeout."""
+
+    classification = "ollama_internal_error"
+
+    def __init__(self, *, http_status: int | None = None) -> None:
+        self.http_status = http_status
+        status = f" (HTTP {http_status})" if http_status is not None else ""
+        super().__init__(
+            f"Local Ollama returned an internal error{status} during Gemma "
+            "analysis. Provider body content was omitted. No automatic provider "
+            "fallback was attempted."
+        )
+
+
+class GemmaOutputLimitError(GemmaAnalysisError):
+    """Generation stopped at the configured analysis output-token ceiling."""
+
+    classification = "output_limit_reached"
+
+    def __init__(self, max_output_tokens: int) -> None:
+        self.max_output_tokens = max_output_tokens
+        super().__init__(
+            "Gemma Local analysis reached its configured output-token limit "
+            f"({max_output_tokens}) before producing a complete valid response. "
+            "Truncated JSON was not accepted. No automatic provider fallback was "
+            "attempted."
+        )
 
 
 class GemmaResponseTooLargeError(GemmaAnalysisError):
@@ -284,6 +314,33 @@ class GemmaStructuredOutputError(GemmaAnalysisError):
 
 class OllamaConnectionError(ModelError):
     """The localhost-only Ollama API could not complete a bounded request."""
+
+    classification = "connection_failure"
+    http_status: int | None = None
+    transport_error: str | None = None
+
+
+class OllamaRequestError(OllamaConnectionError):
+    """Structured localhost Ollama transport failure with a sanitized class.
+
+    ``classification`` is one of:
+    ``connection_refused``, ``timeout``, ``http_error``, ``response_too_large``,
+    ``malformed_envelope``, or ``transport_failure``. Provider body content is
+    never included in the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str,
+        http_status: int | None = None,
+        transport_error: str | None = None,
+    ) -> None:
+        self.classification = classification
+        self.http_status = http_status
+        self.transport_error = transport_error
+        super().__init__(message)
 
 
 class OllamaTailoringContractError(ModelError):

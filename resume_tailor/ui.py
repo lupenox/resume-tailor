@@ -81,7 +81,9 @@ from .utilities import (
     GemmaConnectionError,
     GemmaInnerAnalysisError,
     GemmaModelUnavailableError,
+    GemmaOllamaInternalError,
     GemmaOllamaUnavailableError,
+    GemmaOutputLimitError,
     GemmaResponseTooLargeError,
     GemmaStructuredOutputError,
     GemmaTransportEnvelopeError,
@@ -1481,6 +1483,10 @@ def _failure_kind_for_error(
         return "gemma_model_unavailable"
     if isinstance(error, GemmaAnalysisTimeoutError):
         return "gemma_timeout"
+    if isinstance(error, GemmaOllamaInternalError):
+        return "gemma_ollama_internal"
+    if isinstance(error, GemmaOutputLimitError):
+        return "gemma_output_limit"
     if isinstance(error, GemmaConnectionError):
         return "gemma_connection"
     if isinstance(error, GemmaResponseTooLargeError):
@@ -1529,6 +1535,10 @@ def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
         return "gemma_model_unavailable"
     if failure_class == "gemma-analysis-timeout":
         return "gemma_timeout"
+    if failure_class == "gemma-ollama-internal-error":
+        return "gemma_ollama_internal"
+    if failure_class == "gemma-output-limit":
+        return "gemma_output_limit"
     if failure_class == "gemma-connection-failure":
         return "gemma_connection"
     if failure_class == "gemma-response-too-large":
@@ -1748,8 +1758,21 @@ def _safe_error_message(error: ResumeTailorError) -> str:
         )
     if isinstance(error, GemmaAnalysisTimeoutError):
         return (
-            "Gemma analysis exceeded the bounded timeout. Sanitized diagnostics "
-            "were preserved; no automatic provider fallback was attempted."
+            "Gemma Local analysis exceeded its generation time limit. Ollama was "
+            "running and no automatic provider fallback occurred. Start a new run "
+            "or explicitly select another analysis provider."
+        )
+    if isinstance(error, GemmaOutputLimitError):
+        return (
+            "Gemma Local analysis reached its output-token limit before completing "
+            "a valid response. Truncated JSON was not accepted. Start a new run "
+            "or raise GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS only after reviewing "
+            "diagnostics."
+        )
+    if isinstance(error, GemmaOllamaInternalError):
+        return (
+            "Local Ollama returned an internal error during Gemma analysis. "
+            "Provider content was omitted; no automatic provider fallback occurred."
         )
     if isinstance(error, (GemmaConnectionError, GemmaResponseTooLargeError)):
         return (

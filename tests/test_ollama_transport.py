@@ -79,6 +79,59 @@ def test_local_ollama_transport_rejects_remote_or_failed_requests(
         )
     assert "private detail" not in str(raised.value)
 
+    # Structured worker timeout must surface as classification=timeout.
+    monkeypatch.setattr(
+        transport,
+        "run_command",
+        lambda *args, **kwargs: CommandResult(
+            tuple(),
+            "",
+            json.dumps(
+                {
+                    "transport_error": True,
+                    "error_class": "timeout",
+                    "provider_output_omitted": True,
+                }
+            ),
+            1,
+        ),
+    )
+    with pytest.raises(OllamaConnectionError) as timed:
+        transport.run_ollama_request(
+            path="/api/chat",
+            body={},
+            cwd=tmp_path,
+            timeout_seconds=30,
+        )
+    assert getattr(timed.value, "classification", None) == "timeout"
+
+    monkeypatch.setattr(
+        transport,
+        "run_command",
+        lambda *args, **kwargs: CommandResult(
+            tuple(),
+            "",
+            json.dumps(
+                {
+                    "transport_error": True,
+                    "error_class": "http_error",
+                    "status_code": 500,
+                    "provider_output_omitted": True,
+                }
+            ),
+            1,
+        ),
+    )
+    with pytest.raises(OllamaConnectionError) as internal:
+        transport.run_ollama_request(
+            path="/api/chat",
+            body={},
+            cwd=tmp_path,
+            timeout_seconds=30,
+        )
+    assert getattr(internal.value, "classification", None) == "http_error"
+    assert getattr(internal.value, "http_status", None) == 500
+
 
 def test_ollama_dependency_versions_verify_server_and_model(
     tmp_path: Path,
