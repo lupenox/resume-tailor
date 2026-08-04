@@ -847,3 +847,56 @@ def test_26_mismatched_label_preserved_in_prompt(master_resume: Path):
     assert "AI & Agentic Systems: Python, Docker, AI" in prompt
     assert "mutable_proposed_body" in prompt
     assert "immutable_label" in prompt
+
+# ---------------------------------------------------------------------------
+# 27  Composite no-op elimination regressions
+# ---------------------------------------------------------------------------
+
+def test_27_full_labeled_proposal_identical_to_current_composite_value(master_resume: Path):
+    extracted, _ = extract_resume(master_resume)
+    label = extracted['content']['skill_groups'][2]['label']
+    text = extracted['content']['skill_groups'][2]['text']
+    proposed = f"{label}: {text}"
+    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
+    assert not analysis.get("recommended_edits")
+    assert "skill_groups.2" in analysis.get("discarded_no_op_edit_ids", [])
+    for em in analysis.get("evidence_map", []):
+        assert "skill_groups.2" not in em.get("evidence_source_ids", [])
+
+def test_28_body_only_proposal_identical_to_current_mutable_body(master_resume: Path):
+    extracted, _ = extract_resume(master_resume)
+    text = extracted['content']['skill_groups'][2]['text']
+    proposed = text
+    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
+    assert not analysis.get("recommended_edits")
+    assert "skill_groups.2" in analysis.get("discarded_no_op_edit_ids", [])
+    for em in analysis.get("evidence_map", []):
+        assert "skill_groups.2" not in em.get("evidence_source_ids", [])
+
+def test_29_body_only_changed_proposal_remains_active(master_resume: Path):
+    extracted, _ = extract_resume(master_resume)
+    text = extracted['content']['skill_groups'][2]['text']
+    proposed = f"{text[:-5]} NEW"
+    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
+    assert len(analysis.get("recommended_edits")) == 1
+    assert analysis["recommended_edits"][0]["proposed_text"] == proposed
+    assert "skill_groups.2" not in analysis.get("discarded_no_op_edit_ids", [])
+
+def test_30_full_exact_label_plus_changed_body_normalizes_and_remains_active(master_resume: Path):
+    extracted, _ = extract_resume(master_resume)
+    label = extracted['content']['skill_groups'][2]['label']
+    text = extracted['content']['skill_groups'][2]['text']
+    proposed = f"{label}: {text[:-5]} NEW"
+    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
+    assert len(analysis.get("recommended_edits")) == 1
+    assert analysis["recommended_edits"][0]["proposed_text"] == f"{text[:-5]} NEW"
+    assert "skill_groups.2" not in analysis.get("discarded_no_op_edit_ids", [])
+    assert "skill_groups.2" in analysis.get("normalized_composite_edit_ids", [])
+
+def test_31_changed_immutable_label_is_rejected(master_resume: Path):
+    extracted, _ = extract_resume(master_resume)
+    text = extracted['content']['skill_groups'][2]['text']
+    proposed = f"Different Label: {text}"
+    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
+    assert len(analysis.get("recommended_edits")) == 1
+    assert analysis["recommended_edits"][0]["proposed_text"] == proposed

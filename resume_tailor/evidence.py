@@ -579,11 +579,11 @@ def resolve_analysis_evidence(
     resolved_edits: list[dict[str, Any]] = []
     discarded_no_op_edit_ids: list[str] = list(analysis.get("discarded_no_op_edit_ids", []))
     normalized_composite_edit_ids: list[str] = list(analysis.get("normalized_composite_edit_ids", []))
-    
+
     extracted_content = extracted_resume.get("content")
     if not isinstance(extracted_content, dict):
         extracted_content = {}
-        
+
     for position, edit in enumerate(analysis.get("recommended_edits", [])):
         target_location = f"recommended_edits[{position}].target_source_id"
         target_id = edit.get("target_source_id")
@@ -637,37 +637,68 @@ def resolve_analysis_evidence(
         if target is not None:
             target_text = target["exact_text"]
             proposed_text = local_edit.get("proposed_text")
-            
-            # Canonical composite normalization
+
+            mutable_target_text = target_text
             immutable_label = composite_label_for_source_id(extracted_content, target_id)
-            if immutable_label is not None and isinstance(proposed_text, str):
+            if immutable_label is not None:
                 try:
-                    mutable_text = mutable_text_from_composite_proposal(
-                        proposed_text,
+                    mutable_target_text = mutable_text_from_composite_proposal(
+                        target_text,
                         immutable_label=immutable_label,
                     )
                 except ValueError:
-                    mutable_text = proposed_text
-                
-                if mutable_text != proposed_text:
-                    if target_id not in normalized_composite_edit_ids:
-                        normalized_composite_edit_ids.append(target_id)
-                    local_edit["proposed_text"] = mutable_text
-                    proposed_text = mutable_text
+                    pass
+
+                if isinstance(proposed_text, str):
+                    try:
+                        mutable_text = mutable_text_from_composite_proposal(
+                            proposed_text,
+                            immutable_label=immutable_label,
+                        )
+                    except ValueError:
+                        mutable_text = proposed_text
+
+                    if mutable_text != proposed_text:
+                        edit_id_to_store = local_edit.get("edit_id", target_id)
+                        if edit_id_to_store not in normalized_composite_edit_ids:
+                            normalized_composite_edit_ids.append(edit_id_to_store)
+                        local_edit["proposed_text"] = mutable_text
+                        proposed_text = mutable_text
 
             # No-op elimination
-            if isinstance(proposed_text, str) and canonicalize_budget_text(proposed_text) == canonicalize_budget_text(target_text):
-                if target_id not in discarded_no_op_edit_ids:
-                    discarded_no_op_edit_ids.append(target_id)
+            if isinstance(proposed_text, str) and canonicalize_budget_text(proposed_text) == canonicalize_budget_text(mutable_target_text):
+                edit_id_to_store = local_edit.get("edit_id", target_id)
+                if edit_id_to_store not in discarded_no_op_edit_ids:
+                    discarded_no_op_edit_ids.append(edit_id_to_store)
                 continue
-                
+
             local_edit["existing_text"] = target_text
             local_edit["resume_section"] = target["section_context"]
         resolved_edits.append(local_edit)
-        
+
     resolved["recommended_edits"] = resolved_edits
     resolved["discarded_no_op_edit_ids"] = discarded_no_op_edit_ids
     resolved["normalized_composite_edit_ids"] = normalized_composite_edit_ids
+
+    # Remove evidence_map entries for edits that were discarded
+    discarded_target_ids = {
+        edit.get("target_source_id")
+        for edit in analysis.get("recommended_edits", [])
+        if edit.get("edit_id", edit.get("target_source_id")) in discarded_no_op_edit_ids
+        and edit.get("target_source_id")
+    }
+
+    if discarded_target_ids:
+        for item in resolved["evidence_map"]:
+            item["evidence_source_ids"] = [
+                sid for sid in item["evidence_source_ids"]
+                if sid not in discarded_target_ids
+            ]
+
+        resolved["evidence_map"] = [
+            item for item in resolved["evidence_map"]
+            if item["evidence_source_ids"]
+        ]
 
     budgets = {
         paragraph["content_id"]: paragraph["content_budget"]["maximum_characters"]
