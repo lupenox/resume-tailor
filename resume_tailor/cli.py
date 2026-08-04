@@ -1146,14 +1146,29 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         elif retry_inputs is not None:
             job_requirements = retry_inputs.job_requirements
         else:
-            job_requirements = build_job_requirement_catalog(
-                job_description,
-                structured_job=(
-                    fetched_job
-                    if fetched_job is not None and job_source == "linkedin-url"
-                    else None
-                ),
-                run_directory=run_directory,
+            hooks.progress(
+                "extracting_job",
+                "Extracting constraints and requirements from the job posting.",
+            )
+            try:
+                job_requirements = build_job_requirement_catalog(
+                    job_description,
+                    structured_job=(
+                        fetched_job
+                        if fetched_job is not None and job_source == "linkedin-url"
+                        else None
+                    ),
+                    run_directory=run_directory,
+                )
+            except RequirementExtractionError as exc:
+                hooks.error(str(exc))
+                return 1
+            
+            req_count = len(job_requirements.get("requirements", []))
+            hooks.progress(
+                "extracted_job",
+                f"Successfully extracted {req_count} requirements from the job posting.",
+                requirement_count=req_count,
             )
         if antigravity_retry_inputs is not None:
             atomic_write_bytes(

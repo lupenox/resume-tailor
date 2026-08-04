@@ -1647,6 +1647,8 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "apify-linkedin-retrieval": "fetching_job",
         "linkedin-posting-confirmation": "confirming_posting",
         "extracting-master": "codex_analysis",
+        "extracting_job": "codex_analysis",
+        "extracted_job": "codex_analysis",
         "codex-analysis-schema-preflight": "codex_analysis",
         "codex-analysis": "codex_analysis",
         "tailoring-dependency-check": "antigravity_tailoring",
