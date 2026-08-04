@@ -263,8 +263,17 @@ class GemmaOutputLimitError(GemmaAnalysisError):
 
     classification = "output_limit_reached"
 
-    def __init__(self, max_output_tokens: int) -> None:
+    def __init__(
+        self,
+        max_output_tokens: int,
+        phase: str | None = None,
+        content_bytes: int = 0,
+        thinking_present: bool = False
+    ) -> None:
         self.max_output_tokens = max_output_tokens
+        self.phase = phase
+        self.content_bytes = content_bytes
+        self.thinking_present = thinking_present
         super().__init__(
             "Gemma Local analysis reached its configured output-token limit "
             f"({max_output_tokens}) before producing a complete valid response. "

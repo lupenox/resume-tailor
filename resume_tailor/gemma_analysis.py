@@ -961,6 +961,7 @@ def _chat_request(
     return {
         "model": validate_ollama_model_name(model),
         "stream": False,
+        "think": False,
         "keep_alive": "5m",
         "messages": [
             {
@@ -1017,6 +1018,7 @@ def _write_diagnostic(
     model: str | None = None,
     attempt: int | None = None,
     extra: dict[str, Any] | None = None,
+    extra_diagnostics: dict[str, Any] | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "provider": "gemma_local",
@@ -1030,7 +1032,7 @@ def _write_diagnostic(
         "telemetry_transmitted": False,
         "stream": False,
         "temperature": 0,
-        "think_property_omitted": True,
+        "think_enabled": False,
     }
     if model is not None:
         payload["model"] = model
@@ -1038,6 +1040,17 @@ def _write_diagnostic(
         payload["attempt"] = attempt
     if extra:
         payload.update(extra)
+
+    if extra_diagnostics:
+        payload.update(extra_diagnostics)
+
+    try:
+        from .ollama_transport import ollama_dependency_versions
+        deps = ollama_dependency_versions(model=model or "gemma", cwd=path.parent, timeout_seconds=1)
+        payload["ollama_version"] = deps.get("ollama")
+    except BaseException:
+        pass
+
     atomic_write_json(path, payload)
 
 
@@ -1046,6 +1059,9 @@ def _sanitized_response_artifact(body: dict[str, Any]) -> dict[str, Any]:
     content = None
     content_bytes = 0
     content_sha = None
+    thinking_present = False
+    if isinstance(message, dict) and "thinking" in message:
+        thinking_present = True
     if isinstance(message, dict) and isinstance(message.get("content"), str):
         content = message["content"]
         encoded = content.encode("utf-8")
@@ -1060,6 +1076,7 @@ def _sanitized_response_artifact(body: dict[str, Any]) -> dict[str, Any]:
         "content_bytes": content_bytes,
         "content_sha256": content_sha,
         "content_present": bool(content and content.strip()),
+        "thinking_present": thinking_present,
         "hidden_reasoning_excluded": True,
         "metrics": {
             name: body.get(name)
@@ -1247,6 +1264,7 @@ def _run_phase_with_repair(
     progress_handler: Callable[[float, bool], None] | None,
     parse_and_validate: Callable[[dict[str, Any]], dict[str, Any]],
     status_handler: Callable[[str], None] | None = None,
+    extra_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_error: BaseException | None = None
     for attempt in range(MAX_REPAIR_ATTEMPTS_PER_PHASE + 1):
@@ -1273,6 +1291,7 @@ def _run_phase_with_repair(
                 status_handler=status_handler if attempt == 0 else None,
                 attempt=attempt,
                 write_prompt=(attempt == 0),
+                extra_diagnostics=extra_diagnostics,
             )
         except _PhaseRepairNeeded as repair:
             last_error = repair.cause
@@ -1299,6 +1318,7 @@ def _run_phase_once(
     status_handler: Callable[[str], None] | None,
     attempt: int,
     write_prompt: bool,
+    extra_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_path = run_directory / (
         COVERAGE_PROMPT_FILENAME if phase == "coverage" else EDITS_PROMPT_FILENAME
@@ -1331,6 +1351,7 @@ def _run_phase_once(
                 "elapsed_seconds": overall_timeout_seconds,
                 "remaining_deadline_seconds": 0,
             },
+            extra_diagnostics=extra_diagnostics,
         )
         raise GemmaAnalysisTimeoutError(overall_timeout_seconds)
 
@@ -1341,7 +1362,7 @@ def _run_phase_once(
         max_output_tokens=max_output_tokens,
     )
     system_prompt = request["messages"][0]["content"]
-    assert "think" not in request
+    assert request.get("think") is False
     assert request["options"]["num_predict"] == max_output_tokens
     if write_prompt:
         _write_sanitized_prompt(
@@ -1397,6 +1418,7 @@ def _run_phase_once(
                 ),
                 "repair_attempted": attempt > 0,
             },
+            extra_diagnostics=extra_diagnostics,
         )
         raise mapped from exc
 
@@ -1428,8 +1450,10 @@ def _run_phase_once(
                     0, int(overall_deadline - time.monotonic())
                 ),
             },
+            extra_diagnostics=extra_diagnostics,
         )
-        raise GemmaOutputLimitError(max_output_tokens)
+        artifact = _sanitized_response_artifact(body)
+        raise GemmaOutputLimitError(max_output_tokens, phase=phase, content_bytes=artifact.get("content_bytes", 0), thinking_present=artifact.get("thinking_present", False))
 
     try:
         content = _extract_message_content(body)
@@ -1673,6 +1697,12 @@ def invoke_gemma_analysis(
                 progress_handler=progress_handler,
                 parse_and_validate=validate_batch,
                 status_handler=batch_status_handler,
+                extra_diagnostics={
+                    "batch_index": batch_num,
+                    "batch_count": total_batches,
+                    "requirement_ids": batch_req_ids,
+                    "effective_num_predict": coverage_batch_tokens,
+                },
             )
             merged_coverage_requirements.extend(batch_result["requirements"])
             completed_batch_count += 1

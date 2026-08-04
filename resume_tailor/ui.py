@@ -1771,10 +1771,22 @@ def _safe_error_message(error: ResumeTailorError) -> str:
             "or explicitly select another analysis provider."
         )
     if isinstance(error, GemmaOutputLimitError):
+        var_name = (
+            "GEMMA_ANALYSIS_COVERAGE_BATCH_MAX_OUTPUT_TOKENS"
+            if getattr(error, "phase", None) == "coverage"
+            else "GEMMA_ANALYSIS_EDIT_MAX_OUTPUT_TOKENS"
+        )
+        if getattr(error, "content_bytes", 1) == 0 and getattr(error, "thinking_present", False):
+            return (
+                "Gemma Local analysis reached its output-token limit before producing "
+                "any final JSON. Hidden reasoning completely consumed the output "
+                "allowance. Start a new run and verify think=false is enforced rather "
+                f"than increasing {var_name}."
+            )
         return (
             "Gemma Local analysis reached its output-token limit before completing "
             "a valid response. Truncated JSON was not accepted. Start a new run "
-            "or raise GEMMA_ANALYSIS_MAX_OUTPUT_TOKENS only after reviewing "
+            f"or raise {var_name} only after reviewing "
             "diagnostics."
         )
     if isinstance(error, GemmaOllamaInternalError):

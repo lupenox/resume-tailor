@@ -231,7 +231,7 @@ def test_phase_schemas_and_chat_request_shape() -> None:
     assert request["stream"] is False
     assert request["options"]["temperature"] == 0
     assert request["options"]["num_predict"] == 1536
-    assert "think" not in request
+    assert request.get("think") is False
 
 
 def test_prompt_compaction_two_phase_vs_legacy(

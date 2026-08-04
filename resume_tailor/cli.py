@@ -339,13 +339,25 @@ def _analysis_dependency_versions(
         from .ollama_transport import ollama_dependency_versions
 
         model = resolve_gemma_analysis_model(ollama_model)
-        versions.update(
-            ollama_dependency_versions(
-                model=model,
-                cwd=cwd,
-                timeout_seconds=15,
-            )
+        deps = ollama_dependency_versions(
+            model=model,
+            cwd=cwd,
+            timeout_seconds=15,
         )
+        ollama_ver = deps.get("ollama", "")
+        if ollama_ver:
+            try:
+                parts = tuple(map(int, ollama_ver.split("-")[0].split(".")[:3]))
+                if parts < (0, 31, 2):
+                    from .utilities import ModelError
+                    class OllamaVersionError(ModelError):
+                        classification = "ollama_structured_thinking_incompatible"
+                        def __init__(self) -> None:
+                            super().__init__("Gemma Local analysis requires Ollama 0.31.2+ for structured thinking support.")
+                    raise OllamaVersionError()
+            except ValueError:
+                pass
+        versions.update(deps)
         versions["gemma_analysis_model"] = model
         return versions
     if provider == "grok_cli":
