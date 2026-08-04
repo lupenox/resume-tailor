@@ -78,6 +78,31 @@ _SOURCE_CONTRADICTION_QUESTION_RE = re.compile(
     re.I,
 )
 
+# Candidate-facing aspiration markers (not recruiter "seeking a hire" language).
+_ASPIRATION_MARKER_RE = re.compile(
+    r"\b(?:"
+    r"seeking|"
+    r"targeting|"
+    r"pursuing|"
+    r"interested\s+in|"
+    r"applying\s+for|"
+    r"aiming\s+to\s+transition\s+into"
+    r")\b",
+    re.I,
+)
+_ASPIRATION_OPPORTUNITY_SLOT_RE = (
+    r"(?:roles?|positions?|opportunit(?:y|ies)|internships?|work)"
+)
+_ASPIRATION_RECRUITER_CUE_RE = re.compile(
+    r"\bto\s+(?:join|hire|fill)\b|\bour\s+team\b",
+    re.I,
+)
+# Fields where a tailored aspirational role mention may be allowed.
+_ASPIRATION_ALLOWED_CONTENT_IDS = frozenset({"professional_summary"})
+_ASPIRATION_ALLOWED_ROOT_KEYS = frozenset(
+    {"professional_summary", "objective", "career_target"}
+)
+
 
 @dataclass(frozen=True)
 class SourceEvidenceIssue:
@@ -96,6 +121,7 @@ class EvidenceReport:
     introduced_metrics: list[str] = field(default_factory=list)
     introduced_role_labels: list[str] = field(default_factory=list)
     introduced_availability: list[str] = field(default_factory=list)
+    allowed_aspirational_role_references: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -962,6 +988,178 @@ def _assert_exact(
         )
 
 
+def _target_role_core_pattern(target_role: str) -> str | None:
+    """Return a regex core for a role with light morphological flexibility.
+
+    Preserves the useful Engineer↔Engineering match without treating every
+    substring hit as a factual employment claim.
+    """
+    words = normalized_text(target_role).split()
+    if not words:
+        return None
+    *head, last = words
+    # Final token may appear as the bare form, plural, or -ing form.
+    last_pat = re.escape(last) + r"(?:ing|s)?"
+    if head:
+        head_pat = r"\s+".join(re.escape(word) for word in head)
+        return rf"{head_pat}\s+{last_pat}"
+    return last_pat
+
+
+def _text_mentions_target_role(target_role: str, text: str) -> bool:
+    """Detect a target-role mention using the same normalized containment check."""
+    if not target_role or not isinstance(text, str) or not text.strip():
+        return False
+    return normalized_text(target_role) in normalized_text(text)
+
+
+def _find_target_role_spans(target_role: str, text: str) -> list[tuple[int, int]]:
+    core = _target_role_core_pattern(target_role)
+    if core is None or not isinstance(text, str) or not text:
+        return []
+    pattern = re.compile(rf"\b{core}\b", re.I)
+    return [(match.start(), match.end()) for match in pattern.finditer(text)]
+
+
+def _collect_aspiration_allowed_text(content: dict[str, Any]) -> str:
+    """Join summary/objective fields where aspirational role phrasing is permitted."""
+    parts: list[str] = []
+    for key in ("professional_summary", "objective", "career_target"):
+        value = content.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _role_appears_outside_aspiration_allowed_sections(
+    target_role: str,
+    content: dict[str, Any],
+) -> bool:
+    """True when the target role is present outside summary/objective fields."""
+    for content_id, value in _paragraph_values(content).items():
+        if content_id in _ASPIRATION_ALLOWED_CONTENT_IDS:
+            continue
+        root_key = content_id.split(".", 1)[0]
+        if root_key in _ASPIRATION_ALLOWED_ROOT_KEYS:
+            continue
+        if _text_mentions_target_role(target_role, value):
+            return True
+    # Optional dedicated objective/career-target roots are allowed when present
+    # as free-form strings; any other root string fields remain restricted.
+    for key, value in content.items():
+        if key in _ASPIRATION_ALLOWED_ROOT_KEYS:
+            continue
+        if isinstance(value, str) and _text_mentions_target_role(target_role, value):
+            return True
+    return False
+
+
+def _has_factual_target_role_claim(target_role: str, text: str) -> bool:
+    """Detect declarative employment-title claims for the target role."""
+    core = _target_role_core_pattern(target_role)
+    if core is None or not isinstance(text, str) or not text.strip():
+        return False
+    factual = re.compile(
+        rf"""
+        (?:
+            \bexperienced\s+(?:as\s+)?(?:an?\s+)?{core}\b
+            | \b{core}\s+with\s+(?:\w+\s+){{0,4}}(?:years?|yrs)\b
+            | \b(?:worked|serving|served|employed)\s+as\s+(?:an?\s+)?{core}\b
+            | \b{core}\s+(?:at|with|for)\s+\w+
+            | \b(?:currently|former(?:ly)?)\s+{core}\b
+            | \bex-{core}\b
+        )
+        """,
+        re.I | re.VERBOSE,
+    )
+    return factual.search(text) is not None
+
+
+def _candidate_aspiration_role_spans(
+    target_role: str,
+    text: str,
+) -> list[tuple[int, int]]:
+    """Spans of role mentions that sit inside candidate aspiration constructions."""
+    core = _target_role_core_pattern(target_role)
+    if core is None or not isinstance(text, str) or not text:
+        return []
+    pattern = re.compile(
+        rf"""
+        \b(?:seeking|targeting|pursuing|interested\s+in|applying\s+for|
+           aiming\s+to\s+transition\s+into)\b
+        \s+
+        (?P<pre>(?:(?![.!?]).){{0,80}}?)
+        (?P<role>{core})
+        (?P<post>(?:(?![.!?]).){{0,80}}?)
+        \b{_ASPIRATION_OPPORTUNITY_SLOT_RE}\b
+        """,
+        re.I | re.VERBOSE | re.DOTALL,
+    )
+    spans: list[tuple[int, int]] = []
+    for match in pattern.finditer(text):
+        surrounding = f"{match.group('pre')}{match.group('post')}"
+        if _ASPIRATION_RECRUITER_CUE_RE.search(surrounding):
+            continue
+        spans.append((match.start("role"), match.end("role")))
+    return spans
+
+
+def _all_target_role_mentions_are_candidate_aspirations(
+    target_role: str,
+    text: str,
+) -> bool:
+    mentions = _find_target_role_spans(target_role, text)
+    if not mentions:
+        # Fall back to normalized containment (Engineer⊂Engineering) when the
+        # span finder and normalized_text disagree on token boundaries.
+        if not _text_mentions_target_role(target_role, text):
+            return False
+        # Treat the whole-text normalized hit as requiring an aspiration clause
+        # that also matches under morphology.
+        return bool(_candidate_aspiration_role_spans(target_role, text))
+    aspirational = _candidate_aspiration_role_spans(target_role, text)
+    if not aspirational:
+        return False
+    for start, end in mentions:
+        if not any(a_start <= start and end <= a_end for a_start, a_end in aspirational):
+            return False
+    return True
+
+
+def _is_allowed_aspirational_target_role(
+    *,
+    target_role: str,
+    original: dict[str, Any],
+    tailored: dict[str, Any],
+) -> bool:
+    """Allow a target-role mention only as candidate aspiration in summary fields.
+
+    Required geometry:
+    - source already contains an explicit aspiration marker
+    - tailored mention remains inside an aspirational clause
+    - mention is confined to professional_summary / objective fields
+    - no factual employment-title claim is introduced
+    """
+    source_allowed = _collect_aspiration_allowed_text(original)
+    tailored_allowed = _collect_aspiration_allowed_text(tailored)
+    if not source_allowed.strip() or not tailored_allowed.strip():
+        return False
+    if _ASPIRATION_MARKER_RE.search(source_allowed) is None:
+        return False
+    if not _text_mentions_target_role(target_role, tailored_allowed):
+        return False
+    if _role_appears_outside_aspiration_allowed_sections(target_role, tailored):
+        return False
+    if _has_factual_target_role_claim(target_role, tailored_allowed):
+        return False
+    if not _all_target_role_mentions_are_candidate_aspirations(
+        target_role,
+        tailored_allowed,
+    ):
+        return False
+    return True
+
+
 def validate_tailored_content(
     *,
     original: dict[str, Any],
@@ -1121,11 +1319,20 @@ def validate_tailored_content(
 
     if target_role and normalized_text(target_role) not in normalized_source:
         if normalized_text(target_role) in normalized_text(tailored_text):
-            report.introduced_role_labels.append(target_role)
-            report.issues.append(
-                f"Target role label {target_role!r} was introduced as a resume claim "
-                "without appearing in the source."
-            )
+            # Morphological/normalized containment alone is not a claim verdict.
+            # Classify context: candidate aspiration in summary vs factual title.
+            if _is_allowed_aspirational_target_role(
+                target_role=target_role,
+                original=original,
+                tailored=tailored,
+            ):
+                report.allowed_aspirational_role_references.append(target_role)
+            else:
+                report.introduced_role_labels.append(target_role)
+                report.issues.append(
+                    f"Target role label {target_role!r} was introduced as a resume claim "
+                    "without appearing in the source."
+                )
 
     for match in _AVAILABILITY_RE.finditer(tailored_text):
         phrase = match.group(0)
@@ -1169,6 +1376,9 @@ def validate_tailored_content(
     report.introduced_metrics = list(dict.fromkeys(report.introduced_metrics))
     report.introduced_role_labels = list(dict.fromkeys(report.introduced_role_labels))
     report.introduced_availability = list(dict.fromkeys(report.introduced_availability))
+    report.allowed_aspirational_role_references = list(
+        dict.fromkeys(report.allowed_aspirational_role_references)
+    )
     return report
 
 
@@ -1251,6 +1461,10 @@ def build_content_diff(
         "### Newly introduced role labels",
         "",
         _markdown_list(report.introduced_role_labels),
+        "",
+        "### Allowed aspirational role references",
+        "",
+        _markdown_list(report.allowed_aspirational_role_references),
         "",
         "### Newly introduced availability statements",
         "",

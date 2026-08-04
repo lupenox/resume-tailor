@@ -1871,6 +1871,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     "introduced_technologies": report.introduced_technologies,
                     "introduced_metrics": report.introduced_metrics,
                     "introduced_role_labels": report.introduced_role_labels,
+                    "allowed_aspirational_role_references": (
+                        report.allowed_aspirational_role_references
+                    ),
                     "introduced_availability": report.introduced_availability,
                 },
             },
@@ -2235,6 +2238,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                         "introduced_metrics": revision_report.introduced_metrics,
                         "introduced_role_labels": (
                             revision_report.introduced_role_labels
+                        ),
+                        "allowed_aspirational_role_references": (
+                            revision_report.allowed_aspirational_role_references
                         ),
                         "introduced_availability": (
                             revision_report.introduced_availability
