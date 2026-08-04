@@ -2449,12 +2449,43 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     analysis=analysis,
                     target_role=role,
                 )
-                issue_map = validate_revision_scope(
-                    initial_content=tailored_content,
-                    revised_content=revised_content,
-                    qa_result=qa_result,
-                    approved_analysis=analysis,
-                )
+                try:
+                    issue_map = validate_revision_scope(
+                        initial_content=tailored_content,
+                        revised_content=revised_content,
+                        qa_result=qa_result,
+                        approved_analysis=analysis,
+                    )
+                except RevisionValidationError as scope_exc:
+                    diagnostic = getattr(scope_exc, "diagnostic", None)
+                    if isinstance(diagnostic, dict):
+                        atomic_write_json(
+                            run_directory / "revision-scope-violation.json",
+                            {
+                                **diagnostic,
+                                "provider": revision_provider,
+                                "recorded_at": utc_now_iso(),
+                                "baseline": "initial_tailored_content",
+                            },
+                        )
+                    step10_failure = {
+                        "provider": revision_provider,
+                        "message": str(scope_exc)[:400],
+                        "code": (
+                            diagnostic.get("code")
+                            if isinstance(diagnostic, dict)
+                            else "revision_scope_violation"
+                        ),
+                    }
+                    metadata["revision_cycle"]["state"] = "revision_1_failed"
+                    metadata["revision_cycle"]["last_failure"] = step10_failure
+                    # Do not overwrite the accepted initial generation.
+                    _update_metadata(
+                        metadata, metadata_path, run_directory=run_directory
+                    )
+                    if args.yes:
+                        raise
+                    continue
                 master_revision_diff = build_content_diff(
                     extracted["content"],
                     revised_content,
