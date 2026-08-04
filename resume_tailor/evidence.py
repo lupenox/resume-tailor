@@ -579,6 +579,7 @@ def resolve_analysis_evidence(
     resolved_edits: list[dict[str, Any]] = []
     discarded_no_op_edit_ids: list[str] = list(analysis.get("discarded_no_op_edit_ids", []))
     normalized_composite_edit_ids: list[str] = list(analysis.get("normalized_composite_edit_ids", []))
+    invalid_composite_edit_ids: list[str] = list(analysis.get("invalid_composite_edit_ids", []))
 
     extracted_content = extracted_resume.get("content")
     if not isinstance(extracted_content, dict):
@@ -659,16 +660,90 @@ def resolve_analysis_evidence(
                         mutable_text = proposed_text
 
                     if mutable_text != proposed_text:
-                        edit_id_to_store = local_edit.get("edit_id", target_id)
-                        if edit_id_to_store not in normalized_composite_edit_ids:
+                        # Exact authenticated label was stripped once. A second
+                        # matching wrapper is a duplicated/malformed label, not
+                        # an ordinary prose edit.
+                        try:
+                            second_pass = mutable_text_from_composite_proposal(
+                                mutable_text,
+                                immutable_label=immutable_label,
+                            )
+                        except ValueError:
+                            second_pass = mutable_text
+                        if second_pass != mutable_text:
+                            issues.append(
+                                SourceEvidenceIssue(
+                                    "invalid_composite_label",
+                                    f"recommended_edits[{position}].proposed_text",
+                                    "Codex proposed a changed or malformed immutable label",
+                                )
+                            )
+                            edit_id_to_store = local_edit.get("edit_id")
+                            if (
+                                edit_id_to_store
+                                and edit_id_to_store not in invalid_composite_edit_ids
+                            ):
+                                invalid_composite_edit_ids.append(edit_id_to_store)
+                            continue
+                        edit_id_to_store = local_edit.get("edit_id")
+                        if (
+                            edit_id_to_store
+                            and edit_id_to_store not in normalized_composite_edit_ids
+                        ):
                             normalized_composite_edit_ids.append(edit_id_to_store)
                         local_edit["proposed_text"] = mutable_text
                         proposed_text = mutable_text
+                    else:
+                        stripped = proposed_text.strip()
+                        colon_idx = stripped.find(":")
+                        if colon_idx != -1:
+                            prefix = stripped[:colon_idx]
+                            # Any non-authenticated label wrapper is rejected
+                            # before approval so it cannot survive as prose.
+                            if canonicalize_budget_text(prefix) != canonicalize_budget_text(
+                                immutable_label
+                            ):
+                                issues.append(
+                                    SourceEvidenceIssue(
+                                        "invalid_composite_label",
+                                        f"recommended_edits[{position}].proposed_text",
+                                        "Codex proposed a changed or malformed immutable label",
+                                    )
+                                )
+                                edit_id_to_store = local_edit.get("edit_id")
+                                if (
+                                    edit_id_to_store
+                                    and edit_id_to_store not in invalid_composite_edit_ids
+                                ):
+                                    invalid_composite_edit_ids.append(edit_id_to_store)
+                                continue
+                        elif canonicalize_budget_text(stripped) in {
+                            canonicalize_budget_text(immutable_label),
+                            canonicalize_budget_text(str(target.get("section_context") or "")),
+                        }:
+                            # Bare label or section-heading text rewrites structure.
+                            issues.append(
+                                SourceEvidenceIssue(
+                                    "invalid_composite_label",
+                                    f"recommended_edits[{position}].proposed_text",
+                                    "Codex proposed a changed or malformed immutable label",
+                                )
+                            )
+                            edit_id_to_store = local_edit.get("edit_id")
+                            if (
+                                edit_id_to_store
+                                and edit_id_to_store not in invalid_composite_edit_ids
+                            ):
+                                invalid_composite_edit_ids.append(edit_id_to_store)
+                            continue
 
-            # No-op elimination
-            if isinstance(proposed_text, str) and canonicalize_budget_text(proposed_text) == canonicalize_budget_text(mutable_target_text):
-                edit_id_to_store = local_edit.get("edit_id", target_id)
-                if edit_id_to_store not in discarded_no_op_edit_ids:
+            # No-op elimination: compare mutable bodies only (never full rendered
+            # value that still includes the immutable label).
+            if isinstance(proposed_text, str) and canonicalize_budget_text(
+                proposed_text
+            ) == canonicalize_budget_text(mutable_target_text):
+                edit_id_to_store = local_edit.get("edit_id")
+                if edit_id_to_store and edit_id_to_store not in discarded_no_op_edit_ids:
                     discarded_no_op_edit_ids.append(edit_id_to_store)
                 continue
 
@@ -679,20 +754,16 @@ def resolve_analysis_evidence(
     resolved["recommended_edits"] = resolved_edits
     resolved["discarded_no_op_edit_ids"] = discarded_no_op_edit_ids
     resolved["normalized_composite_edit_ids"] = normalized_composite_edit_ids
+    resolved["invalid_composite_edit_ids"] = invalid_composite_edit_ids
 
-    # Remove evidence_map entries for edits that were discarded
-    discarded_target_ids = {
-        edit.get("target_source_id")
-        for edit in analysis.get("recommended_edits", [])
-        if edit.get("edit_id", edit.get("target_source_id")) in discarded_no_op_edit_ids
-        and edit.get("target_source_id")
-    }
-
-    if discarded_target_ids:
+    # Remove only evidence-map associations that name discarded edit IDs.
+    # Do not strip target_source_id values still used as valid evidence.
+    discarded_edit_ids = set(discarded_no_op_edit_ids)
+    if discarded_edit_ids:
         for item in resolved["evidence_map"]:
             item["evidence_source_ids"] = [
                 sid for sid in item["evidence_source_ids"]
-                if sid not in discarded_target_ids
+                if sid not in discarded_edit_ids
             ]
 
         resolved["evidence_map"] = [

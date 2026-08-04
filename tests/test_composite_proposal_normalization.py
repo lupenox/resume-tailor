@@ -80,6 +80,7 @@ def _setup_synthetic_inputs(
         "missing_or_unsupported_requirements": [],
         "recommended_edits": [
             {
+                "edit_id": "edit.001",
                 "target_source_id": "skill_groups.2",
                 "operation": operation,
                 "proposed_text": proposed_text,
@@ -486,27 +487,6 @@ def test_19_initial_tailoring_exact_label_stripped(master_resume: Path):
     assert "FastAPI, pytest, Linux, AI" in prompt
 
 
-def test_19b_initial_tailoring_mismatched_label_preserved(master_resume: Path):
-    proposed = "Mismatched Label: FastAPI, pytest, Linux, AI"
-    extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(
-        master_resume, proposed
-    )
-    prompt = writer.build_ollama_tailoring_prompt(
-        master_content=extracted["content"],
-        extracted_resume=extracted,
-        job_description=job_desc,
-        job_requirements=reqs,
-        approved_analysis=analysis,
-        company="Synthetic Corp",
-        role="AI Engineer",
-    )
-    assert "Mismatched Label: FastAPI, pytest, Linux, AI" in prompt
-
-
-# ---------------------------------------------------------------------------
-# 20  Revision tailoring uses corrected behavior.
-# ---------------------------------------------------------------------------
-
 def test_20_revision_uses_corrected_behavior(master_resume: Path):
     from resume_tailor.patch_engine import validate_and_apply_revision_patches
     from resume_tailor.revision import approved_revision_targets
@@ -624,57 +604,6 @@ def test_21_authenticated_labels_unchanged_in_merge(master_resume: Path):
     assert tailored["skill_groups"][2]["label"] == original_label
     assert tailored["skill_groups"][2]["text"] == "FastAPI, pytest, Linux, AI"
 
-
-# ---------------------------------------------------------------------------
-# 22  Nonmatching colon content intact in merged output.
-# ---------------------------------------------------------------------------
-
-def test_22_nonmatching_colon_content_intact(master_resume: Path):
-    extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(
-        master_resume,
-        "Mismatched: FastAPI, pytest, Linux, AI"
-    )
-    extracted["source_blocks"].append({
-        "source_id": "fake.22",
-        "exact_text": "Mismatched: FastAPI, pytest, Linux, AI",
-    })
-    analysis["recommended_edits"][0]["evidence_source_ids"].append("fake.22")
-
-    catalog = writer.approved_edit_catalog(analysis)
-    valid_digest = writer.canonical_digest(catalog)
-
-    payload = {
-        "status": "complete",
-        "message": "Complete",
-        "catalog_sha256": valid_digest,
-        "cannot_apply": None,
-        "technical_failure": None,
-        "patches": [
-            {
-                "edit_id": catalog[0]["edit_id"],
-                "target_source_id": "skill_groups.2",
-                "operation": "replace",
-                "replacement_text": "Mismatched: FastAPI, pytest, Linux, AI",
-            },
-        ],
-    }
-    master_copy = copy.deepcopy(extracted["content"])
-    original_label = extracted["content"]["skill_groups"][2]["label"]
-
-    tailored = validate_and_apply_patches(
-        payload=payload,
-        master_content=extracted["content"],
-        extracted_resume=extracted,
-        approved_analysis=analysis,
-    )
-    assert tailored["skill_groups"][2]["label"] == original_label
-    assert tailored["skill_groups"][2]["text"] == "Mismatched: FastAPI, pytest, Linux, AI"
-    assert extracted["content"] == master_copy
-
-
-# ---------------------------------------------------------------------------
-# 23  Original master content not mutated.
-# ---------------------------------------------------------------------------
 
 def test_23_master_content_not_mutated(master_resume: Path):
     extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(
@@ -826,77 +755,341 @@ def test_25_no_provider_call_during_preflight_failure(master_resume: Path, monke
 
 
 # ---------------------------------------------------------------------------
-# 26  Previous mismatched-label test updated to expect preservation.
+# 27–35  Composite no-op elimination and changed-label rejections
 # ---------------------------------------------------------------------------
 
-def test_26_mismatched_label_preserved_in_prompt(master_resume: Path):
-    """Verifies the fix: mismatched labels are NOT stripped from the prompt."""
-    proposed_text = "AI & Agentic Systems: Python, Docker, AI"
-    extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(
-        master_resume, proposed_text
+
+def test_27_full_labeled_proposal_identical_to_current_composite_value(
+    master_resume: Path,
+) -> None:
+    """Identical full labeled proposal is discarded as a body-only no-op."""
+    extracted, _ = extract_resume(master_resume)
+    label = extracted["content"]["skill_groups"][2]["label"]
+    text = extracted["content"]["skill_groups"][2]["text"]
+    proposed = f"{label}: {text}"
+    _extracted2, _job_desc, _reqs, analysis = _setup_synthetic_inputs(
+        master_resume, proposed
     )
-    prompt = writer.build_ollama_tailoring_prompt(
-        master_content=extracted["content"],
-        extracted_resume=extracted,
+    assert not analysis.get("recommended_edits")
+    assert "edit.001" in analysis.get("discarded_no_op_edit_ids", [])
+    assert "skill_groups.2" not in analysis.get("discarded_no_op_edit_ids", [])
+    for em in analysis.get("evidence_map", []):
+        assert "edit.001" not in em.get("evidence_source_ids", [])
+
+
+def test_28_body_only_proposal_identical_to_current_mutable_body(
+    master_resume: Path,
+) -> None:
+    """Body-only proposal equal to the current mutable body is discarded."""
+    extracted, _ = extract_resume(master_resume)
+    text = extracted["content"]["skill_groups"][2]["text"]
+    _extracted2, _job_desc, _reqs, analysis = _setup_synthetic_inputs(
+        master_resume, text
+    )
+    assert not analysis.get("recommended_edits")
+    assert "edit.001" in analysis.get("discarded_no_op_edit_ids", [])
+    for em in analysis.get("evidence_map", []):
+        assert "edit.001" not in em.get("evidence_source_ids", [])
+
+
+def test_29_body_only_changed_proposal_remains_active(master_resume: Path) -> None:
+    extracted, _ = extract_resume(master_resume)
+    text = extracted["content"]["skill_groups"][2]["text"]
+    proposed = f"{text[:-5]} NEW"
+    _extracted2, _job_desc, _reqs, analysis = _setup_synthetic_inputs(
+        master_resume, proposed
+    )
+    assert len(analysis.get("recommended_edits")) == 1
+    assert analysis["recommended_edits"][0]["proposed_text"] == proposed
+    assert "edit.001" not in analysis.get("discarded_no_op_edit_ids", [])
+
+
+def test_30_full_exact_label_plus_changed_body_normalizes_and_remains_active(
+    master_resume: Path,
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    label = extracted["content"]["skill_groups"][2]["label"]
+    text = extracted["content"]["skill_groups"][2]["text"]
+    proposed = f"{label}: {text[:-5]} NEW"
+    _extracted2, _job_desc, _reqs, analysis = _setup_synthetic_inputs(
+        master_resume, proposed
+    )
+    assert len(analysis.get("recommended_edits")) == 1
+    assert analysis["recommended_edits"][0]["proposed_text"] == f"{text[:-5]} NEW"
+    assert "edit.001" not in analysis.get("discarded_no_op_edit_ids", [])
+    assert "edit.001" in analysis.get("normalized_composite_edit_ids", [])
+    assert "skill_groups.2" not in analysis.get("normalized_composite_edit_ids", [])
+
+
+def test_31_changed_immutable_label_is_rejected(master_resume: Path) -> None:
+    extracted, _ = extract_resume(master_resume)
+    text = extracted["content"]["skill_groups"][2]["text"]
+    proposed = f"Different Label: {text}"
+    reqs = build_job_requirement_catalog(
+        "Synthetic job description requiring AI."
+    )
+    analysis = {
+        "recommended_edits": [
+            {
+                "edit_id": "edit.001",
+                "target_source_id": "skill_groups.2",
+                "operation": "replace",
+                "proposed_text": proposed,
+                "evidence_source_ids": ["skill_groups.2", "projects.0.bullets.0"],
+                "resolved_evidence": [],
+            }
+        ],
+        "supported_requirement_mappings": [],
+        "unsupported_requirement_ids": [
+            item["requirement_id"] for item in reqs["requirements"]
+        ],
+        "evidence_map": [],
+    }
+    resolved_analysis, issues = resolve_analysis_evidence(
+        analysis, extracted, reqs
+    )
+    assert any(i.code == "invalid_composite_label" for i in issues)
+    issue = next(i for i in issues if i.code == "invalid_composite_label")
+    assert issue.location == "recommended_edits[0].proposed_text"
+    assert not resolved_analysis.get("recommended_edits")
+    assert "edit.001" in resolved_analysis.get("invalid_composite_edit_ids", [])
+    assert "skill_groups.2" not in resolved_analysis.get(
+        "invalid_composite_edit_ids", []
+    )
+
+
+@pytest.mark.parametrize(
+    "proposed_builder",
+    [
+        lambda label, text: f"Unrelated Category: {text} NEW",
+        lambda label, text: f"{label}: {label}: {text} NEW",
+        lambda label, text: f": {text} NEW",
+        lambda label, text: label,
+        lambda label, text: "TECHNICAL SKILLS",
+    ],
+    ids=[
+        "unrelated_label",
+        "duplicated_label",
+        "malformed_empty_label",
+        "bare_immutable_label",
+        "section_heading_text",
+    ],
+)
+def test_32_invalid_composite_label_variants_are_rejected(
+    master_resume: Path,
+    proposed_builder,
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    label = extracted["content"]["skill_groups"][2]["label"]
+    text = extracted["content"]["skill_groups"][2]["text"]
+    proposed = proposed_builder(label, text)
+    reqs = build_job_requirement_catalog(
+        "Synthetic job description requiring AI."
+    )
+    analysis = {
+        "recommended_edits": [
+            {
+                "edit_id": "edit.001",
+                "target_source_id": "skill_groups.2",
+                "operation": "replace",
+                "proposed_text": proposed,
+                "evidence_source_ids": ["skill_groups.2", "projects.0.bullets.0"],
+                "resolved_evidence": [],
+            }
+        ],
+        "supported_requirement_mappings": [],
+        "unsupported_requirement_ids": [
+            item["requirement_id"] for item in reqs["requirements"]
+        ],
+        "evidence_map": [],
+    }
+    resolved_analysis, issues = resolve_analysis_evidence(
+        analysis, extracted, reqs
+    )
+    assert any(i.code == "invalid_composite_label" for i in issues)
+    assert not resolved_analysis.get("recommended_edits")
+    assert "edit.001" in resolved_analysis.get("invalid_composite_edit_ids", [])
+
+
+def test_33_evidence_map_scope_for_no_op(master_resume: Path) -> None:
+    """Discarding a no-op edit removes only that edit's evidence-map association."""
+    extracted, _ = extract_resume(master_resume)
+    text = extracted["content"]["skill_groups"][0]["text"]
+    # Start from a real catalog, then add a second synthetic requirement so the
+    # test does not depend on extractor splitting of the job description text.
+    reqs = build_job_requirement_catalog(
+        "Synthetic job description requiring AI. Also requires Python."
+    )
+    reqs["requirements"].append(
+        {
+            "requirement_id": "text.002",
+            "category": "unstructured_requirement",
+            "exact_text": "Python experience",
+        }
+    )
+    req_id_1 = reqs["requirements"][0]["requirement_id"]
+    req_id_2 = reqs["requirements"][1]["requirement_id"]
+
+    analysis = {
+        "supported_requirement_mappings": [
+            {
+                "requirement_id": req_id_1,
+                "requirement": "req 1",
+                "evidence_source_ids": ["edit.002", "skill_groups.0"],
+            },
+            {
+                "requirement_id": req_id_2,
+                "requirement": "req 2",
+                "evidence_source_ids": ["skill_groups.0"],
+            },
+        ],
+        "unsupported_requirement_ids": [],
+        "recommended_edits": [
+            {
+                "edit_id": "edit.002",
+                "target_source_id": "skill_groups.0",
+                "operation": "replace",
+                "proposed_text": text,
+                "evidence_source_ids": ["skill_groups.0"],
+                "resolved_evidence": [],
+            },
+            {
+                "edit_id": "edit.003",
+                "target_source_id": "professional_summary",
+                "operation": "replace",
+                "proposed_text": "Changed text here",
+                "evidence_source_ids": ["skill_groups.0"],
+                "resolved_evidence": [],
+            },
+        ],
+        "evidence_map": [
+            {
+                "requirement_id": req_id_1,
+                "evidence_source_ids": ["edit.002", "skill_groups.0"],
+            },
+            {
+                "requirement_id": req_id_2,
+                "evidence_source_ids": ["skill_groups.0"],
+            },
+        ],
+        "requirement_assessment": [
+            {
+                "requirement_id": req_id_1,
+                "requirement": "req 1",
+                "status": "supported",
+                "strength": "strong",
+                "support_provenance": "test",
+                "evidence_source_ids": ["edit.002", "skill_groups.0"],
+                "resolved_evidence": [],
+            },
+            {
+                "requirement_id": req_id_2,
+                "requirement": "req 2",
+                "status": "supported",
+                "strength": "strong",
+                "support_provenance": "test",
+                "evidence_source_ids": ["skill_groups.0"],
+                "resolved_evidence": [],
+            },
+        ],
+    }
+
+    resolved, issues = resolve_analysis_evidence(analysis, extracted, reqs)
+    assert not any(i.code == "invalid_composite_label" for i in issues)
+
+    # No-op edit is discarded by edit_id, not by target_source_id.
+    assert "edit.002" in resolved.get("discarded_no_op_edit_ids", [])
+    assert "skill_groups.0" not in resolved.get("discarded_no_op_edit_ids", [])
+    assert "edit.002" not in {
+        e.get("edit_id") for e in resolved.get("recommended_edits", [])
+    }
+
+    em = {
+        e["requirement_id"]: e["evidence_source_ids"]
+        for e in resolved.get("evidence_map", [])
+    }
+    assert req_id_1 in em
+    assert req_id_2 in em
+    # Orphan association for the discarded edit is gone.
+    assert "edit.002" not in em[req_id_1]
+    # Unrelated valid evidence on the same source remains.
+    assert "skill_groups.0" in em[req_id_1]
+    assert "skill_groups.0" in em[req_id_2]
+
+    # Another active edit may still cite the same source block.
+    active_edits = {e["edit_id"]: e for e in resolved.get("recommended_edits", [])}
+    assert "edit.003" in active_edits
+    assert "skill_groups.0" in active_edits["edit.003"]["evidence_source_ids"]
+
+
+def test_34_all_no_op_result_causes_zero_writer_calls(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted, _ = extract_resume(master_resume)
+    text = extracted["content"]["skill_groups"][2]["text"]
+    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(
+        master_resume, text
+    )
+    assert not analysis.get("recommended_edits")
+    assert analysis.get("discarded_no_op_edit_ids")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Writer must not be invoked for an all-no-op catalog")
+
+    monkeypatch.setattr(writer, "run_ollama_request", fail_if_called)
+    monkeypatch.setattr(writer, "_invoke_payload", fail_if_called)
+
+    tailored = writer.invoke_ollama(
+        master_content=extracted2["content"],
+        extracted_resume=extracted2,
         job_description=job_desc,
         job_requirements=reqs,
         approved_analysis=analysis,
         company="Synthetic Corp",
         role="AI Engineer",
+        run_directory=tmp_path,
+        timeout_seconds=30,
     )
-    assert "AI & Agentic Systems: Python, Docker, AI" in prompt
-    assert "mutable_proposed_body" in prompt
-    assert "immutable_label" in prompt
+    assert tailored == extracted2["content"]
 
-# ---------------------------------------------------------------------------
-# 27  Composite no-op elimination regressions
-# ---------------------------------------------------------------------------
 
-def test_27_full_labeled_proposal_identical_to_current_composite_value(master_resume: Path):
+def test_35_historical_resolved_artifacts_remain_readable(
+    master_resume: Path,
+) -> None:
+    """Historical target-ID metadata remains readable; new writes use edit IDs."""
     extracted, _ = extract_resume(master_resume)
-    label = extracted['content']['skill_groups'][2]['label']
-    text = extracted['content']['skill_groups'][2]['text']
-    proposed = f"{label}: {text}"
-    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
-    assert not analysis.get("recommended_edits")
-    assert "skill_groups.2" in analysis.get("discarded_no_op_edit_ids", [])
-    for em in analysis.get("evidence_map", []):
-        assert "skill_groups.2" not in em.get("evidence_source_ids", [])
-
-def test_28_body_only_proposal_identical_to_current_mutable_body(master_resume: Path):
-    extracted, _ = extract_resume(master_resume)
-    text = extracted['content']['skill_groups'][2]['text']
-    proposed = text
-    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
-    assert not analysis.get("recommended_edits")
-    assert "skill_groups.2" in analysis.get("discarded_no_op_edit_ids", [])
-    for em in analysis.get("evidence_map", []):
-        assert "skill_groups.2" not in em.get("evidence_source_ids", [])
-
-def test_29_body_only_changed_proposal_remains_active(master_resume: Path):
-    extracted, _ = extract_resume(master_resume)
-    text = extracted['content']['skill_groups'][2]['text']
-    proposed = f"{text[:-5]} NEW"
-    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
-    assert len(analysis.get("recommended_edits")) == 1
-    assert analysis["recommended_edits"][0]["proposed_text"] == proposed
-    assert "skill_groups.2" not in analysis.get("discarded_no_op_edit_ids", [])
-
-def test_30_full_exact_label_plus_changed_body_normalizes_and_remains_active(master_resume: Path):
-    extracted, _ = extract_resume(master_resume)
-    label = extracted['content']['skill_groups'][2]['label']
-    text = extracted['content']['skill_groups'][2]['text']
-    proposed = f"{label}: {text[:-5]} NEW"
-    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
-    assert len(analysis.get("recommended_edits")) == 1
-    assert analysis["recommended_edits"][0]["proposed_text"] == f"{text[:-5]} NEW"
-    assert "skill_groups.2" not in analysis.get("discarded_no_op_edit_ids", [])
-    assert "skill_groups.2" in analysis.get("normalized_composite_edit_ids", [])
-
-def test_31_changed_immutable_label_is_rejected(master_resume: Path):
-    extracted, _ = extract_resume(master_resume)
-    text = extracted['content']['skill_groups'][2]['text']
-    proposed = f"Different Label: {text}"
-    extracted2, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, proposed)
-    assert len(analysis.get("recommended_edits")) == 1
-    assert analysis["recommended_edits"][0]["proposed_text"] == proposed
+    text = extracted["content"]["skill_groups"][2]["text"]
+    reqs = build_job_requirement_catalog(
+        "Synthetic job description requiring AI."
+    )
+    # Historical artifact shape: discarded list stored target_source_id values.
+    analysis = {
+        "discarded_no_op_edit_ids": ["skill_groups.1"],
+        "normalized_composite_edit_ids": ["skill_groups.0"],
+        "recommended_edits": [
+            {
+                "edit_id": "edit.001",
+                "target_source_id": "skill_groups.2",
+                "operation": "replace",
+                "proposed_text": text,
+                "evidence_source_ids": ["skill_groups.2", "projects.0.bullets.0"],
+                "resolved_evidence": [],
+            }
+        ],
+        "supported_requirement_mappings": [],
+        "unsupported_requirement_ids": [
+            item["requirement_id"] for item in reqs["requirements"]
+        ],
+        "evidence_map": [],
+    }
+    resolved, issues = resolve_analysis_evidence(analysis, extracted, reqs)
+    assert not issues
+    # Historical target IDs are preserved for compatibility.
+    assert "skill_groups.1" in resolved.get("discarded_no_op_edit_ids", [])
+    assert "skill_groups.0" in resolved.get("normalized_composite_edit_ids", [])
+    # New no-op writes actual edit IDs, not target IDs.
+    assert "edit.001" in resolved.get("discarded_no_op_edit_ids", [])
+    assert "skill_groups.2" not in resolved.get("discarded_no_op_edit_ids", [])
+    assert not resolved.get("recommended_edits")

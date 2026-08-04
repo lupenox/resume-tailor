@@ -870,28 +870,6 @@ def test_40_unsupported_skill_is_rejected_before_merge(master_resume: Path) -> N
         )
 
 
-def test_41_mismatched_label_in_approved_proposal_is_preserved(
-    master_resume: Path,
-) -> None:
-    extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume)
-    analysis = copy.deepcopy(analysis)
-    current_skill = extracted["content"]["skill_groups"][2]["text"]
-    analysis["recommended_edits"][1]["proposed_text"] = (
-        f"Renamed Category: {current_skill}"
-    )
-    prompt = writer.build_ollama_tailoring_prompt(
-        master_content=extracted["content"],
-        extracted_resume=extracted,
-        job_description=job_desc,
-        job_requirements=reqs,
-        approved_analysis=analysis,
-        company="Synthetic Corp",
-        role="AI Engineer",
-    )
-    assert prompt is not None
-    assert f"Renamed Category: {current_skill}" in prompt
-
-
 def _qa_for_summary() -> dict:
     return {
         "status": "material_findings",
@@ -908,7 +886,6 @@ def _qa_for_summary() -> dict:
         ],
         "technical_failure": None,
     }
-
 
 def test_42_successful_revision_patch_uses_keyword_scope_validation(
     master_resume: Path,
