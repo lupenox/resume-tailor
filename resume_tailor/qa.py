@@ -143,6 +143,37 @@ def env_preselected_initial_qa_provider() -> str | None:
         return None
 
 
+def env_preselected_revision_provider(
+    *,
+    initial_qa_provider: str | None = None,
+) -> str | None:
+    """Optional Step 10 preselection only — never auto-launches revision/final QA.
+
+    ``REVISION_PROVIDER=same_as_initial_qa`` maps to the Initial QA provider when
+    known; otherwise returns None so the UI can still preselect Initial QA.
+    """
+    raw = os.environ.get("REVISION_PROVIDER")
+    if raw is None or not str(raw).strip():
+        if initial_qa_provider:
+            try:
+                return normalize_initial_qa_provider(initial_qa_provider)
+            except InputError:
+                return None
+        return None
+    value = str(raw).strip().casefold().replace("-", "_")
+    if value in {"same_as_initial_qa", "same_as_initial", "initial"}:
+        if initial_qa_provider:
+            try:
+                return normalize_initial_qa_provider(initial_qa_provider)
+            except InputError:
+                return None
+        return None
+    try:
+        return normalize_initial_qa_provider(value)
+    except InputError:
+        return None
+
+
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
@@ -720,18 +751,18 @@ def _invoke_codex_qa(
         provider_detail = f"{result.stderr}\n{result.stdout}".casefold()
         if "invalid_json_schema" in provider_detail:
             raise CodexSchemaCompatibilityError(
-                "Codex rejected the final-QA transport schema. Provider output "
+                "Codex rejected the Final QA transport schema. Provider output "
                 "was omitted from the exception."
             )
         raise ModelError(
-            f"Final Codex QA exited with status {result.returncode}. Provider "
-            "output was omitted from the exception."
+            f"Final QA with Codex exited with status {result.returncode}. "
+            "Provider output was omitted from the exception."
         )
     if not raw_output_path.is_file():
-        raise ModelError("Final Codex QA did not create its structured result.")
+        raise ModelError("Final QA with Codex did not create its structured result.")
     return parse_json_text(
         raw_output_path.read_text(encoding="utf-8"),
-        label="Final Codex QA",
+        label="Final QA with Codex",
     )
 
 
@@ -777,8 +808,10 @@ def _invoke_gemma_qa(
     message = envelope.get("message") if isinstance(envelope, dict) else None
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str) or not content.strip():
-        raise ModelError("Gemma Local Initial QA returned an empty structured body.")
-    return parse_json_text(content, label="Gemma Local Initial QA")
+        raise ModelError(
+            "Final QA with Gemma Local returned an empty structured body."
+        )
+    return parse_json_text(content, label="Final QA with Gemma Local")
 
 
 def _extract_json_object(text: str) -> Any:
@@ -818,7 +851,7 @@ def _invoke_grok_qa(
     )
     if result.returncode != 0:
         raise ModelError(
-            f"Grok Initial QA exited with status {result.returncode}. Provider "
+            f"Final QA with Grok exited with status {result.returncode}. Provider "
             "output was omitted from the exception."
         )
     # Prefer structured envelope text field when present.

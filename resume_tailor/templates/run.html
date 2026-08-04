@@ -365,44 +365,90 @@
               </div>
             </section>
 
-          {% elif run.approval.kind == "qa_revision" %}
-            {% set qa = run.approval.payload.qa_result %}
+          {% elif run.approval.kind in ["qa_revision", "optional_revision"] %}
+            {% set qa = run.approval.payload.qa_result or {} %}
             {% set writer_name = run.approval.payload.writer_name or "Gemma 4 12B" %}
+            {% set options = run.approval.payload.options or [] %}
+            {% set default_provider = run.approval.payload.default_provider %}
+            {% set previous_failure = run.approval.payload.previous_failure or {} %}
             <section class="card gate-card">
               <div class="gate-heading">
                 <span class="gate-icon" aria-hidden="true">05</span>
                 <div>
-                  <p class="eyebrow">Optional revision decision</p>
-                  <h2>Initial QA found material issues</h2>
-                  <p>{{ writer_name }} authored the résumé; Initial QA independently reviewed it. You may authorize exactly one {{ writer_name }} revision, or stop and keep every initial artifact.</p>
+                  <p class="eyebrow">Optional one-shot revision</p>
+                  <h2>Step 10 decision</h2>
+                  <p>
+                    Initial QA is finished. Skipping revision keeps the current rendered résumé.
+                    Choosing revision authorizes exactly one content revision and an explicit Final QA provider — nothing launches until you confirm.
+                  </p>
                 </div>
               </div>
+              {% if previous_failure %}
+                <div class="alert alert-warning">
+                  <strong>Previous Step 10 attempt failed</strong>
+                  <span>{{ previous_failure.provider or "provider" }}: {{ previous_failure.message or "diagnostics preserved" }}. Steps 1–9 artifacts were not regenerated.</span>
+                </div>
+              {% endif %}
+              {% if qa.status == "material_findings" and qa.issues %}
+                <div class="report-section">
+                  <h3>Validated Initial QA findings</h3>
+                  {% for issue in qa.issues %}
+                    <article class="edit-card">
+                      <strong><code>{{ issue.issue_id }}</code> · {{ issue.category|replace('_', ' ')|title }} · {{ issue.severity|title }}</strong>
+                      <p>{{ issue.description }}</p>
+                      <small>Affected content: {{ issue.affected_content_id or "Not identifiable" }}</small>
+                      <p><strong>Correction objective:</strong> {{ issue.correction_objective }}</p>
+                    </article>
+                  {% endfor %}
+                </div>
+              {% elif qa.status == "pass" %}
+                <div class="integrity-banner">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <div>
+                    <strong>Initial QA approved the current résumé</strong>
+                    <p>Completing without revision is the recommended default.</p>
+                  </div>
+                </div>
+              {% endif %}
               <div class="alert alert-warning">
-                <strong>One-attempt limit</strong>
-                <span>No revision starts automatically. Codex will never rewrite résumé content, and a second revision is never offered.</span>
+                <strong>One-attempt content revision limit</strong>
+                <span>No provider starts automatically. A second content revision is never offered. Final QA uses only the provider you select here.</span>
               </div>
-              <div class="report-section">
-                <h3>Validated QA findings</h3>
-                {% for issue in qa.issues %}
-                  <article class="edit-card">
-                    <strong><code>{{ issue.issue_id }}</code> · {{ issue.category|replace('_', ' ')|title }} · {{ issue.severity|title }}</strong>
-                    <p>{{ issue.description }}</p>
-                    <small>Affected content: {{ issue.affected_content_id or "Not identifiable" }}</small>
-                    <p><strong>Correction objective:</strong> {{ issue.correction_objective }}</p>
-                  </article>
-                {% endfor %}
-              </div>
-              <div class="gate-actions">
+              <div class="gate-actions" style="margin-bottom:1rem;">
                 <form action="/runs/{{ run.run_id }}/approval" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                  <input type="hidden" name="action" value="revise_once">
-                  <button class="primary-button" type="submit">Ask {{ writer_name }} to revise once <span>→</span></button>
+                  <input type="hidden" name="action" value="complete_without_revision">
+                  <button class="primary-button" type="submit">Complete without revision <span>→</span></button>
                 </form>
                 <form action="/runs/{{ run.run_id }}/approval" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="action" value="stop">
-                  <button class="secondary-button" type="submit">Stop and keep artifacts</button>
+                  <button class="secondary-button" type="submit">Stop and preserve artifacts</button>
                 </form>
+              </div>
+              <h3>Or run optional revision + Final QA</h3>
+              <p class="muted">Select the Final QA provider (preselected from Initial QA when available). Content revision still uses {{ writer_name }} as the local writer.</p>
+              <div class="provider-grid" style="display:grid;gap:0.75rem;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));margin:1rem 0;">
+                {% for option in options %}
+                  <form action="/runs/{{ run.run_id }}/approval" method="post" class="provider-card card" style="margin:0;padding:1rem;{% if not option.available %}opacity:0.55;{% endif %}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="action" value="revise_once">
+                    <input type="hidden" name="provider" value="{{ option.provider_id }}">
+                    <strong>{{ option.label }}</strong>
+                    {% if option.provider_id == default_provider %}<span class="status-pill">Default</span>{% endif %}
+                    <p style="margin:0.5rem 0;">{{ option.description }}</p>
+                    <small>
+                      {% if option.available %}Ready{% else %}{{ option.status|replace('_',' ')|title }} — {{ option.detail }}{% endif %}
+                    </small>
+                    <div class="gate-actions" style="margin-top:0.75rem;">
+                      <button class="secondary-button" type="submit" {% if not option.available %}disabled{% endif %}>
+                        Revise + Final QA with {{ option.label }} <span>→</span>
+                      </button>
+                    </div>
+                  </form>
+                {% else %}
+                  <p class="muted">Provider availability will appear when the gate is presented with options.</p>
+                {% endfor %}
               </div>
             </section>
 
@@ -410,7 +456,7 @@
             {% set evidence = run.approval.payload.evidence %}
             <section class="card gate-card">
               <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">05</span>
+                <span class="gate-icon" aria-hidden="true">06</span>
                 <div>
                   <p class="eyebrow">Revision 1 content gate</p>
                   <h2>Approve the validated revision</h2>
@@ -421,7 +467,7 @@
                 <span class="status-dot" aria-hidden="true"></span>
                 <div>
                   <strong>Revision 1 local validation passed</strong>
-                  <p>Every change maps to an authenticated Codex QA issue and an originally approved target.</p>
+                  <p>Every change maps to an authenticated Initial QA issue and an originally approved target.</p>
                 </div>
               </div>
               <details class="diff-details" open>

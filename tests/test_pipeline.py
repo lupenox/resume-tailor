@@ -984,6 +984,10 @@ def test_url_pipeline_continues_after_explicit_confirmation(
         prompts.append(prompt)
         if "Initial QA provider" in prompt or "provider number" in prompt:
             return "codex"
+        if "complete" in prompt.casefold() and "revise" in prompt.casefold():
+            return "complete"
+        if "Optional one-shot revision" in prompt:
+            return "complete"
         return "approve"
 
     monkeypatch.setattr("builtins.input", approve)

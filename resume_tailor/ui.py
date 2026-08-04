@@ -624,11 +624,13 @@ class RunManager:
                 "stop",
                 "reject",
                 "select",
+                "complete_without_revision",
             }:
                 record.status = "RUNNING"
                 record.message = (
                     f"{request.title} recorded."
-                    if response.action == "select"
+                    if response.action
+                    in {"select", "complete_without_revision", "revise_once", "stop"}
                     else f"{request.title} approved."
                 )
                 record.events.append(
@@ -658,7 +660,14 @@ class RunManager:
             if kind == "linkedin_posting":
                 allowed = {"approve", "cancel", "use_pasted"}
             elif kind == "qa_revision":
-                allowed = {"revise_once", "stop", "cancel"}
+                allowed = {"revise_once", "stop", "cancel", "complete_without_revision"}
+            elif kind == "optional_revision":
+                allowed = {
+                    "revise_once",
+                    "stop",
+                    "cancel",
+                    "complete_without_revision",
+                }
             elif kind == "revised_content":
                 allowed = {"approve", "reject", "cancel"}
             elif kind == "initial_qa_provider":
@@ -679,6 +688,13 @@ class RunManager:
                 if not selected:
                     raise InputError("Choose an Initial QA provider.")
                 data["provider"] = selected
+            if action == "revise_once":
+                selected = provider.strip()
+                if not selected:
+                    raise InputError("Choose a revision / Final QA provider.")
+                data["provider"] = selected
+                data["revision_provider"] = selected
+                data["final_qa_provider"] = selected
             if action == "cancel":
                 record.cancel_event.set()
             record.approval_response = ApprovalResponse(action, data)
@@ -1677,6 +1693,7 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "final-codex-qa": "final_qa",
         "awaiting_initial_qa_provider": "final_qa",
         "initial-qa": "final_qa",
+        "optional-revision-decision": "revision_phase",
         "revision-authorization": "revision_phase",
         "antigravity-revision-1": "revision_phase",
         "ollama-revision-1": "revision_phase",
@@ -1684,6 +1701,7 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "revision-1-content-approval": "revision_phase",
         "revision-1-docx-render": "revision_phase",
         "revision-1-final-codex-qa": "revision_phase",
+        "revision-1-final-qa": "revision_phase",
         "complete": "complete",
     }.get(stage, "validating_input")
 

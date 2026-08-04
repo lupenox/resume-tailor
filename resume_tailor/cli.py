@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import json
 import shutil
 import sys
 from dataclasses import replace
@@ -61,6 +62,7 @@ from .ollama_writer import (
 )
 from .qa import (
     env_preselected_initial_qa_provider,
+    env_preselected_revision_provider,
     historical_initial_qa_provider,
     initial_qa_provider_label,
     invoke_final_qa,
@@ -2149,37 +2151,53 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
 
         assert qa_result is not None and selected_provider is not None
 
-        if qa_result["status"] == "pass":
-            metadata["revision_cycle"]["state"] = "initial_passed_qa"
-            metadata["revision_cycle"]["final_generation"] = "initial"
-        else:
-            metadata["revision_cycle"]["state"] = "awaiting_revision_authorization"
-            metadata["stage"] = "revision-authorization"
+        # -----------------------------------------------------------------
+        # Step 10: optional one-shot revision (explicit decision; no auto-launch)
+        # -----------------------------------------------------------------
+        step10_failure: dict[str, Any] | None = None
+        revised_content: dict[str, Any] | None = None
+        revision_diff = ""
+        revision_pdf_text = ""
+        revision_preview_path = run_directory / "preview.revision-1.png"
+        revision_docx_path = run_directory / f"{basename}.revision-1.docx"
+        revision_pdf_path = run_directory / f"{basename}.revision-1.pdf"
+        revised_content_path = run_directory / "tailored-content.revision-1.json"
+        revision_diff_path = run_directory / "content-diff.revision-1.md"
+        revision_already_authored = False
+
+        while True:
+            metadata["stage"] = "optional-revision-decision"
+            metadata["revision_cycle"]["state"] = "awaiting_optional_revision_decision"
+            default_revision_provider = env_preselected_revision_provider(
+                initial_qa_provider=selected_provider
+            )
+            options = probe_initial_qa_providers(include_expensive=True)
             hooks.progress(
                 "revision_phase",
-                f"Initial QA found material issues. One optional {writer_name} "
-                "revision requires explicit authorization.",
+                "Initial QA finished. Choose complete without revision, optional "
+                "one-shot revision, or stop. No provider launches until confirmed.",
+                run_directory=str(run_directory),
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            if hooks.approval_handler is None:
-                print("\nInitial QA material findings:")
-                for issue in qa_result["issues"]:
-                    print(
-                        f"- {issue['issue_id']} ({issue['category']}): "
-                        f"{issue['description']}"
-                    )
-            revision_authorization = hooks.authorize_revision(
+
+            decision = hooks.decide_optional_revision(
                 payload={
                     "qa_result": qa_result,
                     "maximum_attempts": 1,
                     "initial_preview": preview_path.name,
                     "writer_provider": writer_provider,
                     "writer_name": writer_name,
+                    "initial_qa_provider": selected_provider,
+                    "options": options,
+                    "default_provider": default_revision_provider,
+                    "previous_failure": step10_failure or {},
+                    "primary_action": "complete_without_revision",
                 },
+                assume_yes=bool(args.yes),
                 provider_name=writer_name,
             )
             authorization_record = {
-                "decision": revision_authorization.action,
+                "decision": decision.action,
                 "mode": (
                     "web" if hooks.approval_handler is not None else "interactive"
                 ),
@@ -2187,335 +2205,569 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 "yes_flag_did_not_authorize": bool(args.yes),
             }
             metadata["revision_cycle"]["authorization"] = authorization_record
-            if revision_authorization.action != "revise_once":
+
+            if decision.action == "complete_without_revision":
+                metadata["revision_cycle"]["state"] = "skipped"
+                metadata["revision_cycle"]["skip_reason"] = (
+                    "user_completed_without_revision"
+                )
+                metadata["revision_cycle"]["skipped_at"] = utc_now_iso()
+                metadata["revision_cycle"]["final_generation"] = "initial"
+                # Preserve Initial QA as the authoritative final QA outcome.
+                metadata["final_qa"] = metadata.get("revision_cycle", {}).get(
+                    "initial", {}
+                ).get("qa") or metadata.get("final_qa")
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                break
+
+            if decision.action == "stop":
                 metadata["revision_cycle"]["state"] = "stopped_after_initial_qa"
                 _update_metadata(metadata, metadata_path, run_directory=run_directory)
                 raise QAError(
-                    "Initial QA found material issues and the optional revision was "
-                    "not authorized. Initial artifacts were preserved."
+                    "Optional revision was stopped by user choice. Initial QA and "
+                    "rendered artifacts from Steps 1–9 were preserved."
                 )
 
-            if metadata["revision_cycle"]["attempt_count"] != 0:
-                raise RevisionValidationError(
-                    "The one-revision limit was already consumed."
+            # revise_once
+            revision_provider = normalize_initial_qa_provider(
+                str(
+                    decision.data.get("revision_provider")
+                    or decision.data.get("provider")
+                    or ""
                 )
-            metadata["revision_cycle"]["attempt_count"] = 1
-            metadata["revision_cycle"]["state"] = "revision_1_authorized"
-            allowed_targets = approved_revision_targets(
-                qa_result=qa_result,
-                approved_analysis=analysis,
             )
-            revision_request_path = run_directory / "revision-request.json"
-            revision_input_manifest = {
-                "version": 1,
-                "attempt": 1,
-                "maximum_attempts": 1,
-                "authorization": authorization_record,
-                "qa_issues": qa_result["issues"],
-                "allowed_target_issue_map": allowed_targets,
-                "inputs": {
-                    "source_resume_sha256": source_hash,
-                    "extracted_resume_sha256": sha256_file(
-                        run_directory / "extracted-master-resume.json"
-                    ),
-                    "approved_analysis_sha256": sha256_file(
-                        run_directory
-                        / (
-                            ANALYSIS_RESOLVED_FILENAME
-                            if (
-                                run_directory / ANALYSIS_RESOLVED_FILENAME
-                            ).is_file()
-                            else CODEX_ANALYSIS_RESOLVED_FILENAME
-                        )
-                    ),
-                    "initial_tailored_content_sha256": sha256_file(
-                        initial_content_path
-                    ),
-                    "initial_qa_sha256": sha256_file(initial_qa_path),
-                    "revision_schema_sha256": sha256_file(
-                        schema_path(REVISION_SCHEMA_NAME)
-                    ),
-                },
-            }
-            atomic_write_json(revision_request_path, revision_input_manifest)
-            revision_input_manifest["request"] = {
-                "filename": revision_request_path.name,
-                "sha256": sha256_file(revision_request_path),
-            }
-            metadata["revision_cycle"]["revision_1"] = {
-                "state": "provider_in_progress",
-                "input_manifest": revision_input_manifest,
-            }
-            metadata["stage"] = f"{writer_provider}-revision-1"
-            hooks.progress(
-                "revision_phase",
-                f"{writer_name} is applying the one authorized QA revision.",
+            final_qa_provider = normalize_initial_qa_provider(
+                str(
+                    decision.data.get("final_qa_provider")
+                    or decision.data.get("provider")
+                    or revision_provider
+                )
             )
-            _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            if writer_provider == "ollama":
-                revised_content = invoke_ollama_revision(
-                    current_tailored_content=tailored_content,
-                    extracted_resume=extracted,
-                    approved_analysis=analysis,
-                    qa_result=qa_result,
-                    company=company,
-                    role=role,
-                    run_directory=run_directory,
-                    timeout_seconds=timeout_seconds,
-                    attempt_number=1,
-                    model=ollama_model,
-                )
-                revision_response_metadata = load_ollama_response_metadata(
-                    run_directory,
-                    filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
-                )
-            else:
-                revised_content = invoke_antigravity_revision(
-                    current_tailored_content=tailored_content,
-                    extracted_resume=extracted,
-                    approved_analysis=analysis,
-                    qa_result=qa_result,
-                    company=company,
-                    role=role,
-                    run_directory=run_directory,
-                    timeout_seconds=timeout_seconds,
-                    antigravity_duration=antigravity_duration,
-                    attempt_number=1,
-                )
-                revision_response_metadata = load_antigravity_response_metadata(
-                    run_directory,
-                    filename=REVISION_RESPONSE_METADATA_FILENAME,
-                )
-            if revision_response_metadata is None:
-                raise IntegrityError(
-                    f"The {writer_name} revision response metadata is unavailable."
-                )
-            revised_content_path = (
-                run_directory / "tailored-content.revision-1.json"
-            )
-            atomic_write_json(revised_content_path, revised_content)
-            metadata["revision_cycle"]["revision_1"].update(
-                {
-                    "state": "local_validation",
-                    "provider": writer_provider,
-                    "model": ollama_model if writer_provider == "ollama" else None,
-                    "response": dict(revision_response_metadata["response"]),
-                    "response_envelope_type": revision_response_metadata[
-                        "response_envelope_type"
-                    ],
-                    "output_format": revision_response_metadata["output_format"],
-                    "tailored_content": {
-                        "filename": revised_content_path.name,
-                        "sha256": sha256_file(revised_content_path),
-                    },
+            # Do not overwrite initial_qa_provider.
+            metadata["revision_provider"] = revision_provider
+            metadata["final_qa_provider"] = final_qa_provider
+            metadata["revision_provider_selected_at"] = utc_now_iso()
+            option_by_id = {str(item.get("provider_id")): item for item in options}
+            option = option_by_id.get(revision_provider)
+            if option is None or not option.get("available"):
+                step10_failure = {
+                    "provider": revision_provider,
+                    "message": (
+                        (option or {}).get("detail")
+                        if isinstance(option, dict)
+                        else "Selected revision provider is unavailable."
+                    ),
                 }
-            )
-            metadata["stage"] = "revision-1-local-evidence-check"
-            hooks.progress(
-                "revision_phase",
-                "Python is validating revision 1 against every original evidence "
-                "and QA authorization boundary.",
-            )
-            revision_report = validate_tailored_content(
-                original=extracted["content"],
-                tailored=revised_content,
-                extracted_resume=extracted,
-                analysis=analysis,
-                target_role=role,
-            )
-            issue_map = validate_revision_scope(
-                initial_content=tailored_content,
-                revised_content=revised_content,
-                qa_result=qa_result,
-                approved_analysis=analysis,
-            )
-            master_revision_diff = build_content_diff(
-                extracted["content"],
-                revised_content,
-                revision_report,
-            )
-            revision_diff = build_revision_diff(
-                initial_content=tailored_content,
-                revised_content=revised_content,
-                issue_map=issue_map,
-                master_to_revision_diff=master_revision_diff,
-            )
-            revision_diff_path = run_directory / "content-diff.revision-1.md"
-            atomic_write_text(revision_diff_path, revision_diff)
-            if not revision_report.passed:
-                raise RevisionValidationError(
-                    "Revision 1 failed local factual, structural, or content-budget "
-                    "validation. No provider content was promoted."
-                )
-            metadata["revision_cycle"]["revision_1"]["validation"] = {
-                "status": "PASS",
-                "changed_target_issue_map": issue_map,
-                "diff": {
-                    "filename": revision_diff_path.name,
-                    "sha256": sha256_file(revision_diff_path),
-                },
-            }
-            metadata["revision_cycle"]["revision_1"]["state"] = (
-                "awaiting_content_approval"
-            )
-            metadata["stage"] = "revision-1-content-approval"
-            hooks.progress(
-                "revision_phase",
-                "Revision 1 passed local validation and awaits explicit approval.",
-            )
-            _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            if hooks.approval_handler is None:
-                print("\n" + revision_diff)
-            revised_approval = hooks.approve_revised_content(
-                payload={
-                    "content_diff": revision_diff,
-                    "tailored_content": revised_content,
-                    "issue_map": issue_map,
-                    "evidence": {
-                        "passed": revision_report.passed,
-                        "issues": revision_report.issues,
-                        "introduced_technologies": (
-                            revision_report.introduced_technologies
-                        ),
-                        "introduced_metrics": revision_report.introduced_metrics,
-                        "introduced_role_labels": (
-                            revision_report.introduced_role_labels
-                        ),
-                        "allowed_aspirational_role_references": (
-                            revision_report.allowed_aspirational_role_references
-                        ),
-                        "introduced_availability": (
-                            revision_report.introduced_availability
-                        ),
-                    },
-                }
-            )
-            revised_approval_record = {
-                "decision": revised_approval.action,
-                "mode": (
-                    "web" if hooks.approval_handler is not None else "interactive"
-                ),
-                "timestamp": utc_now_iso(),
-                "yes_flag_did_not_authorize": bool(args.yes),
-            }
-            metadata["revision_cycle"]["revision_1"]["content_approval"] = (
-                revised_approval_record
-            )
-            if revised_approval.action != "approve":
-                metadata["revision_cycle"]["revision_1"]["state"] = (
-                    "content_rejected"
-                )
-                metadata["revision_cycle"]["state"] = "revision_1_rejected"
+                metadata["revision_cycle"]["last_failure"] = step10_failure
                 _update_metadata(metadata, metadata_path, run_directory=run_directory)
-                raise ApprovalError(
-                    "Revision 1 was rejected. Initial and revised artifacts were "
-                    "preserved; no revised document was rendered."
-                )
+                if args.yes:
+                    raise QAError(
+                        f"Revision provider {revision_provider!r} is unavailable. "
+                        "No silent fallback occurred; artifacts were preserved."
+                    )
+                continue
 
-            revision_docx_path = run_directory / f"{basename}.revision-1.docx"
-            revision_pdf_path = run_directory / f"{basename}.revision-1.pdf"
-            revision_preview_path = run_directory / "preview.revision-1.png"
-            metadata["stage"] = "revision-1-docx-render"
-            hooks.progress(
-                "revision_phase",
-                "Python is rendering the approved revision 1 without overwriting "
-                "the initial generation.",
-            )
-            if document_format == "headless":
-                render_headless_docx(
-                    source_path=resume_path,
-                    destination_path=revision_docx_path,
-                    tailored_content=revised_content,
+            final_qa_label = initial_qa_provider_label(final_qa_provider)
+
+            # Author revision content at most once (one-shot limit). Reuse existing
+            # revision artifacts when retrying Final QA after a provider failure.
+            if (
+                not revision_already_authored
+                and revised_content_path.is_file()
+                and revision_preview_path.is_file()
+                and revision_docx_path.is_file()
+            ):
+                revision_already_authored = True
+
+            if not revision_already_authored:
+                if metadata["revision_cycle"]["attempt_count"] != 0:
+                    raise RevisionValidationError(
+                        "The one-revision limit was already consumed."
+                    )
+                metadata["revision_cycle"]["attempt_count"] = 1
+                metadata["revision_cycle"]["state"] = "revision_1_authorized"
+                allowed_targets = approved_revision_targets(
+                    qa_result=qa_result,
+                    approved_analysis=analysis,
+                )
+                revision_request_path = run_directory / "revision-request.json"
+                revision_input_manifest = {
+                    "version": 1,
+                    "attempt": 1,
+                    "maximum_attempts": 1,
+                    "authorization": authorization_record,
+                    "revision_provider": revision_provider,
+                    "final_qa_provider": final_qa_provider,
+                    "qa_issues": qa_result["issues"],
+                    "allowed_target_issue_map": allowed_targets,
+                    "inputs": {
+                        "source_resume_sha256": source_hash,
+                        "extracted_resume_sha256": sha256_file(
+                            run_directory / "extracted-master-resume.json"
+                        ),
+                        "approved_analysis_sha256": sha256_file(
+                            run_directory
+                            / (
+                                ANALYSIS_RESOLVED_FILENAME
+                                if (
+                                    run_directory / ANALYSIS_RESOLVED_FILENAME
+                                ).is_file()
+                                else CODEX_ANALYSIS_RESOLVED_FILENAME
+                            )
+                        ),
+                        "initial_tailored_content_sha256": sha256_file(
+                            initial_content_path
+                        ),
+                        "initial_qa_sha256": sha256_file(initial_qa_path),
+                        "revision_schema_sha256": sha256_file(
+                            schema_path(REVISION_SCHEMA_NAME)
+                        ),
+                    },
+                }
+                atomic_write_json(revision_request_path, revision_input_manifest)
+                revision_input_manifest["request"] = {
+                    "filename": revision_request_path.name,
+                    "sha256": sha256_file(revision_request_path),
+                }
+                metadata["revision_cycle"]["revision_1"] = {
+                    "state": "provider_in_progress",
+                    "input_manifest": revision_input_manifest,
+                    "revision_provider": revision_provider,
+                    "final_qa_provider": final_qa_provider,
+                }
+                metadata["stage"] = f"{writer_provider}-revision-1"
+                hooks.progress(
+                    "revision_phase",
+                    f"{writer_name} is applying the one authorized QA revision.",
+                )
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                try:
+                    if writer_provider == "ollama":
+                        revised_content = invoke_ollama_revision(
+                            current_tailored_content=tailored_content,
+                            extracted_resume=extracted,
+                            approved_analysis=analysis,
+                            qa_result=qa_result,
+                            company=company,
+                            role=role,
+                            run_directory=run_directory,
+                            timeout_seconds=timeout_seconds,
+                            attempt_number=1,
+                            model=ollama_model,
+                        )
+                        revision_response_metadata = load_ollama_response_metadata(
+                            run_directory,
+                            filename=OLLAMA_REVISION_RESPONSE_METADATA_FILENAME,
+                        )
+                    else:
+                        revised_content = invoke_antigravity_revision(
+                            current_tailored_content=tailored_content,
+                            extracted_resume=extracted,
+                            approved_analysis=analysis,
+                            qa_result=qa_result,
+                            company=company,
+                            role=role,
+                            run_directory=run_directory,
+                            timeout_seconds=timeout_seconds,
+                            antigravity_duration=antigravity_duration,
+                            attempt_number=1,
+                        )
+                        revision_response_metadata = (
+                            load_antigravity_response_metadata(
+                                run_directory,
+                                filename=REVISION_RESPONSE_METADATA_FILENAME,
+                            )
+                        )
+                except Exception as exc:
+                    step10_failure = {
+                        "provider": revision_provider,
+                        "message": (
+                            f"{type(exc).__name__}: revision authoring failed; "
+                            "diagnostics preserved."
+                        ),
+                        "error_type": type(exc).__name__,
+                    }
+                    metadata["revision_cycle"]["state"] = "revision_1_failed"
+                    metadata["revision_cycle"]["last_failure"] = step10_failure
+                    _update_metadata(
+                        metadata, metadata_path, run_directory=run_directory
+                    )
+                    if args.yes:
+                        raise QAError(
+                            f"Optional revision failed during authoring. "
+                            f"No silent provider fallback occurred."
+                        ) from exc
+                    continue
+
+                if revision_response_metadata is None:
+                    step10_failure = {
+                        "provider": revision_provider,
+                        "message": (
+                            f"{writer_name} revision response metadata unavailable."
+                        ),
+                    }
+                    metadata["revision_cycle"]["last_failure"] = step10_failure
+                    _update_metadata(
+                        metadata, metadata_path, run_directory=run_directory
+                    )
+                    if args.yes:
+                        raise IntegrityError(
+                            f"The {writer_name} revision response metadata is "
+                            "unavailable."
+                        )
+                    continue
+
+                atomic_write_json(revised_content_path, revised_content)
+                metadata["revision_cycle"]["revision_1"].update(
+                    {
+                        "state": "local_validation",
+                        "provider": writer_provider,
+                        "model": (
+                            ollama_model if writer_provider == "ollama" else None
+                        ),
+                        "response": dict(revision_response_metadata["response"]),
+                        "response_envelope_type": revision_response_metadata[
+                            "response_envelope_type"
+                        ],
+                        "output_format": revision_response_metadata["output_format"],
+                        "tailored_content": {
+                            "filename": revised_content_path.name,
+                            "sha256": sha256_file(revised_content_path),
+                        },
+                    }
+                )
+                metadata["stage"] = "revision-1-local-evidence-check"
+                hooks.progress(
+                    "revision_phase",
+                    "Python is validating revision 1 against every original evidence "
+                    "and QA authorization boundary.",
+                )
+                revision_report = validate_tailored_content(
+                    original=extracted["content"],
+                    tailored=revised_content,
                     extracted_resume=extracted,
-                    expected_source_hash=source_hash,
+                    analysis=analysis,
+                    target_role=role,
                 )
+                issue_map = validate_revision_scope(
+                    initial_content=tailored_content,
+                    revised_content=revised_content,
+                    qa_result=qa_result,
+                    approved_analysis=analysis,
+                )
+                master_revision_diff = build_content_diff(
+                    extracted["content"],
+                    revised_content,
+                    revision_report,
+                )
+                revision_diff = build_revision_diff(
+                    initial_content=tailored_content,
+                    revised_content=revised_content,
+                    issue_map=issue_map,
+                    master_to_revision_diff=master_revision_diff,
+                )
+                atomic_write_text(revision_diff_path, revision_diff)
+                if not revision_report.passed:
+                    step10_failure = {
+                        "provider": revision_provider,
+                        "message": (
+                            "Revision 1 failed local evidence validation; "
+                            "not promoted."
+                        ),
+                    }
+                    metadata["revision_cycle"]["state"] = "revision_1_failed"
+                    metadata["revision_cycle"]["last_failure"] = step10_failure
+                    _update_metadata(
+                        metadata, metadata_path, run_directory=run_directory
+                    )
+                    if args.yes:
+                        raise RevisionValidationError(
+                            "Revision 1 failed local factual, structural, or "
+                            "content-budget validation. No provider content was "
+                            "promoted."
+                        )
+                    continue
+                metadata["revision_cycle"]["revision_1"]["validation"] = {
+                    "status": "PASS",
+                    "changed_target_issue_map": issue_map,
+                    "diff": {
+                        "filename": revision_diff_path.name,
+                        "sha256": sha256_file(revision_diff_path),
+                    },
+                }
+                metadata["revision_cycle"]["revision_1"]["state"] = (
+                    "awaiting_content_approval"
+                )
+                metadata["stage"] = "revision-1-content-approval"
+                hooks.progress(
+                    "revision_phase",
+                    "Revision 1 passed local validation and awaits explicit approval.",
+                )
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                if hooks.approval_handler is None:
+                    print("\n" + revision_diff)
+                revised_approval = hooks.approve_revised_content(
+                    payload={
+                        "content_diff": revision_diff,
+                        "tailored_content": revised_content,
+                        "issue_map": issue_map,
+                        "evidence": {
+                            "passed": revision_report.passed,
+                            "issues": revision_report.issues,
+                            "introduced_technologies": (
+                                revision_report.introduced_technologies
+                            ),
+                            "introduced_metrics": revision_report.introduced_metrics,
+                            "introduced_role_labels": (
+                                revision_report.introduced_role_labels
+                            ),
+                            "allowed_aspirational_role_references": (
+                                revision_report.allowed_aspirational_role_references
+                            ),
+                            "introduced_availability": (
+                                revision_report.introduced_availability
+                            ),
+                        },
+                    }
+                )
+                revised_approval_record = {
+                    "decision": revised_approval.action,
+                    "mode": (
+                        "web"
+                        if hooks.approval_handler is not None
+                        else "interactive"
+                    ),
+                    "timestamp": utc_now_iso(),
+                    "yes_flag_did_not_authorize": bool(args.yes),
+                }
+                metadata["revision_cycle"]["revision_1"]["content_approval"] = (
+                    revised_approval_record
+                )
+                if revised_approval.action != "approve":
+                    metadata["revision_cycle"]["revision_1"]["state"] = (
+                        "content_rejected"
+                    )
+                    metadata["revision_cycle"]["state"] = "revision_1_rejected"
+                    step10_failure = {
+                        "provider": revision_provider,
+                        "message": "Revision 1 content was rejected by the user.",
+                    }
+                    metadata["revision_cycle"]["last_failure"] = step10_failure
+                    _update_metadata(
+                        metadata, metadata_path, run_directory=run_directory
+                    )
+                    if args.yes:
+                        raise ApprovalError(
+                            "Revision 1 was rejected. Initial and revised artifacts "
+                            "were preserved; no revised document was rendered."
+                        )
+                    continue
+
+                metadata["stage"] = "revision-1-docx-render"
+                hooks.progress(
+                    "revision_phase",
+                    "Python is rendering the approved revision 1 without overwriting "
+                    "the initial generation.",
+                )
+                if document_format == "headless":
+                    render_headless_docx(
+                        source_path=resume_path,
+                        destination_path=revision_docx_path,
+                        tailored_content=revised_content,
+                        extracted_resume=extracted,
+                        expected_source_hash=source_hash,
+                    )
+                else:
+                    render_tailored_docx(
+                        source_path=resume_path,
+                        destination_path=revision_docx_path,
+                        tailored_content=revised_content,
+                        expected_source_hash=source_hash,
+                    )
+                revision_pdf_text = export_and_validate_pdf(
+                    docx_path=revision_docx_path,
+                    pdf_path=revision_pdf_path,
+                    preview_path=revision_preview_path,
+                    working_directory=work_directory / "revision-1",
+                    required_text=_required_pdf_text(
+                        extracted,
+                        document_format=document_format,
+                    ),
+                )
+                revision_layout = {
+                    "status": "PASS",
+                    "pages": 1,
+                    "required_text_present": True,
+                    "bounding_boxes_valid": True,
+                    "docx": {
+                        "filename": revision_docx_path.name,
+                        "sha256": sha256_file(revision_docx_path),
+                    },
+                    "pdf": {
+                        "filename": revision_pdf_path.name,
+                        "sha256": sha256_file(revision_pdf_path),
+                    },
+                    "preview": {
+                        "filename": revision_preview_path.name,
+                        "sha256": sha256_file(revision_preview_path),
+                    },
+                }
+                metadata["revision_cycle"]["revision_1"]["layout_validation"] = (
+                    revision_layout
+                )
+                revision_already_authored = True
             else:
-                render_tailored_docx(
-                    source_path=resume_path,
-                    destination_path=revision_docx_path,
-                    tailored_content=revised_content,
-                    expected_source_hash=source_hash,
-                )
-            revision_pdf_text = export_and_validate_pdf(
-                docx_path=revision_docx_path,
-                pdf_path=revision_pdf_path,
-                preview_path=revision_preview_path,
-                working_directory=work_directory / "revision-1",
-                required_text=_required_pdf_text(
-                    extracted,
-                    document_format=document_format,
-                ),
-            )
-            revision_layout = {
-                "status": "PASS",
-                "pages": 1,
-                "required_text_present": True,
-                "bounding_boxes_valid": True,
-                "docx": {
-                    "filename": revision_docx_path.name,
-                    "sha256": sha256_file(revision_docx_path),
-                },
-                "pdf": {
-                    "filename": revision_pdf_path.name,
-                    "sha256": sha256_file(revision_pdf_path),
-                },
-                "preview": {
-                    "filename": revision_preview_path.name,
-                    "sha256": sha256_file(revision_preview_path),
-                },
-            }
-            metadata["revision_cycle"]["revision_1"]["layout_validation"] = (
-                revision_layout
-            )
-            metadata["stage"] = "revision-1-final-codex-qa"
+                # Reuse already-authored/rendered revision; only re-run Final QA.
+                if revised_content is None and revised_content_path.is_file():
+                    revised_content = json.loads(
+                        revised_content_path.read_text(encoding="utf-8")
+                    )
+                if revision_diff_path.is_file():
+                    revision_diff = revision_diff_path.read_text(encoding="utf-8")
+                if not revision_pdf_path.is_file() or not revision_preview_path.is_file():
+                    step10_failure = {
+                        "provider": final_qa_provider,
+                        "message": (
+                            "Revision render artifacts missing; cannot retry Final QA."
+                        ),
+                    }
+                    continue
+                # PDF text for QA: re-export is heavy; use prior text if available.
+                if not revision_pdf_text:
+                    revision_pdf_text = export_and_validate_pdf(
+                        docx_path=revision_docx_path,
+                        pdf_path=revision_pdf_path,
+                        preview_path=revision_preview_path,
+                        working_directory=work_directory / "revision-1-retry",
+                        required_text=_required_pdf_text(
+                            extracted,
+                            document_format=document_format,
+                        ),
+                    )
+                revision_layout = metadata.get("revision_cycle", {}).get(
+                    "revision_1", {}
+                ).get("layout_validation") or {
+                    "status": "PASS",
+                    "pages": 1,
+                    "docx": {"filename": revision_docx_path.name},
+                    "pdf": {"filename": revision_pdf_path.name},
+                    "preview": {"filename": revision_preview_path.name},
+                }
+
+            # Explicit Final QA with the selected provider — never hardwired Codex.
+            metadata["stage"] = "revision-1-final-qa"
             hooks.progress(
                 "revision_phase",
-                "A second fresh Codex session is reviewing revision 1. No further "
-                "revision is permitted.",
+                f"Final QA with {final_qa_label} is reviewing revision 1. "
+                "No further content revision is permitted.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
-            second_qa = invoke_final_qa(
-                original_extraction=extracted,
-                job_description=job_description,
-                analysis=analysis,
-                tailored_pdf_text=revision_pdf_text,
-                content_diff=revision_diff,
-                preview_path=revision_preview_path,
-                run_directory=run_directory,
-                work_directory=work_directory / "revision-1-qa",
-                timeout_seconds=timeout_seconds,
-                generation="revision-1",
-            )
+            try:
+                second_qa = run_initial_qa(
+                    provider=final_qa_provider,
+                    original_extraction=extracted,
+                    job_description=job_description,
+                    analysis=analysis,
+                    tailored_pdf_text=revision_pdf_text,
+                    content_diff=revision_diff,
+                    preview_path=revision_preview_path,
+                    run_directory=run_directory,
+                    work_directory=work_directory / "revision-1-qa",
+                    timeout_seconds=timeout_seconds,
+                    generation="revision-1",
+                    company=company,
+                    role=role,
+                    job_requirements=job_requirements,
+                    tailored_content=revised_content,
+                    docx_path=revision_docx_path,
+                    pdf_path=revision_pdf_path,
+                    antigravity_duration=antigravity_duration,
+                    gemma_model=ollama_model,
+                )
+            except Exception as exc:
+                step10_failure = {
+                    "provider": final_qa_provider,
+                    "message": (
+                        f"{type(exc).__name__}: Final QA with "
+                        f"{final_qa_label} failed; diagnostics preserved."
+                    ),
+                    "error_type": type(exc).__name__,
+                }
+                metadata["revision_cycle"]["revision_1"] = metadata.get(
+                    "revision_cycle", {}
+                ).get("revision_1") or {}
+                metadata["revision_cycle"]["revision_1"]["state"] = "final_qa_failed"
+                metadata["revision_cycle"]["state"] = "awaiting_optional_revision_decision"
+                metadata["revision_cycle"]["last_failure"] = step10_failure
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                if args.yes:
+                    raise QAError(
+                        f"Final QA with {final_qa_label} failed. Steps 1–9 artifacts "
+                        "were preserved; no silent provider fallback occurred."
+                    ) from exc
+                # Return to Step 10 gate — do not rerender or rerun Initial QA.
+                continue
+
             second_qa_path = run_directory / "final-qa.revision-1.json"
             second_qa_metadata = {
                 "generation": "revision-1",
-                "provider": "codex",
+                "provider": final_qa_provider,
+                "provider_label": final_qa_label,
                 "session": "fresh_ephemeral_read_only",
                 "status": second_qa["status"],
                 "summary": second_qa["summary"],
                 "issues": second_qa["issues"],
                 "technical_failure": second_qa["technical_failure"],
+                "limitations": (
+                    ["content_and_structure_only"]
+                    if final_qa_provider != "codex"
+                    else []
+                ),
                 "result": {
                     "filename": second_qa_path.name,
                     "sha256": sha256_file(second_qa_path),
                 },
             }
             metadata["revision_cycle"]["revision_1"]["qa"] = second_qa_metadata
-            metadata["final_qa"] = second_qa_metadata
+            # Do not erase Initial QA provider metadata fields.
+            metadata["revision_cycle"]["revision_1"]["final_qa_provider"] = (
+                final_qa_provider
+            )
             metadata["layout_validation"] = revision_layout
             if second_qa["status"] != "pass":
-                metadata["revision_cycle"]["revision_1"]["state"] = (
-                    "qa_not_passed"
+                step10_failure = {
+                    "provider": final_qa_provider,
+                    "message": (
+                        f"Final QA with {final_qa_label} status="
+                        f"{second_qa['status']!r}; one-shot content revision already "
+                        "used. You may complete without revision (keep initial) or "
+                        "retry Final QA with another provider."
+                    ),
+                    "status": second_qa["status"],
+                }
+                metadata["revision_cycle"]["revision_1"]["state"] = "qa_not_passed"
+                metadata["revision_cycle"]["state"] = (
+                    "awaiting_optional_revision_decision"
                 )
-                metadata["revision_cycle"]["state"] = "one_revision_limit_reached"
+                metadata["revision_cycle"]["last_failure"] = step10_failure
+                # Keep initial Final QA as the run-level result until success.
+                metadata["final_qa"] = metadata.get("revision_cycle", {}).get(
+                    "initial", {}
+                ).get("qa") or metadata.get("final_qa")
                 _update_metadata(metadata, metadata_path, run_directory=run_directory)
-                raise QAError(
-                    "Revision 1 did not pass the second fresh Codex QA. The "
-                    "one-revision limit was reached; all artifacts were preserved."
-                )
+                if args.yes:
+                    raise QAError(
+                        f"Revision 1 did not pass Final QA with {final_qa_label}. "
+                        "All artifacts were preserved; no silent fallback occurred."
+                    )
+                continue
+
+            metadata["final_qa"] = second_qa_metadata
             metadata["revision_cycle"]["revision_1"]["state"] = "passed_qa"
             metadata["revision_cycle"]["state"] = "revision_1_passed_qa"
             metadata["revision_cycle"]["final_generation"] = "revision-1"
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            break
 
         final_generation = metadata["revision_cycle"]["final_generation"]
         metadata["revision_cycle"]["published_artifacts"] = (

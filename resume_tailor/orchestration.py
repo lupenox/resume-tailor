@@ -98,30 +98,141 @@ class PipelineHooks:
         payload: Mapping[str, Any],
         provider_name: str = "Antigravity",
     ) -> ApprovalResponse:
-        """Request the one optional extra provider call; --yes never bypasses it."""
+        """Compatibility wrapper for the optional Step 10 revision decision.
+
+        Prefer :meth:`decide_optional_revision`. ``--yes`` never auto-launches a
+        revision provider.
+        """
+        return self.decide_optional_revision(
+            payload=payload,
+            assume_yes=False,
+            provider_name=provider_name,
+        )
+
+    def decide_optional_revision(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        assume_yes: bool = False,
+        provider_name: str = "writer",
+    ) -> ApprovalResponse:
+        """Step 10 gate: complete without revision, revise once, or stop.
+
+        No revision or final-QA provider launches until the user explicitly
+        chooses ``revise_once`` with a provider id.
+        """
         check_cancelled()
-        title = f"One optional {provider_name} revision"
+        title = "Optional one-shot revision"
+        options = list(payload.get("options") or [])
+        default_provider = payload.get("default_provider")
+        previous_failure = payload.get("previous_failure") or {}
+        qa_status = None
+        qa_result = payload.get("qa_result")
+        if isinstance(qa_result, Mapping):
+            qa_status = qa_result.get("status")
+
         if self.approval_handler is None:
+            if assume_yes:
+                # Never auto-launch revision under --yes; complete with Initial QA.
+                return ApprovalResponse("complete_without_revision")
+            print("\nOptional one-shot revision (Step 10):")
+            if qa_status == "material_findings":
+                print("  Initial QA reported material findings.")
+                issues = qa_result.get("issues") if isinstance(qa_result, Mapping) else None
+                if isinstance(issues, list):
+                    for issue in issues[:8]:
+                        if isinstance(issue, Mapping):
+                            print(
+                                f"  - {issue.get('issue_id', '?')} "
+                                f"({issue.get('category', '?')}): "
+                                f"{issue.get('description', '')}"
+                            )
+            elif qa_status == "pass":
+                print("  Initial QA approved the current rendered résumé.")
+            if previous_failure:
+                print(
+                    f"  Previous Step 10 attempt failed "
+                    f"({previous_failure.get('provider', 'unknown')}): "
+                    f"{previous_failure.get('message', 'see diagnostics')}."
+                )
+                print("  Steps 1–9 artifacts are preserved; no re-render.")
+            print("  Actions:")
+            print("    complete  — Complete without revision (keep current résumé)")
+            print("    revise    — Run optional one-shot revision + Final QA")
+            print("    stop      — Stop and preserve artifacts")
             try:
                 answer = input(
-                    f"\nInitial QA found material issues. Exactly one {provider_name} "
-                    "revision is available. Type 'revise' to authorize that "
-                    "provider call, or press Enter to stop and keep artifacts: "
-                ).strip()
+                    "Type 'complete', 'revise', or 'stop' "
+                    f"[default: complete]: "
+                ).strip().casefold()
             except (EOFError, OSError):
                 answer = ""
             check_cancelled()
+            if not answer or answer in {"complete", "c", "done", "skip"}:
+                return ApprovalResponse("complete_without_revision")
+            if answer in {"stop", "q", "quit", "cancel"}:
+                return ApprovalResponse("stop")
+            if answer not in {"revise", "revise_once", "r"}:
+                raise ApprovalError(
+                    "Optional revision decision was invalid; artifacts were preserved."
+                )
+            # Provider selection for revision + Final QA (no auto-launch).
+            available_ids = [
+                str(item.get("provider_id"))
+                for item in options
+                if item.get("available") and item.get("provider_id")
+            ]
+            print("\nSelect revision / Final QA provider:")
+            index_map: dict[str, str] = {}
+            for index, option in enumerate(options, start=1):
+                provider_id = str(option.get("provider_id") or "")
+                label = option.get("label") or provider_id
+                available = bool(option.get("available"))
+                status = option.get("status") or "unknown"
+                mark = "ready" if available else f"unavailable ({status})"
+                default_mark = " (default)" if provider_id == default_provider else ""
+                print(f"  {index}. {label}{default_mark} — {mark}")
+                index_map[str(index)] = provider_id
+                index_map[provider_id] = provider_id
+            try:
+                choice = input(
+                    "Enter provider number or id (or 'stop'): "
+                ).strip()
+            except (EOFError, OSError):
+                choice = ""
+            check_cancelled()
+            if not choice or choice.casefold() in {"stop", "q", "quit", "cancel"}:
+                return ApprovalResponse("stop")
+            chosen = index_map.get(choice) or index_map.get(choice.casefold())
+            if chosen is None:
+                normalized = choice.casefold().replace("-", "_")
+                chosen = index_map.get(normalized)
+            if chosen is None or (available_ids and chosen not in available_ids):
+                # Allow selecting even if probe said unavailable? No — require available.
+                if chosen is None:
+                    raise ApprovalError(
+                        "Revision provider selection was invalid; artifacts were preserved."
+                    )
             return ApprovalResponse(
-                "revise_once" if answer == "revise" else "stop"
+                "revise_once",
+                {
+                    "revision_provider": chosen,
+                    "final_qa_provider": chosen,
+                    "provider": chosen,
+                },
             )
+
         response = self.approval_handler(
-            ApprovalRequest(kind="qa_revision", title=title, payload=payload)
+            ApprovalRequest(kind="optional_revision", title=title, payload=payload)
         )
         check_cancelled()
-        if response.action not in {"revise_once", "stop"}:
+        if response.action not in {
+            "complete_without_revision",
+            "revise_once",
+            "stop",
+        }:
             raise ApprovalError(
-                "The revision authorization response was invalid; artifacts were "
-                "preserved."
+                "Optional revision decision was invalid; artifacts were preserved."
             )
         return response
 
