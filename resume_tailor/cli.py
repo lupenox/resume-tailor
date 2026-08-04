@@ -1579,6 +1579,9 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                     "pipeline stopped instead of guessing:\n"
                     f"{questions}"
                 )
+            if not analysis.get("recommended_edits") and analysis.get("discarded_no_op_edit_ids") and metadata["stage"] != "resuming":
+                print("The analysis found no evidence-supported résumé changes.")
+                return run_directory
             hooks.progress(
                 "reviewing_changes",
                 f"{analysis_label} analysis passed local evidence checks and "
