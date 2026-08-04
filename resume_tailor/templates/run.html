@@ -314,16 +314,67 @@
               </div>
             </section>
 
+          {% elif run.approval.kind == "initial_qa_provider" %}
+            {% set options = run.approval.payload.options or [] %}
+            {% set default_provider = run.approval.payload.default_provider %}
+            {% set previous_failure = run.approval.payload.previous_failure or {} %}
+            <section class="card gate-card">
+              <div class="gate-heading">
+                <span class="gate-icon" aria-hidden="true">04</span>
+                <div>
+                  <p class="eyebrow">Initial QA provider</p>
+                  <h2>Choose who reviews the tailored résumé</h2>
+                  <p>Steps 1–8 are complete. Rendering is finished. Select one provider for Initial QA. No provider launches until you confirm, and failures never fall back silently.</p>
+                </div>
+              </div>
+              {% if previous_failure %}
+                <div class="alert alert-warning">
+                  <strong>Previous attempt failed</strong>
+                  <span>{{ previous_failure.provider or "provider" }}: {{ previous_failure.message or "diagnostics preserved" }}. DOCX/PDF were not regenerated.</span>
+                </div>
+              {% endif %}
+              <div class="provider-grid" style="display:grid;gap:0.75rem;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));margin:1rem 0;">
+                {% for option in options %}
+                  <form action="/runs/{{ run.run_id }}/approval" method="post" class="provider-card card" style="margin:0;padding:1rem;{% if not option.available %}opacity:0.55;{% endif %}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="action" value="select">
+                    <input type="hidden" name="provider" value="{{ option.provider_id }}">
+                    <strong>{{ option.label }}</strong>
+                    {% if option.provider_id == default_provider %}<span class="status-pill">Default</span>{% endif %}
+                    <p style="margin:0.5rem 0;">{{ option.description }}</p>
+                    <small>
+                      {% if option.available %}Ready{% else %}{{ option.status|replace('_',' ')|title }} — {{ option.detail }}{% endif %}
+                    </small>
+                    {% if option.limitations %}
+                      <p><small>Limitation: {{ option.limitations|join(', ') }}</small></p>
+                    {% endif %}
+                    <div class="gate-actions" style="margin-top:0.75rem;">
+                      <button class="primary-button" type="submit" {% if not option.available %}disabled{% endif %}>
+                        Use {{ option.label }} <span>→</span>
+                      </button>
+                    </div>
+                  </form>
+                {% endfor %}
+              </div>
+              <div class="gate-actions">
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="stop">
+                  <button class="secondary-button" type="submit">Stop and keep rendered artifacts</button>
+                </form>
+              </div>
+            </section>
+
           {% elif run.approval.kind == "qa_revision" %}
             {% set qa = run.approval.payload.qa_result %}
             {% set writer_name = run.approval.payload.writer_name or "Gemma 4 12B" %}
             <section class="card gate-card">
               <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">04</span>
+                <span class="gate-icon" aria-hidden="true">05</span>
                 <div>
                   <p class="eyebrow">Optional revision decision</p>
-                  <h2>Codex found material issues</h2>
-                  <p>{{ writer_name }} authored the résumé; Codex independently reviewed it. You may authorize exactly one {{ writer_name }} revision, or stop and keep every initial artifact.</p>
+                  <h2>Initial QA found material issues</h2>
+                  <p>{{ writer_name }} authored the résumé; Initial QA independently reviewed it. You may authorize exactly one {{ writer_name }} revision, or stop and keep every initial artifact.</p>
                 </div>
               </div>
               <div class="alert alert-warning">
@@ -419,9 +470,15 @@
             </div>
             {% if run.metadata.get("final_qa") %}
               <div class="qa-summary">
-                <h3>Final QA result</h3>
+                <h3>Initial QA result</h3>
                 <p>{{ run.metadata.final_qa.summary }}</p>
-                <small>Fresh ephemeral read-only Codex session · {{ run.metadata.final_qa.generation }}</small>
+                <small>
+                  {{ run.metadata.final_qa.provider_label or run.metadata.final_qa.provider or "Codex" }}
+                  · {{ run.metadata.final_qa.generation }}
+                  {% if run.metadata.final_qa.limitations %}
+                    · limitations: {{ run.metadata.final_qa.limitations|join(', ') }}
+                  {% endif %}
+                </small>
               </div>
             {% endif %}
             <div class="result-layout">

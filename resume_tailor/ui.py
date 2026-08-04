@@ -623,9 +623,14 @@ class RunManager:
                 "revise_once",
                 "stop",
                 "reject",
+                "select",
             }:
                 record.status = "RUNNING"
-                record.message = f"{request.title} approved."
+                record.message = (
+                    f"{request.title} recorded."
+                    if response.action == "select"
+                    else f"{request.title} approved."
+                )
                 record.events.append(
                     {
                         "time": _clock_text(),
@@ -643,6 +648,7 @@ class RunManager:
         *,
         action: str,
         job_description: str = "",
+        provider: str = "",
     ) -> None:
         with self._condition:
             record = self._require_record(run_id)
@@ -655,6 +661,8 @@ class RunManager:
                 allowed = {"revise_once", "stop", "cancel"}
             elif kind == "revised_content":
                 allowed = {"approve", "reject", "cancel"}
+            elif kind == "initial_qa_provider":
+                allowed = {"select", "stop", "cancel"}
             else:
                 allowed = {"approve", "cancel"}
             if action not in allowed:
@@ -666,6 +674,11 @@ class RunManager:
                     raise InputError("Paste a complete job description first.")
                 validate_confirmed_job_description(description)
                 data["job_description"] = description
+            if action == "select":
+                selected = provider.strip()
+                if not selected:
+                    raise InputError("Choose an Initial QA provider.")
+                data["provider"] = selected
             if action == "cancel":
                 record.cancel_event.set()
             record.approval_response = ApprovalResponse(action, data)
@@ -1662,6 +1675,8 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "docx-render": "rendering",
         "pdf-export-validation": "rendering",
         "final-codex-qa": "final_qa",
+        "awaiting_initial_qa_provider": "final_qa",
+        "initial-qa": "final_qa",
         "revision-authorization": "revision_phase",
         "antigravity-revision-1": "revision_phase",
         "ollama-revision-1": "revision_phase",
@@ -2431,6 +2446,7 @@ def create_app(
                 run_id,
                 action=_form_text(form, "action"),
                 job_description=_form_text(form, "fallback_description"),
+                provider=_form_text(form, "provider"),
             )
         except InputError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

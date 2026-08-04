@@ -452,6 +452,7 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
     monkeypatch.setattr(headless_render_module, "render_headless_docx", fake_render)
     monkeypatch.setattr(docx_render_module, "export_and_validate_pdf", fake_export)
     monkeypatch.setattr(cli_module, "invoke_final_qa", fake_final_qa)
+    monkeypatch.setattr(cli_module, "run_initial_qa", fake_final_qa)
 
     parser = build_parser()
     output_dir = tmp_path / "deterministic-output"
@@ -981,6 +982,8 @@ def test_url_pipeline_continues_after_explicit_confirmation(
 
     def approve(prompt: str) -> str:
         prompts.append(prompt)
+        if "Initial QA provider" in prompt or "provider number" in prompt:
+            return "codex"
         return "approve"
 
     monkeypatch.setattr("builtins.input", approve)
@@ -1006,6 +1009,7 @@ def test_url_pipeline_continues_after_explicit_confirmation(
     )
     metadata = json.loads((run / "run-metadata.json").read_text(encoding="utf-8"))
     assert metadata["status"] == "COMPLETE"
+    assert metadata["initial_qa_provider"] == "codex"
     assert metadata["company"] == "Example AI Systems"
     assert metadata["role"] == "Machine Learning Engineer"
     assert metadata["source_resume"]["unchanged"] is True
@@ -1013,11 +1017,13 @@ def test_url_pipeline_continues_after_explicit_confirmation(
     assert analytics.summary()["totals"]["jobs_approved_for_tailoring"] == 1
     assert analytics.summary()["totals"]["applications_submitted"] == 0
     assert len(analytics.sanitized_export()["resume_versions"]) == 1
-    assert prompts == [
-        'LinkedIn posting: type "approve" to continue: ',
-        'Codex analysis: type "approve" to continue: ',
-        'Tailored content diff: type "approve" to continue: ',
-    ]
+    assert prompts[0] == 'LinkedIn posting: type "approve" to continue: '
+    assert prompts[1] == 'Codex analysis: type "approve" to continue: '
+    assert prompts[2] == 'Tailored content diff: type "approve" to continue: '
+    assert any(
+        "provider number or id" in prompt or "Initial QA provider" in prompt
+        for prompt in prompts
+    )
 
 
 def test_initial_generation_metadata_preserves_sanitized_budget_repair(

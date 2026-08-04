@@ -95,7 +95,7 @@ def workflow_stages_for_provider(
         ("antigravity_tailoring", "Local résumé tailoring"),
         ("evidence_validation", "Evidence validation"),
         ("rendering", "Rendering DOCX/PDF"),
-        ("final_qa", "Initial Codex QA"),
+        ("final_qa", "Initial QA"),
         ("revision_phase", "Optional one-shot revision"),
         ("complete", "Complete"),
     )

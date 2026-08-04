@@ -104,7 +104,7 @@ class PipelineHooks:
         if self.approval_handler is None:
             try:
                 answer = input(
-                    f"\nCodex found material issues. Exactly one {provider_name} "
+                    f"\nInitial QA found material issues. Exactly one {provider_name} "
                     "revision is available. Type 'revise' to authorize that "
                     "provider call, or press Enter to stop and keep artifacts: "
                 ).strip()
@@ -122,6 +122,97 @@ class PipelineHooks:
             raise ApprovalError(
                 "The revision authorization response was invalid; artifacts were "
                 "preserved."
+            )
+        return response
+
+    def select_initial_qa_provider(
+        self,
+        *,
+        options: list[Mapping[str, Any]],
+        default_provider: str | None = None,
+        previous_failure: Mapping[str, Any] | None = None,
+        assume_yes: bool = False,
+    ) -> ApprovalResponse:
+        """Pause before Step 9 and require an explicit Initial QA provider choice.
+
+        Environment defaults may preselect a radio option but never auto-launch
+        QA. ``assume_yes`` confirms the preselected/default provider for CLI
+        automation only after Steps 1–8 have already completed.
+        """
+        check_cancelled()
+        title = "Select Initial QA provider"
+        payload: dict[str, Any] = {
+            "options": list(options),
+            "default_provider": default_provider,
+            "previous_failure": dict(previous_failure or {}),
+        }
+        available_ids = [
+            str(item.get("provider_id"))
+            for item in options
+            if item.get("available") and item.get("provider_id")
+        ]
+        if self.approval_handler is None:
+            if assume_yes:
+                # Confirm a preselection only; never probe-and-switch silently.
+                chosen = default_provider
+                if chosen is None:
+                    # Non-interactive automation without an explicit preselection
+                    # prefers Codex when present (historical Step 9 default).
+                    if "codex" in available_ids:
+                        chosen = "codex"
+                    elif available_ids:
+                        chosen = available_ids[0]
+                if chosen is None:
+                    raise ApprovalError(
+                        "No Initial QA provider is available; rendered artifacts "
+                        "were preserved."
+                    )
+                return ApprovalResponse("select", {"provider": chosen})
+            print("\nSelect Initial QA provider (Step 9):")
+            if previous_failure:
+                print(
+                    f"  Previous attempt failed "
+                    f"({previous_failure.get('provider', 'unknown')}): "
+                    f"{previous_failure.get('message', 'see diagnostics')}."
+                )
+                print("  Rendered DOCX/PDF artifacts are preserved; no re-render.")
+            index_map: dict[str, str] = {}
+            for index, option in enumerate(options, start=1):
+                provider_id = str(option.get("provider_id") or "")
+                label = option.get("label") or provider_id
+                status = option.get("status") or "unknown"
+                available = bool(option.get("available"))
+                mark = "ready" if available else f"unavailable ({status})"
+                default_mark = " (default)" if provider_id == default_provider else ""
+                print(f"  {index}. {label}{default_mark} — {mark}")
+                print(f"     {option.get('description') or ''}")
+                index_map[str(index)] = provider_id
+                index_map[provider_id] = provider_id
+            try:
+                answer = input(
+                    "Enter provider number or id (or 'stop' to keep artifacts): "
+                ).strip()
+            except (EOFError, OSError):
+                answer = ""
+            check_cancelled()
+            if not answer or answer.casefold() in {"stop", "q", "quit", "cancel"}:
+                return ApprovalResponse("stop")
+            chosen = index_map.get(answer) or index_map.get(answer.casefold())
+            if chosen is None and answer.casefold().replace("-", "_") in index_map:
+                chosen = index_map[answer.casefold().replace("-", "_")]
+            if chosen is None:
+                raise ApprovalError(
+                    "Initial QA provider selection was invalid; artifacts were preserved."
+                )
+            return ApprovalResponse("select", {"provider": chosen})
+
+        response = self.approval_handler(
+            ApprovalRequest(kind="initial_qa_provider", title=title, payload=payload)
+        )
+        check_cancelled()
+        if response.action not in {"select", "stop"}:
+            raise ApprovalError(
+                "Initial QA provider selection was invalid; artifacts were preserved."
             )
         return response
 

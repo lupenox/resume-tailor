@@ -59,7 +59,15 @@ from .ollama_writer import (
     load_ollama_response_metadata,
     validate_ollama_model_name,
 )
-from .qa import invoke_final_qa
+from .qa import (
+    env_preselected_initial_qa_provider,
+    historical_initial_qa_provider,
+    initial_qa_provider_label,
+    invoke_final_qa,
+    normalize_initial_qa_provider,
+    probe_initial_qa_providers,
+    run_initial_qa,
+)
 from .revision import (
     REVISION_RESPONSE_METADATA_FILENAME,
     REVISION_SCHEMA_NAME,
@@ -251,6 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--ollama-model",
         default=DEFAULT_OLLAMA_MODEL,
         help=f"local Ollama model/profile (default: {DEFAULT_OLLAMA_MODEL})",
+    )
+    parser.add_argument(
+        "--initial-qa-provider",
+        choices=("gemma_local", "codex", "grok", "antigravity"),
+        default=None,
+        help=(
+            "optional preselection for Initial QA after rendering (never auto-launches; "
+            "default preselection may also come from INITIAL_QA_PROVIDER)"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
@@ -1965,48 +1982,173 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
         metadata["layout_validation"] = initial_layout
         metadata["revision_cycle"]["initial"]["layout_validation"] = initial_layout
 
-        metadata["stage"] = "final-codex-qa"
-        hooks.progress(
-            "final_qa",
-            "Codex is performing the final read-only content and visual QA review.",
-        )
-        _update_metadata(metadata, metadata_path, run_directory=run_directory)
-        qa_result = invoke_final_qa(
-            original_extraction=extracted,
-            job_description=job_description,
-            analysis=analysis,
-            tailored_pdf_text=pdf_text,
-            content_diff=content_diff,
-            preview_path=preview_path,
-            run_directory=run_directory,
-            work_directory=work_directory / "initial-qa",
-            timeout_seconds=timeout_seconds,
-            generation="initial",
-        )
-        initial_qa_path = run_directory / "final-qa.initial.json"
-        initial_qa_metadata = {
-            "generation": "initial",
-            "provider": "codex",
-            "session": "fresh_ephemeral_read_only",
-            "status": qa_result["status"],
-            "summary": qa_result["summary"],
-            "issues": qa_result["issues"],
-            "technical_failure": qa_result["technical_failure"],
-            "result": {
-                "filename": initial_qa_path.name,
-                "sha256": sha256_file(initial_qa_path),
-            },
-        }
-        metadata["final_qa"] = initial_qa_metadata
-        metadata["revision_cycle"]["initial"]["qa"] = initial_qa_metadata
-        _update_metadata(metadata, metadata_path, run_directory=run_directory)
+        # -----------------------------------------------------------------
+        # Step 9: selectable Initial QA providers (no auto-launch)
+        # -----------------------------------------------------------------
+        preselected = getattr(args, "initial_qa_provider", None)
+        if preselected is None:
+            preselected = env_preselected_initial_qa_provider()
+        if preselected is not None:
+            preselected = normalize_initial_qa_provider(preselected)
 
-        if qa_result["status"] == "technical_failure":
-            metadata["revision_cycle"]["state"] = "initial_qa_technical_failure"
-            raise QAError(
-                "The first fresh read-only Codex QA could not complete reliably. "
-                "All initial artifacts were preserved; no revision was invoked."
+        previous_failure: dict[str, Any] | None = None
+        qa_result: dict[str, Any] | None = None
+        selected_provider: str | None = None
+        initial_qa_path = run_directory / "final-qa.initial.json"
+
+        while True:
+            metadata["stage"] = "awaiting_initial_qa_provider"
+            metadata["revision_cycle"]["state"] = "awaiting_initial_qa_provider"
+            hooks.progress(
+                "final_qa",
+                "Rendering finished. Select an Initial QA provider to continue.",
+                run_directory=str(run_directory),
             )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+
+            # Honest availability; expensive Ollama probe only when selecting.
+            options = probe_initial_qa_providers(include_expensive=True)
+            selection = hooks.select_initial_qa_provider(
+                options=options,
+                default_provider=preselected,
+                previous_failure=previous_failure,
+                assume_yes=bool(args.yes),
+            )
+            if selection.action == "stop":
+                metadata["revision_cycle"]["state"] = "stopped_before_initial_qa"
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                raise QAError(
+                    "Initial QA was not launched. Rendered DOCX/PDF artifacts from "
+                    "Steps 1–8 were preserved."
+                )
+
+            selected_provider = normalize_initial_qa_provider(
+                str(selection.data.get("provider") or "")
+            )
+            option_by_id = {
+                str(item.get("provider_id")): item for item in options
+            }
+            option = option_by_id.get(selected_provider)
+            if option is None or not option.get("available"):
+                detail = (
+                    option.get("detail")
+                    if isinstance(option, dict)
+                    else "Provider is unavailable."
+                )
+                previous_failure = {
+                    "provider": selected_provider,
+                    "message": detail or "Selected provider is unavailable.",
+                }
+                # No silent fallback — re-enter selection.
+                continue
+
+            metadata["initial_qa_provider"] = selected_provider
+            metadata["initial_qa_provider_label"] = initial_qa_provider_label(
+                selected_provider
+            )
+            metadata["initial_qa_provider_selected_at"] = utc_now_iso()
+            metadata["stage"] = "initial-qa"
+            metadata["initial_qa_started_at"] = utc_now_iso()
+            metadata["revision_cycle"]["state"] = "initial_qa_in_progress"
+            provider_label = initial_qa_provider_label(selected_provider)
+            hooks.progress(
+                "final_qa",
+                f"{provider_label} is performing the Initial QA review.",
+                run_directory=str(run_directory),
+            )
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+
+            try:
+                qa_result = run_initial_qa(
+                    provider=selected_provider,
+                    original_extraction=extracted,
+                    job_description=job_description,
+                    analysis=analysis,
+                    tailored_pdf_text=pdf_text,
+                    content_diff=content_diff,
+                    preview_path=preview_path,
+                    run_directory=run_directory,
+                    work_directory=work_directory / "initial-qa",
+                    timeout_seconds=timeout_seconds,
+                    generation="initial",
+                    company=company,
+                    role=role,
+                    job_requirements=job_requirements,
+                    tailored_content=tailored_content,
+                    docx_path=docx_path,
+                    pdf_path=pdf_path,
+                    antigravity_duration=antigravity_duration,
+                    gemma_model=ollama_model,
+                )
+            except Exception as exc:
+                # Preserve diagnostics; allow retry/reselect without re-render.
+                previous_failure = {
+                    "provider": selected_provider,
+                    "message": (
+                        f"{type(exc).__name__}: provider failed; diagnostics preserved."
+                    ),
+                    "error_type": type(exc).__name__,
+                }
+                metadata["initial_qa_completed_at"] = utc_now_iso()
+                metadata["revision_cycle"]["state"] = "initial_qa_failed"
+                metadata["initial_qa_last_failure"] = previous_failure
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                if args.yes:
+                    raise QAError(
+                        f"Initial QA provider {selected_provider!r} failed. "
+                        "Rendered artifacts from Steps 1–8 were preserved; no "
+                        "silent provider fallback occurred."
+                    ) from exc
+                # No silent fallback to another provider.
+                continue
+
+            metadata["initial_qa_completed_at"] = utc_now_iso()
+            initial_qa_metadata = {
+                "generation": "initial",
+                "provider": selected_provider,
+                "provider_label": provider_label,
+                "session": "fresh_ephemeral_read_only",
+                "status": qa_result["status"],
+                "summary": qa_result["summary"],
+                "issues": qa_result["issues"],
+                "technical_failure": qa_result["technical_failure"],
+                "limitations": (
+                    ["content_and_structure_only"]
+                    if selected_provider != "codex"
+                    else []
+                ),
+                "result": {
+                    "filename": initial_qa_path.name,
+                    "sha256": sha256_file(initial_qa_path),
+                },
+            }
+            metadata["final_qa"] = initial_qa_metadata
+            metadata["revision_cycle"]["initial"]["qa"] = initial_qa_metadata
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+
+            if qa_result["status"] == "technical_failure":
+                previous_failure = {
+                    "provider": selected_provider,
+                    "message": (
+                        "Provider reported technical_failure; diagnostics preserved."
+                    ),
+                    "status": "technical_failure",
+                }
+                metadata["revision_cycle"]["state"] = "initial_qa_technical_failure"
+                metadata["initial_qa_last_failure"] = previous_failure
+                _update_metadata(metadata, metadata_path, run_directory=run_directory)
+                if args.yes:
+                    raise QAError(
+                        f"Initial QA provider {selected_provider!r} could not "
+                        "complete reliably. All initial artifacts were preserved; "
+                        "no silent provider fallback occurred."
+                    )
+                # Stay at Step 9 for retry/reselect — do not re-render.
+                continue
+            break
+
+        assert qa_result is not None and selected_provider is not None
+
         if qa_result["status"] == "pass":
             metadata["revision_cycle"]["state"] = "initial_passed_qa"
             metadata["revision_cycle"]["final_generation"] = "initial"
@@ -2015,12 +2157,12 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
             metadata["stage"] = "revision-authorization"
             hooks.progress(
                 "revision_phase",
-                f"Codex found material issues. One optional {writer_name} revision "
-                "requires explicit authorization.",
+                f"Initial QA found material issues. One optional {writer_name} "
+                "revision requires explicit authorization.",
             )
             _update_metadata(metadata, metadata_path, run_directory=run_directory)
             if hooks.approval_handler is None:
-                print("\nCodex material findings:")
+                print("\nInitial QA material findings:")
                 for issue in qa_result["issues"]:
                     print(
                         f"- {issue['issue_id']} ({issue['category']}): "
@@ -2049,8 +2191,8 @@ def _run_pipeline(args: argparse.Namespace, hooks: PipelineHooks) -> Path:
                 metadata["revision_cycle"]["state"] = "stopped_after_initial_qa"
                 _update_metadata(metadata, metadata_path, run_directory=run_directory)
                 raise QAError(
-                    "Codex found material issues and the optional revision was not "
-                    "authorized. Initial artifacts were preserved."
+                    "Initial QA found material issues and the optional revision was "
+                    "not authorized. Initial artifacts were preserved."
                 )
 
             if metadata["revision_cycle"]["attempt_count"] != 0:
