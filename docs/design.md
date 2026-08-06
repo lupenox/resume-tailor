@@ -2,8 +2,13 @@
 
 Resume Tailor uses a dark “Study in the Woods” visual system: quiet, scholarly,
 and grounded. The interface combines deep warm charcoal-green foundations,
-softly elevated panels, parchment-toned text, muted lichen accents, and restrained
-brass highlights that suggest lamplight under a canopy.
+softly elevated panels with restrained multi-layered borders, parchment-toned
+text, muted lichen accents, and brass highlights that suggest lamplight under
+a canopy.
+
+Cards use a quiet vintage framing language — thin concentric borders and
+subtle geometric corner accents inspired by Art Deco / early 20th-century
+study aesthetics — without becoming ornate or decorative for its own sake.
 
 The runtime UI uses no remote fonts or decorative assets. Body text and activity
 logs use the system sans-serif stack; Georgia is reserved for selected headings.
