@@ -1,25 +1,25 @@
 :root {
   color-scheme: dark;
-  --bg-canvas: #050914;
-  --bg-elevated: #08101e;
-  --panel: rgba(8, 18, 33, 0.88);
-  --panel-strong: #0c182b;
-  --panel-soft: #091426;
-  --border: rgba(126, 149, 191, 0.32);
-  --border-strong: rgba(150, 217, 239, 0.55);
-  --text: #f2f6fb;
-  --text-soft: #b4c7d9;
-  --muted: #8599b2;
-  --cyan: #96d9ef;
-  --cyan-bright: #bce6ff;
-  --steel: #385b82;
-  --steel-deep: #1f4563;
-  --purple: #8063ad;
-  --success: #65d8a3;
-  --warning: #e4c886;
-  --danger: #f0a6b3;
-  --focus: #a9e5f5;
-  --shadow: 0 20px 50px rgba(0, 0, 0, 0.36);
+  --bg-canvas: #0a120c;
+  --bg-elevated: #0f1a12;
+  --panel: rgba(15, 28, 20, 0.90);
+  --panel-strong: #13241a;
+  --panel-soft: #0e1c14;
+  --border: rgba(140, 168, 140, 0.28);
+  --border-strong: rgba(160, 200, 150, 0.48);
+  --text: #eef4ea;
+  --text-soft: #b8c9b0;
+  --muted: #7a8f75;
+  --cyan: #8fbc8f;
+  --cyan-bright: #b8d4a0;
+  --steel: #3d5c45;
+  --steel-deep: #2a4030;
+  --purple: #6b8e6b;
+  --success: #7dcea0;
+  --warning: #d4b86a;
+  --danger: #e0a0a8;
+  --focus: #a8d4a0;
+  --shadow: 0 20px 50px rgba(0, 0, 0, 0.42);
   --radius: 16px;
   --radius-small: 10px;
   --max-width: 1460px;
@@ -41,9 +41,9 @@ body {
   margin: 0;
   color: var(--text);
   background:
-    radial-gradient(circle at 88% 3%, rgba(188, 230, 255, 0.12), transparent 24rem),
-    radial-gradient(circle at 8% 78%, rgba(128, 99, 173, 0.08), transparent 32rem),
-    linear-gradient(145deg, #050914 0%, #07111f 52%, #050a13 100%);
+    radial-gradient(circle at 85% 5%, rgba(168, 212, 160, 0.09), transparent 28rem),
+    radial-gradient(circle at 12% 80%, rgba(80, 120, 70, 0.10), transparent 30rem),
+    linear-gradient(155deg, #0a120c 0%, #0d1a12 55%, #09100b 100%);
   font-size: 15.5px;
   line-height: 1.6;
 }
@@ -54,14 +54,14 @@ body::before {
   z-index: -1;
   pointer-events: none;
   content: "";
-  opacity: 0.38;
+  opacity: 0.32;
   background-image:
-    radial-gradient(ellipse at 72% 28%, rgba(141, 188, 218, 0.06), transparent 34%),
-    radial-gradient(ellipse at 26% 64%, rgba(88, 122, 157, 0.05), transparent 38%),
+    radial-gradient(ellipse at 70% 25%, rgba(140, 180, 130, 0.05), transparent 36%),
+    radial-gradient(ellipse at 22% 70%, rgba(70, 110, 80, 0.06), transparent 40%),
     repeating-linear-gradient(
       118deg,
       transparent 0 138px,
-      rgba(166, 211, 236, 0.025) 139px,
+      rgba(140, 180, 130, 0.02) 139px,
       transparent 141px 158px
     );
 }
@@ -111,7 +111,7 @@ summary:focus-visible {
   height: 72px;
   padding: 0 clamp(20px, 4vw, 64px);
   border-bottom: 1px solid var(--border);
-  background: rgba(5, 9, 20, 0.9);
+  background: rgba(10, 18, 12, 0.92);
   backdrop-filter: blur(16px);
 }
 
@@ -135,8 +135,8 @@ summary:focus-visible {
   border: 1px solid rgba(150, 217, 239, 0.48);
   border-radius: 10px;
   background:
-    linear-gradient(145deg, rgba(150, 217, 239, 0.16), rgba(128, 99, 173, 0.12)),
-    #0a1729;
+    linear-gradient(145deg, rgba(143, 188, 143, 0.18), rgba(100, 140, 90, 0.12)),
+    #0d1a12;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
 }
 
@@ -481,9 +481,9 @@ fieldset {
 }
 
 .segmented-control input:checked + span {
-  background: linear-gradient(145deg, #a7e2f2, #86c9df);
+  background: linear-gradient(145deg, #b8d4a0, #8fbc8f);
   box-shadow: 0 5px 18px rgba(0, 0, 0, 0.24);
-  color: #061426;
+  color: #0a160c;
 }
 
 .segmented-control input:focus-visible + span {
@@ -671,9 +671,9 @@ textarea::placeholder {
 }
 
 .primary-button {
-  border: 1px solid rgba(150, 217, 239, 0.68);
-  background: linear-gradient(135deg, #214c69, #385b82);
-  box-shadow: 0 10px 28px rgba(5, 21, 36, 0.34);
+  border: 1px solid rgba(160, 200, 150, 0.55);
+  background: linear-gradient(135deg, #2a4a35, #3d5c45);
+  box-shadow: 0 10px 28px rgba(5, 20, 10, 0.38);
   color: #fff;
 }
 
@@ -1128,7 +1128,7 @@ textarea::placeholder {
   flex: 0 0 auto;
   place-items: center;
   border-radius: 11px;
-  background: linear-gradient(145deg, #24546f, #5b507c);
+  background: linear-gradient(145deg, #2f5a3a, #4a6b4a);
   font-size: 19px;
   font-weight: 800;
 }

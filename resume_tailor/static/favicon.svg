@@ -1,17 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <defs>
     <linearGradient id="frame" x1="8" y1="6" x2="56" y2="58">
-      <stop offset="0" stop-color="#bce6ff"/>
-      <stop offset="0.58" stop-color="#5f88a8"/>
-      <stop offset="1" stop-color="#8063ad"/>
+      <stop offset="0" stop-color="#b8d4a0"/>
+      <stop offset="0.55" stop-color="#5a8a5a"/>
+      <stop offset="1" stop-color="#3d5c45"/>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="15" fill="#07111f"/>
+  <rect width="64" height="64" rx="15" fill="#0a120c"/>
   <rect x="2" y="2" width="60" height="60" rx="13" fill="none"
     stroke="url(#frame)" stroke-width="2"/>
-  <circle cx="43" cy="20" r="12" fill="#96d9ef"/>
-  <circle cx="48" cy="15" r="12" fill="#07111f"/>
-  <path d="M11 49 21 43l3-11 6 6 7-10 2 12 10 5 5 7-13-3-6 8-9-5-9 3z"
-    fill="#d9edf5" stroke="#5f88a8" stroke-linejoin="round" stroke-width="1.2"/>
-  <circle cx="35.5" cy="42.5" r="1.4" fill="#07111f"/>
+  <!-- stylized leaf -->
+  <path d="M32 12c-2 8-12 14-16 22 4 2 10 4 16 4s12-2 16-4c-4-8-14-14-16-22z"
+        fill="#8fbc8f" opacity="0.95"/>
+  <path d="M32 16v28" stroke="#0a120c" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M32 28c-5 2-9 6-11 10M32 28c5 2 9 6 11 10"
+        stroke="#0a120c" stroke-width="1.6" stroke-linecap="round" fill="none"/>
 </svg>
