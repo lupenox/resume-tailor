@@ -6,7 +6,7 @@
   <section class="hero">
     <div>
       <p class="eyebrow">AI engineering résumé workspace</p>
-      <h1>Tailor with evidence, not invention.</h1>
+      <h1>Stitch your experience into the <span class="prism-underline">perfect fit</span>.</h1>
       <p class="hero-copy">
         Bring a posting, approve every important decision, and receive a
         formatting-safe DOCX and one-page PDF.
@@ -48,7 +48,12 @@
                 {% if selected_resume_mode != "upload" %}checked{% endif %}>
               <span class="choice-title">Master résumé</span>
               <span class="choice-copy">{{ master_resume_name }}</span>
-              <span class="choice-meta">Recommended · protected source</span>
+              <div class="choice-actions">
+                <span class="choice-meta">Recommended · protected source</span>
+                <button type="button" class="preview-btn" title="Edit in LibreOffice" aria-label="Edit in LibreOffice">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" fill="none" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                </button>
+              </div>
             </label>
             <label class="choice-card">
               <input type="radio" name="resume_mode" value="upload"

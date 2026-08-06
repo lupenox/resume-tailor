@@ -2510,6 +2510,15 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return RedirectResponse(f"/runs/{record.run_id}", status_code=303)
 
+    @app.post("/api/open-master-resume")
+    async def open_master_resume(request: Request):
+        try:
+            import subprocess
+            subprocess.Popen(["libreoffice", str(settings.master_resume)], start_new_session=True)
+            return JSONResponse({"status": "ok"})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.get("/runs/{run_id}/artifacts/{artifact_name:path}")
     async def artifact(
         request: Request,

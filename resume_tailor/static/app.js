@@ -214,5 +214,88 @@
     setupFallback();
     setupSubmissionLocks();
     setupRunPolling();
+    initStarfield();
+
+    const previewBtn = document.querySelector('.preview-btn');
+    if (previewBtn) {
+      previewBtn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          previewBtn.disabled = true;
+          const res = await fetch("/api/open-master-resume", { method: "POST" });
+          if (!res.ok) throw new Error("Failed to open");
+          setTimeout(() => { previewBtn.disabled = false; }, 2000);
+        } catch (err) {
+          alert("Could not launch LibreOffice locally.");
+          previewBtn.disabled = false;
+        }
+      });
+    }
   });
+
+  function initStarfield() {
+    const canvas = document.createElement("canvas");
+    canvas.id = "starfield";
+    canvas.style.position = "fixed";
+    canvas.style.top = "0";
+    canvas.style.left = "0";
+    canvas.style.width = "100vw";
+    canvas.style.height = "100vh";
+    canvas.style.zIndex = "-1";
+    canvas.style.pointerEvents = "none";
+    document.body.insertBefore(canvas, document.body.firstChild);
+    
+    const ctx = canvas.getContext("2d");
+    let width, height;
+    let stars = [];
+    
+    function resize() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width;
+      canvas.height = height;
+      initStars();
+    }
+    
+    function initStars() {
+      stars = [];
+      const numStars = Math.floor((width * height) / 1500);
+      for (let i = 0; i < numStars; i++) {
+        stars.push({
+          x: Math.random() * width,
+          y: Math.random() * height,
+          r: Math.random() * 1.2 + 0.3,
+          alpha: Math.random(),
+          speed: (Math.random() * 0.015) + 0.002,
+          dir: Math.random() > 0.5 ? 1 : -1,
+          color: Math.random() > 0.2 ? "rgba(232, 228, 217, " : "rgba(196, 165, 116, "
+        });
+      }
+    }
+    
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+      for (let i = 0; i < stars.length; i++) {
+        let s = stars[i];
+        s.alpha += s.speed * s.dir;
+        if (s.alpha >= 1) {
+          s.alpha = 1;
+          s.dir = -1;
+        } else if (s.alpha <= 0.1) {
+          s.alpha = 0.1;
+          s.dir = 1;
+        }
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+        ctx.fillStyle = s.color + s.alpha + ")";
+        ctx.fill();
+      }
+      requestAnimationFrame(draw);
+    }
+    
+    window.addEventListener("resize", resize);
+    resize();
+    draw();
+  }
 })();
