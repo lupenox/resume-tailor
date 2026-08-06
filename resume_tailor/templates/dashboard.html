@@ -1,5 +1,11 @@
 {% extends "base.html" %}
+
 {% block title %}New run · resume-tailor{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="/static/dashboard.css?v=1">
+{% endblock %}
+
 {% block content %}
   {% set selected_job_mode = form_values.get("job_mode", "url") %}
   {% set selected_resume_mode = form_values.get("resume_mode", "master") %}
