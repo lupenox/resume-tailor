@@ -1,18 +1,37 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
   <defs>
-    <linearGradient id="frame" x1="8" y1="6" x2="56" y2="58">
-      <stop offset="0" stop-color="#b8d4a0"/>
-      <stop offset="0.55" stop-color="#5a8a5a"/>
-      <stop offset="1" stop-color="#3d5c45"/>
+    <linearGradient id="gold" x1="12" y1="8" x2="52" y2="56">
+      <stop offset="0%" stop-color="#e8d5a3"/>
+      <stop offset="40%" stop-color="#c4a574"/>
+      <stop offset="100%" stop-color="#8a6f3e"/>
+    </linearGradient>
+    <linearGradient id="gold-bright" x1="20" y1="10" x2="44" y2="50">
+      <stop offset="0%" stop-color="#f5e6c0"/>
+      <stop offset="50%" stop-color="#d4b86a"/>
+      <stop offset="100%" stop-color="#a88b4a"/>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="15" fill="#0a120c"/>
-  <rect x="2" y="2" width="60" height="60" rx="13" fill="none"
-    stroke="url(#frame)" stroke-width="2"/>
-  <!-- stylized leaf -->
-  <path d="M32 12c-2 8-12 14-16 22 4 2 10 4 16 4s12-2 16-4c-4-8-14-14-16-22z"
-        fill="#8fbc8f" opacity="0.95"/>
-  <path d="M32 16v28" stroke="#0a120c" stroke-width="2.2" stroke-linecap="round"/>
-  <path d="M32 28c-5 2-9 6-11 10M32 28c5 2 9 6 11 10"
-        stroke="#0a120c" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+
+  <!-- subtle dark rounded square background for brand mark readability -->
+  <rect width="64" height="64" rx="14" fill="#0c100d"/>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="12.5" fill="none"
+        stroke="url(#gold)" stroke-width="1.5" opacity="0.7"/>
+
+  <!-- needle body -->
+  <path d="M32.5 14 L32.5 48.5" stroke="url(#gold-bright)" stroke-width="3.2" stroke-linecap="round"/>
+  <!-- needle tip -->
+  <path d="M32.5 48.5 L30.8 52.5 L32.5 54 L34.2 52.5 Z" fill="url(#gold-bright)"/>
+  <!-- needle eye (outer) -->
+  <ellipse cx="32.5" cy="18" rx="4.2" ry="5.5" stroke="url(#gold-bright)" stroke-width="2.2" fill="#0c100d"/>
+  <!-- needle eye (inner hole) -->
+  <ellipse cx="32.5" cy="18" rx="1.6" ry="2.8" fill="#0c100d"/>
+
+  <!-- elegant curling thread -->
+  <path d="M30.2 16.5
+           C 22 12, 14 18, 16 26
+           C 18 34, 12 40, 18 46
+           C 24 52, 34 48, 38 42
+           C 42 36, 48 38, 46 30
+           C 44 22, 40 16, 34.5 18.5"
+        stroke="url(#gold)" stroke-width="1.8" stroke-linecap="round" fill="none" opacity="0.95"/>
 </svg>

@@ -108,7 +108,7 @@
         {% if summary.top_requested_skills %}
           <ol class="ranked-list">
             {% for item in summary.top_requested_skills %}
-              <li><span>{{ item.name }}</span><strong>{{ item.jobs }} job{% if item.jobs != 1 %}s{% endif %}</strong></li>
+              <li><span>{{ item.name }}</span><div class="stat-value"><strong>{{ item.jobs }}</strong><small>job{% if item.jobs != 1 %}s{% endif %}</small></div></li>
             {% endfor %}
           </ol>
         {% else %}
@@ -122,7 +122,7 @@
         {% if summary.top_missing_skills %}
           <ol class="ranked-list">
             {% for item in summary.top_missing_skills %}
-              <li><span>{{ item.name }}</span><strong>{{ item.jobs }} job{% if item.jobs != 1 %}s{% endif %}</strong></li>
+              <li><span>{{ item.name }}</span><div class="stat-value"><strong>{{ item.jobs }}</strong><small>job{% if item.jobs != 1 %}s{% endif %}</small></div></li>
             {% endfor %}
           </ol>
         {% else %}
