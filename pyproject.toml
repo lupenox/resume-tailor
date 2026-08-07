@@ -26,8 +26,8 @@ dev = [
 ]
 
 [project.scripts]
-tailor-resume = "resume_tailor.cli:main"
-tailor-resume-ui = "resume_tailor.ui_cli:main"
+tailor-resume = "resume_tailor.ui.cli:main"
+tailor-resume-ui = "resume_tailor.ui.ui_cli:main"
 
 [tool.setuptools]
 packages = ["resume_tailor"]

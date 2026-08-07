@@ -4,12 +4,12 @@ from pathlib import Path
 
 from docx import Document
 
-from resume_tailor.docx_extract import extract_resume, iter_hyperlinks
-from resume_tailor.headless_render import (
+from resume_tailor.backend.documents.docx_extract import extract_resume, iter_hyperlinks
+from resume_tailor.backend.documents.headless_render import (
     HEADLESS_SECTION_HEADINGS,
     render_headless_docx,
 )
-from resume_tailor.utilities import sha256_file
+from resume_tailor.backend.utils.utilities import sha256_file
 
 
 def test_headless_renderer_preserves_grounded_content_header_and_links(

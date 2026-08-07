@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.utilities import (
+from resume_tailor.backend.utils.utilities import (
     CancellationError,
     ModelError,
     cancellable_commands,

@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.orchestration import ApprovalRequest, ApprovalResponse, PipelineHooks
-from resume_tailor.qa import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.orchestration import ApprovalRequest, ApprovalResponse, PipelineHooks
+from resume_tailor.backend.engine.qa import (
     historical_initial_qa_provider,
     invoke_final_qa,
     normalize_initial_qa_provider,
@@ -17,7 +17,7 @@ from resume_tailor.qa import (
     resolve_qa_payload,
     run_initial_qa,
 )
-from resume_tailor.utilities import InputError, ModelError
+from resume_tailor.backend.utils.utilities import InputError, ModelError
 
 
 def _pass_payload() -> dict[str, Any]:
@@ -91,7 +91,7 @@ def test_historical_codex_only_runs_remain_readable() -> None:
 
 def test_probe_marks_unavailable_providers_honestly(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "resume_tailor.qa._probe_gemma_local",
+        "resume_tailor.backend.engine.qa._probe_gemma_local",
         lambda: type(
             "O",
             (),
@@ -110,7 +110,7 @@ def test_probe_marks_unavailable_providers_honestly(monkeypatch: pytest.MonkeyPa
         )(),
     )
     monkeypatch.setattr(
-        "resume_tailor.qa._probe_codex",
+        "resume_tailor.backend.engine.qa._probe_codex",
         lambda: type(
             "O",
             (),
@@ -129,7 +129,7 @@ def test_probe_marks_unavailable_providers_honestly(monkeypatch: pytest.MonkeyPa
         )(),
     )
     monkeypatch.setattr(
-        "resume_tailor.qa._probe_grok",
+        "resume_tailor.backend.engine.qa._probe_grok",
         lambda: type(
             "O",
             (),
@@ -148,7 +148,7 @@ def test_probe_marks_unavailable_providers_honestly(monkeypatch: pytest.MonkeyPa
         )(),
     )
     monkeypatch.setattr(
-        "resume_tailor.qa._probe_antigravity",
+        "resume_tailor.backend.engine.qa._probe_antigravity",
         lambda: type(
             "O",
             (),
@@ -193,13 +193,13 @@ def test_each_provider_selection_invokes_only_that_adapter(
 
         return _impl
 
-    monkeypatch.setattr("resume_tailor.qa._invoke_codex_qa", track("codex", _pass_payload()))
+    monkeypatch.setattr("resume_tailor.backend.engine.qa._invoke_codex_qa", track("codex", _pass_payload()))
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_gemma_qa", track("gemma_local", _pass_payload())
+        "resume_tailor.backend.engine.qa._invoke_gemma_qa", track("gemma_local", _pass_payload())
     )
-    monkeypatch.setattr("resume_tailor.qa._invoke_grok_qa", track("grok", _pass_payload()))
+    monkeypatch.setattr("resume_tailor.backend.engine.qa._invoke_grok_qa", track("grok", _pass_payload()))
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_antigravity_qa",
+        "resume_tailor.backend.engine.qa._invoke_antigravity_qa",
         track("antigravity", _pass_payload()),
     )
 
@@ -222,7 +222,7 @@ def test_malformed_provider_output_rejected_locally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_codex_qa",
+        "resume_tailor.backend.engine.qa._invoke_codex_qa",
         lambda **_k: {"status": "pass", "summary": "x", "issues": [{"bad": True}]},
     )
     with pytest.raises(ModelError):
@@ -288,11 +288,11 @@ def test_no_silent_fallback_on_provider_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_gemma_qa",
+        "resume_tailor.backend.engine.qa._invoke_gemma_qa",
         lambda **_k: (_ for _ in ()).throw(ModelError("gemma failed")),
     )
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_codex_qa",
+        "resume_tailor.backend.engine.qa._invoke_codex_qa",
         lambda **_k: (_ for _ in ()).throw(AssertionError("codex must not run")),
     )
     with pytest.raises(ModelError, match="gemma failed"):
@@ -300,7 +300,7 @@ def test_no_silent_fallback_on_provider_exception(
 
 
 def test_packet_excludes_secrets(master_resume: Path, tmp_path: Path) -> None:
-    from resume_tailor.qa import build_initial_qa_packet
+    from resume_tailor.backend.engine.qa import build_initial_qa_packet
 
     extracted, _ = extract_resume(master_resume)
     packet = build_initial_qa_packet(
@@ -333,7 +333,7 @@ def test_step10_receives_provider_neutral_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_gemma_qa",
+        "resume_tailor.backend.engine.qa._invoke_gemma_qa",
         lambda **_k: _material_payload(),
     )
     result = run_initial_qa(provider="gemma_local", **_qa_kwargs(master_resume, tmp_path))
@@ -349,7 +349,7 @@ def test_gemma_records_visual_limitation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_gemma_qa",
+        "resume_tailor.backend.engine.qa._invoke_gemma_qa",
         lambda **_k: _pass_payload(),
     )
     run_initial_qa(provider="gemma_local", **_qa_kwargs(master_resume, tmp_path))
@@ -371,9 +371,9 @@ def test_invoke_final_qa_compat_defaults_to_codex(
         calls.append("codex")
         return _pass_payload()
 
-    monkeypatch.setattr("resume_tailor.qa._invoke_codex_qa", fake_codex)
+    monkeypatch.setattr("resume_tailor.backend.engine.qa._invoke_codex_qa", fake_codex)
     monkeypatch.setattr(
-        "resume_tailor.qa._invoke_gemma_qa",
+        "resume_tailor.backend.engine.qa._invoke_gemma_qa",
         lambda **_k: (_ for _ in ()).throw(AssertionError("gemma")),
     )
     kwargs = _qa_kwargs(master_resume, tmp_path)

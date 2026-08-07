@@ -14,12 +14,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from resume_tailor.antigravity_writer import approved_edit_catalog
-from resume_tailor.ollama_writer import (
+from resume_tailor.backend.providers.antigravity_writer import approved_edit_catalog
+from resume_tailor.backend.providers.ollama_writer import (
     _write_tailoring_patch_transport_schema,
     build_ollama_tailoring_prompt,
 )
-from resume_tailor.patch_engine import (
+from resume_tailor.backend.engine.patch_engine import (
     TargetResolutionError,
     _validate_structured_list_items,
     canonical_digest,
@@ -28,7 +28,7 @@ from resume_tailor.patch_engine import (
     resolve_target_descriptor,
     validate_and_apply_patches,
 )
-from resume_tailor.structured_patch_compiler import (
+from resume_tailor.backend.engine.structured_patch_compiler import (
     DeterministicPatchError,
     combine_hybrid_patch_payload,
     compile_deterministic_structured_patches,
@@ -37,7 +37,7 @@ from resume_tailor.structured_patch_compiler import (
     is_deterministic_structured_target,
     partition_edit_catalog,
 )
-from resume_tailor.utilities import (
+from resume_tailor.backend.utils.utilities import (
     OllamaCannotApplyError,
     OllamaRevisionContractError,
     OllamaTailoringContractError,
@@ -47,7 +47,7 @@ from resume_tailor.utilities import (
     atomic_write_json,
 )
 
-import resume_tailor.ollama_writer as writer
+import resume_tailor.backend.providers.ollama_writer as writer
 
 
 # ---------------------------------------------------------------------------

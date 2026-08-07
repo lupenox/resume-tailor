@@ -5,11 +5,11 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.docx_extract import source_blocks_from_paragraphs
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.schemas import validate_payload
-from resume_tailor.utilities import ModelError
+from resume_tailor.backend.documents.docx_extract import source_blocks_from_paragraphs
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.utils.schemas import validate_payload
+from resume_tailor.backend.utils.utilities import ModelError
 
 
 SUMMARY_TEXT = "Built Python—based validation,\nwith strict evidence and exact IDs."

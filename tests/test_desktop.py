@@ -7,13 +7,13 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.desktop import (
+from resume_tailor.ui.desktop import (
     DesktopInstallError,
     is_managed_desktop_file,
     resolve_desktop_directory,
     write_desktop_launcher,
 )
-from resume_tailor import ui_cli
+from resume_tailor.ui import ui_cli
 
 
 def test_chrome_detection_uses_declared_priority() -> None:

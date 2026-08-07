@@ -8,16 +8,16 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.analysis import (
+from resume_tailor.backend.engine.analysis import (
     ANALYSIS_RESOLVED_FILENAME,
     CODEX_ANALYSIS_RESOLVED_FILENAME,
     DEFAULT_ANALYSIS_PROVIDER,
     write_resolved_analysis_artifact,
 )
-from resume_tailor.codex_analysis import build_analysis_prompt
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.gemma_analysis import (
+from resume_tailor.backend.providers.codex_analysis import build_analysis_prompt
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.providers.gemma_analysis import (
     DEFAULT_COVERAGE_MAX_OUTPUT_TOKENS,
     resolve_coverage_batch_max_output_tokens,
     resolve_coverage_batch_size,
@@ -41,8 +41,8 @@ from resume_tailor.gemma_analysis import (
     validate_coverage_payload,
     validate_edits_payload,
 )
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.utilities import (
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.utils.utilities import (
     GemmaAnalysisTimeoutError,
     GemmaOutputLimitError,
     OllamaRequestError,
@@ -144,7 +144,7 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch):
         return state["bodies"].pop(0)
 
     monkeypatch.setattr(
-        "resume_tailor.gemma_analysis.run_ollama_request",
+        "resume_tailor.backend.providers.gemma_analysis.run_ollama_request",
         fake_run_ollama_request,
     )
     state["set_bodies"] = _set_bodies
@@ -548,7 +548,7 @@ def test_phase_b_timeout_reports_edits_phase(
             return _ollama_body(coverage)
         raise OllamaRequestError("timeout", classification="timeout")
 
-    import resume_tailor.gemma_analysis as ga
+    import resume_tailor.backend.providers.gemma_analysis as ga
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(ga, "run_ollama_request", fake)
@@ -893,7 +893,7 @@ def test_canonical_fields_are_deterministic_and_honest() -> None:
 
 def test_structured_targets_remain_compiler_owned() -> None:
     """Phase B may name structured targets; they must still be compiler-classified."""
-    from resume_tailor.structured_patch_compiler import (
+    from resume_tailor.backend.engine.structured_patch_compiler import (
         is_deterministic_structured_target,
         partition_edit_catalog,
     )
@@ -984,7 +984,7 @@ def test_success_diagnostics_include_phase_metadata(
 
 
 def test_ui_timeout_message_not_unavailable() -> None:
-    from resume_tailor.ui import _safe_error_message
+    from resume_tailor.ui.ui import _safe_error_message
 
     message = _safe_error_message(GemmaAnalysisTimeoutError(900))
     assert "generation time limit" in message.casefold()

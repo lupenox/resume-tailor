@@ -7,15 +7,15 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import changed_content_ids, resolve_analysis_evidence, validate_tailored_content
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.ollama_writer import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import changed_content_ids, resolve_analysis_evidence, validate_tailored_content
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.providers.ollama_writer import (
     _resolve_initial_payload,
     _validate_gemma_structural_contract,
     build_ollama_tailoring_prompt,
 )
-from resume_tailor.utilities import (
+from resume_tailor.backend.utils.utilities import (
     OllamaCannotApplyError,
     OllamaEvidenceRejectionError,
     OllamaTailoringContractError,
@@ -353,7 +353,7 @@ def test_15_constraint_manifest_is_present_in_writer_prompt(master_resume: Path)
     assert "CATALOG SHA256 DIGEST" in prompt
 
 def test_16_no_qwen_or_antigravity_fallback_introduced() -> None:
-    from resume_tailor.ollama_writer import DEFAULT_OLLAMA_MODEL
+    from resume_tailor.backend.providers.ollama_writer import DEFAULT_OLLAMA_MODEL
     assert "gemma" in DEFAULT_OLLAMA_MODEL.lower()
 
 
@@ -369,8 +369,8 @@ def test_17_changed_content_ids_handles_differing_keys_without_error(master_resu
 
 
 def test_18_historical_wrong_root_ollama_regression_still_passes(master_resume: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from resume_tailor.ollama_capabilities import capabilities_for_model, plan_ollama_budget
-    from resume_tailor.ollama_writer import _invoke_payload, _write_transport_schema
+    from resume_tailor.backend.providers.ollama_capabilities import capabilities_for_model, plan_ollama_budget
+    from resume_tailor.backend.providers.ollama_writer import _invoke_payload, _write_transport_schema
     schema, transport_path = _write_transport_schema(
         tmp_path,
         canonical_name="ollama_tailoring_patch.schema.json",
@@ -389,7 +389,7 @@ def test_18_historical_wrong_root_ollama_regression_still_passes(master_resume: 
     }
 
     monkeypatch.setattr(
-        "resume_tailor.ollama_writer.run_ollama_request",
+        "resume_tailor.backend.providers.ollama_writer.run_ollama_request",
         lambda **kwargs: {
             "model": "resume-tailor-gemma",
             "done": True,
@@ -400,7 +400,7 @@ def test_18_historical_wrong_root_ollama_regression_still_passes(master_resume: 
         },
     )
 
-    from resume_tailor.utilities import OllamaTransportSchemaError
+    from resume_tailor.backend.utils.utilities import OllamaTransportSchemaError
     with pytest.raises(OllamaTransportSchemaError, match="ignored the supplied structured-output schema"):
         _invoke_payload(
             model="resume-tailor-gemma",

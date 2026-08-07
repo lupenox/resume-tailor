@@ -6,12 +6,12 @@ from pathlib import Path
 import pytest
 from docx import Document
 
-from resume_tailor.docx_extract import (
+from resume_tailor.backend.documents.docx_extract import (
     EXPECTED_PROJECT_BULLETS,
     extract_resume,
     validate_template,
 )
-from resume_tailor.utilities import TemplateError
+from resume_tailor.backend.utils.utilities import TemplateError
 
 
 def test_known_master_structure(master_resume: Path) -> None:

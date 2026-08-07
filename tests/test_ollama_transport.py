@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import resume_tailor.ollama_transport as transport
-from resume_tailor.utilities import CommandResult, OllamaConnectionError
+import resume_tailor.backend.providers.ollama_transport as transport
+from resume_tailor.backend.utils.utilities import CommandResult, OllamaConnectionError
 
 
 def test_local_ollama_request_uses_stdin_and_fixed_worker(

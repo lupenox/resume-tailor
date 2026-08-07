@@ -4,9 +4,9 @@ import subprocess
 
 import pytest
 
-from resume_tailor import clipboard
-from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
-from resume_tailor.utilities import InputError
+from resume_tailor.backend.utils import clipboard
+from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+from resume_tailor.backend.utils.utilities import InputError
 
 
 def test_clipboard_backend_selection_order(monkeypatch: pytest.MonkeyPatch) -> None:

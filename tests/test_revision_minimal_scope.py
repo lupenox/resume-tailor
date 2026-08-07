@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.revision import build_revision_prompt, validate_revision_scope
-from resume_tailor.utilities import RevisionValidationError
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.revision import build_revision_prompt, validate_revision_scope
+from resume_tailor.backend.utils.utilities import RevisionValidationError
 
 
 def _skeleton(master_resume: Path) -> dict[str, Any]:

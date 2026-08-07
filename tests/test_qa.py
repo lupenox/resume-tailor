@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.qa import invoke_final_qa
-from resume_tailor.utilities import ModelError
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.qa import invoke_final_qa
+from resume_tailor.backend.utils.utilities import ModelError
 
 
 def _invoke(

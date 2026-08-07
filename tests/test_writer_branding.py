@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 ACTIVE_WRITER_FILES = (
-    "resume_tailor/utilities.py",
+    "resume_tailor/backend/utils/utilities.py",
     "resume_tailor/ui.py",
     "resume_tailor/headless_render.py",
     "resume_tailor/templates/run.html",

@@ -6,12 +6,12 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 
-import resume_tailor.codex_analysis as codex_analysis_module
-from resume_tailor.codex_analysis import invoke_codex_analysis
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.schemas import (
+import resume_tailor.backend.providers.codex_analysis as codex_analysis_module
+from resume_tailor.backend.providers.codex_analysis import invoke_codex_analysis
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.utils.schemas import (
     audit_codex_transport_schema,
     build_codex_analysis_transport_schema,
     codex_transport_schema_path,
@@ -22,7 +22,7 @@ from resume_tailor.schemas import (
     validate_codex_analysis_transport_artifact,
     validate_payload,
 )
-from resume_tailor.utilities import CodexSchemaCompatibilityError
+from resume_tailor.backend.utils.utilities import CodexSchemaCompatibilityError
 
 
 def _walk_keywords(value: Any):
@@ -236,7 +236,7 @@ def test_codex_adapter_uses_transport_and_persists_normalization_warning(
     stubs_on_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from resume_tailor.docx_extract import extract_resume
+    from resume_tailor.backend.documents.docx_extract import extract_resume
 
     extracted, _ = extract_resume(master_resume)
     schema_log = tmp_path / "schema-paths.txt"
@@ -271,7 +271,7 @@ def test_codex_adapter_uses_transport_and_persists_normalization_warning(
 def test_run_schema_uses_separate_evidence_and_editable_enums(
     master_resume: Path,
 ) -> None:
-    from resume_tailor.docx_extract import extract_resume
+    from resume_tailor.backend.documents.docx_extract import extract_resume
 
     extracted, _ = extract_resume(master_resume)
     transport, evidence_ids, editable_ids, requirement_ids = (
@@ -328,7 +328,7 @@ def test_run_schema_rejects_malformed_or_inappropriate_ids(
     master_resume: Path,
 ) -> None:
     import jsonschema
-    from resume_tailor.docx_extract import extract_resume
+    from resume_tailor.backend.documents.docx_extract import extract_resume
 
     extracted, _ = extract_resume(master_resume)
     transport, _, _, _ = build_codex_analysis_transport_schema(
@@ -361,7 +361,7 @@ def test_generated_schema_artifact_is_hashed_and_revalidated(
     master_resume: Path,
     tmp_path: Path,
 ) -> None:
-    from resume_tailor.docx_extract import extract_resume
+    from resume_tailor.backend.documents.docx_extract import extract_resume
 
     extracted, _ = extract_resume(master_resume)
     artifact = prepare_codex_analysis_transport_schema(
@@ -397,7 +397,7 @@ def test_generated_schema_rejects_requirement_catalog_drift(
     master_resume: Path,
     tmp_path: Path,
 ) -> None:
-    from resume_tailor.docx_extract import extract_resume
+    from resume_tailor.backend.documents.docx_extract import extract_resume
 
     extracted, _ = extract_resume(master_resume)
     catalog = _job_catalog()

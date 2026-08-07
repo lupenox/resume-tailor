@@ -7,16 +7,16 @@ from typing import Any
 
 import pytest
 
-import resume_tailor.ollama_writer as ollama_writer_module
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import validate_tailored_content
-from resume_tailor.revision import (
+import resume_tailor.backend.providers.ollama_writer as ollama_writer_module
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import validate_tailored_content
+from resume_tailor.backend.engine.revision import (
     build_revision_prompt,
     invoke_antigravity_revision,
     validate_revision_scope,
 )
-from resume_tailor.schemas import schema_path
-from resume_tailor.utilities import (
+from resume_tailor.backend.utils.schemas import schema_path
+from resume_tailor.backend.utils.utilities import (
     AntigravityResponseEnvelopeError,
     AntigravityRevisionCannotApplyError,
     AntigravityRevisionContractError,

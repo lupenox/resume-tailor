@@ -6,22 +6,22 @@ from pathlib import Path
 
 import pytest
 
-import resume_tailor.ollama_writer as writer
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.ollama_capabilities import (
+import resume_tailor.backend.providers.ollama_writer as writer
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.providers.ollama_capabilities import (
     OllamaModelCapabilities,
     capabilities_for_model,
     estimate_tokens,
     plan_ollama_budget,
 )
-from resume_tailor.ollama_probe import (
+from resume_tailor.backend.providers.ollama_probe import (
     OBSERVED_WRONG_ROOT_KEYS,
     REQUIRED_ROOT_FIELDS,
     probe_structured_output_support,
 )
-from resume_tailor.utilities import (
+from resume_tailor.backend.utils.utilities import (
     OllamaBudgetError,
     OllamaCanonicalSchemaError,
     OllamaCannotApplyError,
@@ -1070,7 +1070,7 @@ def test_default_model_is_resume_tailor_gemma() -> None:
 
 def test_gemma_capability_lookup_resolves_exact_name() -> None:
     """Exact name lookup must return declared Gemma capabilities."""
-    from resume_tailor.ollama_capabilities import MODEL_CAPABILITIES
+    from resume_tailor.backend.providers.ollama_capabilities import MODEL_CAPABILITIES
 
     assert "resume-tailor-gemma" in MODEL_CAPABILITIES
     caps = MODEL_CAPABILITIES["resume-tailor-gemma"]

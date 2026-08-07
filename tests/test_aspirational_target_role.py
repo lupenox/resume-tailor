@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import build_content_diff, validate_tailored_content
-from resume_tailor.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import build_content_diff, validate_tailored_content
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
 
 
 TARGET_ROLE = "AI Solutions Engineer"

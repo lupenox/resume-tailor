@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.analytics import (
+from resume_tailor.backend.utils.analytics import (
     ANALYTICS_DATABASE_FILENAME,
     ANALYTICS_SCHEMA_VERSION,
     APPLICATION_STATUSES,
@@ -20,11 +20,11 @@ from resume_tailor.analytics import (
     default_analytics_database_path,
     normalize_skill_name,
 )
-from resume_tailor.job_requirements import (
+from resume_tailor.backend.jobs.job_requirements import (
     build_job_requirement_catalog,
     job_description_sha256,
 )
-from resume_tailor.utilities import InputError
+from resume_tailor.backend.utils.utilities import InputError
 
 
 JOB_DESCRIPTION = (

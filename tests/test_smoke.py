@@ -5,14 +5,14 @@ from pathlib import Path
 
 import pytest
 
-import resume_tailor.smoke as smoke_module
-from resume_tailor.smoke import (
+import resume_tailor.backend.utils.smoke as smoke_module
+from resume_tailor.backend.utils.smoke import (
     SYNTHETIC_SAMPLE_SHA256,
     assert_smoke_input_provenance,
     prepare_smoke_inputs,
     run_semantic_smoke,
 )
-from resume_tailor.utilities import InputError
+from resume_tailor.backend.utils.utilities import InputError
 
 
 def _valid_response(repository_root: Path) -> dict:

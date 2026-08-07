@@ -11,21 +11,21 @@ from pathlib import Path
 
 import pytest
 
-import resume_tailor.antigravity_transport as transport_module
-from resume_tailor.antigravity_transport import (
+import resume_tailor.backend.providers.antigravity_transport as transport_module
+from resume_tailor.backend.providers.antigravity_transport import (
     MAX_ANTIGRAVITY_PROMPT_BYTES,
     antigravity_print_args,
     run_antigravity_prompt,
 )
-from resume_tailor.antigravity_writer import (
+from resume_tailor.backend.providers.antigravity_writer import (
     build_tailoring_prompt,
     invoke_antigravity,
 )
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.schemas import schema_path
-from resume_tailor.utilities import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.utils.schemas import schema_path
+from resume_tailor.backend.utils.utilities import (
     AntigravityLaunchSizeError,
     AntigravityResponseEnvelopeError,
     CancellationError,

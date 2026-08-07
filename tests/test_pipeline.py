@@ -5,17 +5,17 @@ from pathlib import Path
 
 import pytest
 
-import resume_tailor.cli as cli_module
-from resume_tailor.analytics import ANALYTICS_DATABASE_FILENAME, AnalyticsStore
-from resume_tailor.cli import build_parser, main, run_pipeline
-from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
-from resume_tailor.utilities import (
+import resume_tailor.ui.cli as cli_module
+from resume_tailor.backend.utils.analytics import ANALYTICS_DATABASE_FILENAME, AnalyticsStore
+from resume_tailor.ui.cli import build_parser, main, run_pipeline
+from resume_tailor.backend.engine.orchestration import ApprovalResponse, PipelineHooks
+from resume_tailor.backend.utils.utilities import (
     ApifyLinkedInRetrievalError,
     ApprovalError,
     InputError,
     TailoringPreflightError,
 )
-from resume_tailor.utilities import ExitCode, sha256_file
+from resume_tailor.backend.utils.utilities import ExitCode, sha256_file
 
 
 LINKEDIN_JOB_URL = (
@@ -331,9 +331,9 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exercise the real writer entrypoint and every post-writer pipeline gate."""
-    import resume_tailor.docx_render as docx_render_module
-    import resume_tailor.headless_render as headless_render_module
-    import resume_tailor.ollama_writer as ollama_writer_module
+    import resume_tailor.backend.documents.docx_render as docx_render_module
+    import resume_tailor.backend.documents.headless_render as headless_render_module
+    import resume_tailor.backend.providers.ollama_writer as ollama_writer_module
 
     progress: list[tuple[str, str]] = []
     provider_calls: list[str] = []
