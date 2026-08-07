@@ -3,7 +3,7 @@
 {% block title %}New run · resume-tailor{% endblock %}
 
 {% block extra_css %}
-<link rel="stylesheet" href="/static/dashboard.css?v=1">
+<link rel="stylesheet" href="/static/dashboard.css?v=14">
 {% endblock %}
 
 {% block content %}
@@ -156,7 +156,7 @@
           <div class="choice-grid">
             <label class="choice-card">
               <input type="radio" name="analysis_provider" value="gemma_local"
-                {% if selected_analysis_provider not in ["codex", "grok_cli", "grok"] %}checked{% endif %}>
+                {% if selected_analysis_provider not in ["codex", "grok_cli", "grok", "antigravity"] %}checked{% endif %}>
               <span class="choice-title">Gemma Local</span>
               <span class="choice-copy">Free local Ollama analysis</span>
               <span class="choice-meta">Recommended · no cloud key</span>
@@ -175,6 +175,13 @@
               <span class="choice-copy">Authenticated local Grok CLI</span>
               <span class="choice-meta">Experimental · explicit only</span>
             </label>
+            <label class="choice-card">
+              <input type="radio" name="analysis_provider" value="antigravity"
+                {% if selected_analysis_provider == "antigravity" %}checked{% endif %}>
+              <span class="choice-title">Antigravity</span>
+              <span class="choice-copy">Antigravity CLI analysis</span>
+              <span class="choice-meta">Supports various models</span>
+            </label>
           </div>
           <p class="field-help">
             Gemma Local is recommended for free offline analysis. Resume Tailor
@@ -182,6 +189,27 @@
             QA remains Codex-only even when Gemma Local is selected for analysis.
           </p>
         </fieldset>
+
+        <fieldset class="form-section">
+          <legend>Writer provider</legend>
+          {% set selected_writer_provider = form_values.get("writer_provider", "ollama") %}
+          <div class="choice-grid choice-grid-two">
+            <label class="choice-card">
+              <input type="radio" name="writer_provider" value="ollama"
+                {% if selected_writer_provider == "ollama" %}checked{% endif %}>
+              <span class="choice-title">Ollama</span>
+              <span class="choice-copy">Local Ollama Writer</span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="writer_provider" value="antigravity"
+                {% if selected_writer_provider == "antigravity" %}checked{% endif %}>
+              <span class="choice-title">Antigravity</span>
+              <span class="choice-copy">Antigravity CLI Writer</span>
+            </label>
+          </div>
+        </fieldset>
+
+
 
         <div class="privacy-note">
           <span class="shield-icon" aria-hidden="true">✓</span>
@@ -229,6 +257,148 @@
           </li>
         </ul>
       </section>
+
+      <section class="card model-config-card" id="model-config-section">
+        <div class="card-heading compact">
+          <div>
+            <p class="eyebrow">Overrides</p>
+            <h2>Model Configuration</h2>
+          </div>
+        </div>
+        <div id="model-config-grid" class="input-panel" style="margin-top: 1rem; display: flex; flex-direction: column; gap: 0.75rem;">
+          <div id="antigravity-model-container">
+            <label for="antigravity-model">Antigravity Model</label>
+            <input id="antigravity-model" name="antigravity_model" form="new-run-form" type="text" list="antigravity-models"
+              value="{{ form_values.get('antigravity_model', '') }}" placeholder="Default">
+            <datalist id="antigravity-models">
+              <option value="flash_lite"></option>
+              <option value="flash"></option>
+              <option value="flash-exp"></option>
+              <option value="pro"></option>
+              <option value="pro-exp"></option>
+              <option value="inherit"></option>
+            </datalist>
+          </div>
+          <div id="antigravity-strength-container">
+            <label for="antigravity-strength">Antigravity Strength</label>
+            <input id="antigravity-strength" name="antigravity_strength" form="new-run-form" type="text" list="antigravity-strengths"
+              value="{{ form_values.get('antigravity_strength', '') }}" placeholder="Default">
+            <datalist id="antigravity-strengths">
+              <option value="low"></option>
+              <option value="medium"></option>
+              <option value="high"></option>
+              <option value="0.1"></option>
+              <option value="0.5"></option>
+              <option value="0.8"></option>
+              <option value="1.0"></option>
+            </datalist>
+          </div>
+          <div id="ollama-model-container">
+            <label for="ollama-model">Ollama Model</label>
+            <input id="ollama-model" name="ollama_model" form="new-run-form" type="text" list="ollama-models"
+              value="{{ form_values.get('ollama_model', 'resume-tailor-gemma') }}" placeholder="resume-tailor-gemma">
+            <datalist id="ollama-models">
+              <option value="resume-tailor-gemma"></option>
+              <option value="llama3.1:8b"></option>
+              <option value="gemma2:9b"></option>
+              <option value="qwen2.5:7b"></option>
+              <option value="mistral"></option>
+            </datalist>
+          </div>
+          <div id="grok-model-container">
+            <label for="grok-model">Grok Model</label>
+            <input id="grok-model" name="grok_model" form="new-run-form" type="text" list="grok-models"
+              value="{{ form_values.get('grok_model', '') }}" placeholder="Default">
+            <datalist id="grok-models">
+              <option value="grok-1"></option>
+              <option value="grok-1.5"></option>
+              <option value="grok-2"></option>
+              <option value="grok-2-mini"></option>
+              <option value="grok-2-latest"></option>
+              <option value="grok-3"></option>
+              <option value="grok-3-mini"></option>
+              <option value="grok-3-latest"></option>
+            </datalist>
+          </div>
+          <div id="grok-strength-container">
+            <label for="grok-strength">Grok Strength</label>
+            <input id="grok-strength" name="grok_strength" form="new-run-form" type="text" list="grok-strengths"
+              value="{{ form_values.get('grok_strength', '') }}" placeholder="Default">
+            <datalist id="grok-strengths">
+              <option value="low"></option>
+              <option value="medium"></option>
+              <option value="high"></option>
+              <option value="0.1"></option>
+              <option value="0.5"></option>
+              <option value="0.8"></option>
+              <option value="1.0"></option>
+            </datalist>
+          </div>
+          <div id="codex-model-container">
+            <label for="codex-model">Codex Model</label>
+            <input id="codex-model" name="codex_model" form="new-run-form" type="text" list="codex-models"
+              value="{{ form_values.get('codex_model', '') }}" placeholder="Default">
+            <datalist id="codex-models">
+              <option value="sol"></option>
+              <option value="sonnet"></option>
+              <option value="claude-3-5-sonnet"></option>
+              <option value="claude-3-5-haiku"></option>
+              <option value="gpt-4o"></option>
+              <option value="gpt-4o-mini"></option>
+              <option value="o1-preview"></option>
+              <option value="o1-mini"></option>
+              <option value="o3-mini"></option>
+              <option value="codex-v2"></option>
+              <option value="codex-v3"></option>
+            </datalist>
+          </div>
+          <div id="codex-strength-container">
+            <label for="codex-strength">Codex Strength</label>
+            <input id="codex-strength" name="codex_strength" form="new-run-form" type="text" list="codex-strengths"
+              value="{{ form_values.get('codex_strength', '') }}" placeholder="Default">
+            <datalist id="codex-strengths">
+              <option value="low"></option>
+              <option value="medium"></option>
+              <option value="high"></option>
+              <option value="0.5"></option>
+              <option value="1.0"></option>
+            </datalist>
+          </div>
+        </div>
+      </section>
+
+      <script>
+        document.addEventListener('DOMContentLoaded', function() {
+          const form = document.getElementById('new-run-form');
+          function updateVisibility() {
+            const analysisProvider = form.querySelector('input[name="analysis_provider"]:checked')?.value;
+            const writerProvider = form.querySelector('input[name="writer_provider"]:checked')?.value;
+            
+            const showAntigravity = analysisProvider === 'antigravity' || writerProvider === 'antigravity';
+            const showOllama = analysisProvider === 'gemma_local' || writerProvider === 'ollama';
+            const showGrok = analysisProvider === 'grok_cli' || analysisProvider === 'grok';
+            const showCodex = analysisProvider === 'codex';
+
+            document.getElementById('antigravity-model-container').style.display = showAntigravity ? 'block' : 'none';
+            document.getElementById('antigravity-strength-container').style.display = showAntigravity ? 'block' : 'none';
+            document.getElementById('ollama-model-container').style.display = showOllama ? 'block' : 'none';
+            document.getElementById('grok-model-container').style.display = showGrok ? 'block' : 'none';
+            document.getElementById('grok-strength-container').style.display = showGrok ? 'block' : 'none';
+            document.getElementById('codex-model-container').style.display = showCodex ? 'block' : 'none';
+            document.getElementById('codex-strength-container').style.display = showCodex ? 'block' : 'none';
+            
+            // Hide the entire section if no options are visible (unlikely since at least one provider is selected)
+            const section = document.getElementById('model-config-section');
+            if (!showAntigravity && !showOllama && !showGrok && !showCodex) {
+              section.style.display = 'none';
+            } else {
+              section.style.display = 'block';
+            }
+          }
+          form.addEventListener('change', updateVisibility);
+          updateVisibility();
+        });
+      </script>
 
       <section class="card history-card">
         <div class="card-heading compact">

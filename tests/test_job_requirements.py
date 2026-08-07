@@ -1,12 +1,12 @@
 import pytest
 from pathlib import Path
-from resume_tailor.utilities import InputError, RequirementExtractionError
-from resume_tailor.job_requirements import (
+from resume_tailor.backend.utils.utilities import InputError, RequirementExtractionError
+from resume_tailor.backend.jobs.job_requirements import (
     build_job_requirement_catalog,
     validate_job_requirement_catalog,
     job_requirement_index,
 )
-from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 
 def test_job_requirement_catalog_versioning() -> None:
     description = "Synthetic requirement."

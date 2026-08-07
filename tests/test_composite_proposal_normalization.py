@@ -12,17 +12,17 @@ from typing import Any
 
 import pytest
 
-from resume_tailor import ollama_writer as writer
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.patch_engine import (
+from resume_tailor.backend.providers import ollama_writer as writer
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.engine.patch_engine import (
     TargetDescriptor,
     TargetResolutionError,
     mutable_proposed_text,
     validate_and_apply_patches,
 )
-from resume_tailor.utilities import (
+from resume_tailor.backend.utils.utilities import (
     OllamaTailoringContractError,
     TailoringPreflightError,
 )
@@ -294,7 +294,7 @@ def test_14_plain_targets_bypass_normalization():
 # 15  Missing authenticated labels fail closed.
 # ---------------------------------------------------------------------------
 
-from resume_tailor.patch_engine import parse_target_source_id
+from resume_tailor.backend.engine.patch_engine import parse_target_source_id
 
 def test_15a_missing_label_key():
     content = {"skill_groups": [{"text": "Python"}]}
@@ -363,7 +363,7 @@ def test_16_missing_budget_fails_closed(master_resume: Path):
         "alignment_rationale": "",
         "evidence_source_ids": [],
     }
-    from resume_tailor.patch_engine import resolve_target_descriptor
+    from resume_tailor.backend.engine.patch_engine import resolve_target_descriptor
     with pytest.raises(TargetResolutionError, match="no authenticated content budget"):
         resolve_target_descriptor(edit, extracted["content"], extracted)
 
@@ -373,7 +373,7 @@ def test_16_missing_budget_fails_closed(master_resume: Path):
 # ---------------------------------------------------------------------------
 
 def test_17_exact_label_stripping_does_not_bypass_noop(master_resume: Path):
-    from resume_tailor.utilities import OllamaTailoringContractError
+    from resume_tailor.backend.utils.utilities import OllamaTailoringContractError
     extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, "dummy")
     current = extracted["content"]["skill_groups"][2]["text"]
     label = extracted["content"]["skill_groups"][2]["label"]
@@ -413,7 +413,7 @@ def test_17_exact_label_stripping_does_not_bypass_noop(master_resume: Path):
 # ---------------------------------------------------------------------------
 
 def test_18_exact_label_stripping_with_append(master_resume: Path):
-    from resume_tailor.utilities import OllamaTailoringContractError
+    from resume_tailor.backend.utils.utilities import OllamaTailoringContractError
     extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, "dummy", operation="append")
     current = extracted["content"]["skill_groups"][2]["text"]
 
@@ -488,8 +488,8 @@ def test_19_initial_tailoring_exact_label_stripped(master_resume: Path):
 
 
 def test_20_revision_uses_corrected_behavior(master_resume: Path):
-    from resume_tailor.patch_engine import validate_and_apply_revision_patches
-    from resume_tailor.revision import approved_revision_targets
+    from resume_tailor.backend.engine.patch_engine import validate_and_apply_revision_patches
+    from resume_tailor.backend.engine.revision import approved_revision_targets
     extracted, job_desc, reqs, analysis = _setup_synthetic_inputs(master_resume, "dummy")
     current = extracted["content"]["skill_groups"][2]["text"]
     label = extracted["content"]["skill_groups"][2]["label"]
@@ -538,7 +538,7 @@ def test_20_revision_uses_corrected_behavior(master_resume: Path):
     assert f'"mutable_proposed_body":"Wrong Label: {current}, AI"' in prompt_mismatched
 
     target_map = approved_revision_targets(qa_result=qa_result, approved_analysis=analysis)
-    from resume_tailor.patch_engine import canonical_digest
+    from resume_tailor.backend.engine.patch_engine import canonical_digest
     auth_sha256 = canonical_digest(target_map)
     payload = {
         "status": "complete",
@@ -651,7 +651,7 @@ def test_24_downstream_validation_unchanged(master_resume: Path):
             },
         ],
     }
-    from resume_tailor.utilities import OllamaTailoringContractError
+    from resume_tailor.backend.utils.utilities import OllamaTailoringContractError
     with pytest.raises(OllamaTailoringContractError, match="without authenticated source evidence"):
         validate_and_apply_patches(
             payload=payload,

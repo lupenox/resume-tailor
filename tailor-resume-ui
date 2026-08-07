@@ -23,4 +23,4 @@ else
 fi
 
 export PYTHONPATH="${APP_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-exec "${PYTHON_BIN}" -m resume_tailor.ui_cli "$@"
+exec "${PYTHON_BIN}" -m resume_tailor.ui.ui_cli "$@"

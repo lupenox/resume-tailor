@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.analysis import (
+from resume_tailor.backend.engine.analysis import (
     ANALYSIS_RESOLVED_FILENAME,
     CODEX_ANALYSIS_RESOLVED_FILENAME,
     DEFAULT_ANALYSIS_PROVIDER,
@@ -19,11 +19,11 @@ from resume_tailor.analysis import (
     unwrap_resolved_analysis_document,
     write_resolved_analysis_artifact,
 )
-from resume_tailor.cli import build_parser
-from resume_tailor.codex_analysis import invoke_codex_analysis
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.grok_analysis import (
+from resume_tailor.ui.cli import build_parser
+from resume_tailor.backend.providers.codex_analysis import invoke_codex_analysis
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.providers.grok_analysis import (
     GROK_ANALYSIS_DIAGNOSTIC_FILENAME,
     GROK_ANALYSIS_PROMPT_FILENAME,
     GROK_ANALYSIS_RESPONSE_FILENAME,
@@ -35,8 +35,8 @@ from resume_tailor.grok_analysis import (
     parse_grok_transport_envelope,
     resolve_grok_executable,
 )
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.utilities import (
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.utils.utilities import (
     CodexUsageLimitError,
     GrokAuthenticationError,
     GrokExecutableError,
@@ -126,7 +126,7 @@ def test_resolve_grok_executable_from_path(
 
     # Prefer the verified home path only when present; otherwise PATH resolution.
     monkeypatch.setattr(
-        "resume_tailor.grok_analysis.DEFAULT_GROK_EXECUTABLE",
+        "resume_tailor.backend.providers.grok_analysis.DEFAULT_GROK_EXECUTABLE",
         tmp_path / "no-home-grok",
     )
     monkeypatch.setenv("PATH", str(stubs_on_path))
@@ -140,7 +140,7 @@ def test_resolve_grok_executable_missing(
 ) -> None:
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(
-        "resume_tailor.grok_analysis.DEFAULT_GROK_EXECUTABLE",
+        "resume_tailor.backend.providers.grok_analysis.DEFAULT_GROK_EXECUTABLE",
         tmp_path / "missing-grok",
     )
     with pytest.raises(GrokExecutableError, match="not found"):
@@ -455,7 +455,7 @@ def test_codex_quota_specific_classification(
     extracted, _ = extract_resume(master_resume)
 
     def fake_run_command(args, **kwargs):  # type: ignore[no-untyped-def]
-        from resume_tailor.utilities import CommandResult
+        from resume_tailor.backend.utils.utilities import CommandResult
 
         return CommandResult(
             tuple(str(a) for a in args),
@@ -685,12 +685,12 @@ def test_e2big_is_prompt_too_large_not_executable_unavailable(
     extracted, _ = extract_resume(master_resume)
 
     def raise_e2big(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-        from resume_tailor.utilities import DependencyError
+        from resume_tailor.backend.utils.utilities import DependencyError
 
         cause = OSError(errno.E2BIG, "Argument list too long")
         raise DependencyError("Could not run grok: Argument list too long") from cause
 
-    monkeypatch.setattr("resume_tailor.grok_analysis.run_command", raise_e2big)
+    monkeypatch.setattr("resume_tailor.backend.providers.grok_analysis.run_command", raise_e2big)
     with pytest.raises(GrokPromptTooLargeError, match="argument-size limit"):
         invoke_grok_analysis(
             extracted_resume=extracted,

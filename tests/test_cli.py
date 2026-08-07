@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.cli import _validate_mode_arguments, build_parser, main
-from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
-from resume_tailor.utilities import (
+from resume_tailor.ui.cli import _validate_mode_arguments, build_parser, main
+from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+from resume_tailor.backend.utils.utilities import (
     ApprovalError,
     ExitCode,
     ask_for_approval,
@@ -223,14 +223,14 @@ def test_existing_installation_refuses_overwrite(
     )
     assert first.returncode == 0, first.stderr
     installed = fake_home / ".local" / "share" / "resume-tailor"
-    assert (installed / "resume_tailor" / "linkedin_job.py").is_file()
-    assert (installed / "resume_tailor" / "apify_job.py").is_file()
-    assert (installed / "resume_tailor" / "ollama_transport.py").is_file()
-    assert (installed / "resume_tailor" / "ollama_writer.py").is_file()
-    assert (installed / "resume_tailor" / "headless_render.py").is_file()
+    assert (installed / "resume_tailor" / "backend" / "jobs" / "linkedin_job.py").is_file()
+    assert (installed / "resume_tailor" / "backend" / "jobs" / "apify_job.py").is_file()
+    assert (installed / "resume_tailor" / "backend" / "providers" / "ollama_transport.py").is_file()
+    assert (installed / "resume_tailor" / "backend" / "providers" / "ollama_writer.py").is_file()
+    assert (installed / "resume_tailor" / "backend" / "documents" / "headless_render.py").is_file()
     assert not (installed / "resume_tailor" / "codex_linkedin.py").exists()
-    assert (installed / "resume_tailor" / "smoke.py").is_file()
-    assert (installed / "resume_tailor" / "ui.py").is_file()
+    assert (installed / "resume_tailor" / "backend" / "utils" / "smoke.py").is_file()
+    assert (installed / "resume_tailor" / "ui" / "ui.py").is_file()
     assert (installed / "resume_tailor" / "templates" / "dashboard.html").is_file()
     assert (installed / "resume_tailor" / "static" / "app.css").is_file()
     assert (installed / "schemas" / "linkedin_job.schema.json").is_file()

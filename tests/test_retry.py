@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.retry import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.engine.retry import (
     ANALYSIS_APPROVAL_FILENAME,
     analysis_input_manifest,
     build_antigravity_reprocess_context,
@@ -20,11 +20,11 @@ from resume_tailor.retry import (
     load_retry_inputs,
     record_codex_analysis_approval,
 )
-from resume_tailor.schemas import (
+from resume_tailor.backend.utils.schemas import (
     load_schema,
     prepare_codex_analysis_transport_schema,
 )
-from resume_tailor.utilities import InputError, atomic_write_json, sha256_file
+from resume_tailor.backend.utils.utilities import InputError, atomic_write_json, sha256_file
 
 
 def _write_legacy_failure(

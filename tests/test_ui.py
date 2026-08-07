@@ -11,20 +11,20 @@ from typing import Any, AsyncIterator
 import httpx
 import pytest
 
-import resume_tailor.cli as cli_module
-from resume_tailor.analytics import observation_from_local_job
-from resume_tailor.cli import run_pipeline
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
-from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
-from resume_tailor.retry import analysis_input_manifest, antigravity_retry_failure_kind
-from resume_tailor.schemas import load_schema
-import resume_tailor.ui as ui
-from resume_tailor.ui import COOKIE_NAME, DEFAULT_HOST, create_app
-from resume_tailor.ui import _failure_kind_from_metadata
-from resume_tailor.ui_cli import build_parser as build_ui_parser
-from resume_tailor.utilities import (
+import resume_tailor.ui.cli as cli_module
+from resume_tailor.backend.utils.analytics import observation_from_local_job
+from resume_tailor.ui.cli import run_pipeline
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+from resume_tailor.backend.engine.orchestration import ApprovalResponse, PipelineHooks
+from resume_tailor.backend.engine.retry import analysis_input_manifest, antigravity_retry_failure_kind
+from resume_tailor.backend.utils.schemas import load_schema
+import resume_tailor.ui.ui as ui
+from resume_tailor.ui.ui import COOKIE_NAME, DEFAULT_HOST, create_app
+from resume_tailor.ui.ui import _failure_kind_from_metadata
+from resume_tailor.ui.ui_cli import build_parser as build_ui_parser
+from resume_tailor.backend.utils.utilities import (
     ApifyConfigurationError,
     ApifyLinkedInRetrievalError,
     CancellationError,
@@ -639,7 +639,7 @@ def test_workflow_sidebar_shows_recorded_analysis_provider(
     tmp_path: Path,
 ) -> None:
     """Regression: analysis stage label must follow metadata.analysis.provider."""
-    from resume_tailor.analysis import workflow_stages_for_provider
+    from resume_tailor.backend.engine.analysis import workflow_stages_for_provider
 
     output_directory = tmp_path / "output"
     output_directory.mkdir()
@@ -1345,13 +1345,13 @@ def test_source_evidence_failure_guidance_and_safe_retry(
         master_resume,
     )
     monkeypatch.setattr(
-        "resume_tailor.cli._tailoring_dependency_versions",
+        "resume_tailor.ui.cli._tailoring_dependency_versions",
         lambda *_args, **_kwargs: pytest.fail(
             "Antigravity dependencies checked before approval"
         ),
     )
     monkeypatch.setattr(
-        "resume_tailor.cli._analysis_dependency_versions",
+        "resume_tailor.ui.cli._analysis_dependency_versions",
         lambda *_args, **_kwargs: {
             "resume_tailor": "synthetic",
             "codex": "synthetic",

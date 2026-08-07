@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from resume_tailor.character_budget import (
+from resume_tailor.backend.engine.character_budget import (
     CHARACTER_COUNTING_CONTRACT,
     calculate_content_budget,
     canonicalize_budget_text,
@@ -14,15 +14,15 @@ from resume_tailor.character_budget import (
     mutable_character_capacity,
     rendered_prefix,
 )
-from resume_tailor.codex_analysis import build_analysis_prompt
-from resume_tailor.docx_extract import _content_budget, extract_resume
-from resume_tailor.evidence import validate_tailored_content
-from resume_tailor.patch_engine import (
+from resume_tailor.backend.providers.codex_analysis import build_analysis_prompt
+from resume_tailor.backend.documents.docx_extract import _content_budget, extract_resume
+from resume_tailor.backend.engine.evidence import validate_tailored_content
+from resume_tailor.backend.engine.patch_engine import (
     PatchCharacterBudgetError,
     TargetDescriptor,
     _validate_replacement_text,
 )
-from resume_tailor.utilities import OllamaTailoringContractError
+from resume_tailor.backend.utils.utilities import OllamaTailoringContractError
 
 
 def test_canonical_text_normalizes_unicode_and_line_endings_only() -> None:

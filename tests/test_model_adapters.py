@@ -4,20 +4,20 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.antigravity_writer import (
+from resume_tailor.backend.providers.antigravity_writer import (
     build_tailoring_prompt,
     invoke_antigravity,
 )
-from resume_tailor.codex_analysis import (
+from resume_tailor.backend.providers.codex_analysis import (
     build_analysis_prompt,
     invoke_codex_analysis,
 )
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.qa import build_qa_prompt
-from resume_tailor.utilities import ModelError, SourceEvidenceError
-from resume_tailor.utilities import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.engine.qa import build_qa_prompt
+from resume_tailor.backend.utils.utilities import ModelError, SourceEvidenceError
+from resume_tailor.backend.utils.utilities import (
     AntigravityTailoringContractError,
     AntigravityTechnicalFailureError,
 )

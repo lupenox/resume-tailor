@@ -3,9 +3,9 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.docx_render import export_and_validate_pdf, render_tailored_docx
-from resume_tailor.utilities import sha256_file
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.documents.docx_render import export_and_validate_pdf, render_tailored_docx
+from resume_tailor.backend.utils.utilities import sha256_file
 
 
 def _relationship_xml(path: Path) -> bytes:

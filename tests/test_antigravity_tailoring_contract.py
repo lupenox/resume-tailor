@@ -8,19 +8,19 @@ from typing import Any
 import jsonschema
 import pytest
 
-import resume_tailor.antigravity_writer as writer_module
-from resume_tailor.antigravity_writer import (
+import resume_tailor.backend.providers.antigravity_writer as writer_module
+from resume_tailor.backend.providers.antigravity_writer import (
     approved_edit_catalog,
     build_tailoring_prompt,
     invoke_antigravity,
     preflight_tailoring_inputs,
     resolve_tailoring_response,
 )
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.schemas import load_schema, validate_payload
-from resume_tailor.utilities import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.utils.schemas import load_schema, validate_payload
+from resume_tailor.backend.utils.utilities import (
     AntigravityCannotApplyError,
     AntigravityTailoringContractError,
     AntigravityTailoringPreflightError,

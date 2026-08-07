@@ -5,17 +5,17 @@ import json
 from pathlib import Path
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import resolve_analysis_evidence, validate_tailored_content, changed_content_ids
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor import ollama_writer as writer
-from resume_tailor import patch_engine
-from resume_tailor.structured_patch_compiler import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import resolve_analysis_evidence, validate_tailored_content, changed_content_ids
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.providers import ollama_writer as writer
+from resume_tailor.backend.engine import patch_engine
+from resume_tailor.backend.engine.structured_patch_compiler import (
     combine_hybrid_patch_payload,
     deterministic_only_metadata,
     hybrid_execution_metadata,
 )
-from resume_tailor.utilities import (
+from resume_tailor.backend.utils.utilities import (
     OllamaTailoringContractError,
     OllamaCannotApplyError,
     OllamaEvidenceRejectionError,
@@ -715,7 +715,7 @@ def test_32_technical_failure_cannot_include_patches() -> None:
             }
         ],
     }
-    from resume_tailor.schemas import validate_payload
+    from resume_tailor.backend.utils.schemas import validate_payload
     with pytest.raises(ModelError, match="failed local schema validation"):
         validate_payload(payload, "ollama_tailoring_patch.schema.json", label="Test")
 
@@ -833,7 +833,7 @@ def _valid_patch_payload(extracted: dict, analysis: dict) -> dict:
 def test_39_metric_from_unrelated_source_is_not_authorized_for_summary(
     master_resume: Path,
 ) -> None:
-    from resume_tailor.evidence import _NUMBER_RE, _resume_text
+    from resume_tailor.backend.engine.evidence import _NUMBER_RE, _resume_text
 
     extracted, _job_desc, _reqs, analysis = _setup_synthetic_inputs(master_resume)
     summary_metrics = set(_NUMBER_RE.findall(extracted["content"]["professional_summary"]))

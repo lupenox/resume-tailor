@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from resume_tailor.orchestration import ApprovalRequest, ApprovalResponse, PipelineHooks
-from resume_tailor.qa import (
+from resume_tailor.backend.engine.orchestration import ApprovalRequest, ApprovalResponse, PipelineHooks
+from resume_tailor.backend.engine.qa import (
     env_preselected_revision_provider,
     historical_initial_qa_provider,
     run_initial_qa,
@@ -114,7 +114,7 @@ def test_final_qa_each_provider_isolation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from resume_tailor.docx_extract import extract_resume
+    from resume_tailor.backend.documents.docx_extract import extract_resume
 
     extracted, _ = extract_resume(master_resume)
     preview = tmp_path / "preview.revision-1.png"
@@ -134,10 +134,10 @@ def test_final_qa_each_provider_isolation(
 
         return _impl
 
-    monkeypatch.setattr("resume_tailor.qa._invoke_codex_qa", track("codex"))
-    monkeypatch.setattr("resume_tailor.qa._invoke_gemma_qa", track("gemma_local"))
-    monkeypatch.setattr("resume_tailor.qa._invoke_grok_qa", track("grok"))
-    monkeypatch.setattr("resume_tailor.qa._invoke_antigravity_qa", track("antigravity"))
+    monkeypatch.setattr("resume_tailor.backend.engine.qa._invoke_codex_qa", track("codex"))
+    monkeypatch.setattr("resume_tailor.backend.engine.qa._invoke_gemma_qa", track("gemma_local"))
+    monkeypatch.setattr("resume_tailor.backend.engine.qa._invoke_grok_qa", track("grok"))
+    monkeypatch.setattr("resume_tailor.backend.engine.qa._invoke_antigravity_qa", track("antigravity"))
 
     for provider in ("gemma_local", "codex", "grok", "antigravity"):
         calls.clear()
@@ -166,7 +166,7 @@ def test_final_qa_each_provider_isolation(
 
 
 def test_provider_neutral_error_message_includes_provider_name() -> None:
-    from resume_tailor.utilities import ModelError
+    from resume_tailor.backend.utils.utilities import ModelError
 
     # Surface wording contract used by adapters.
     message = "Final QA with Codex exited with status 2. Provider output was omitted from the exception."
@@ -209,7 +209,7 @@ def test_step10_decision_gate_does_not_invoke_providers_until_revise(
             "technical_failure": None,
         }
 
-    monkeypatch.setattr("resume_tailor.cli.run_initial_qa", track_run_initial_qa)
+    monkeypatch.setattr("resume_tailor.ui.cli.run_initial_qa", track_run_initial_qa)
     hooks = PipelineHooks()
     # Gate alone must not call providers.
     response = hooks.decide_optional_revision(

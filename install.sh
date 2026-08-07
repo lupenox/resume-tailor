@@ -54,7 +54,7 @@ DESKTOP_DIRECTORY=""
 DESKTOP_SHORTCUT=""
 if [[ "${DESKTOP}" -eq 1 ]]; then
   if ! DESKTOP_DIRECTORY="$(
-    python3 "${SOURCE_DIR}/resume_tailor/desktop.py" resolve --home "${HOME}"
+    python3 "${SOURCE_DIR}/resume_tailor/ui/desktop.py" resolve --home "${HOME}"
   )"; then
     echo "install.sh: could not resolve a safe desktop directory." >&2
     exit 1
@@ -94,7 +94,7 @@ fi
 if [[ "${DESKTOP}" -eq 1 \
   && ( -e "${DESKTOP_FILE}" || -L "${DESKTOP_FILE}" ) \
   && "${FORCE}" -eq 1 ]]; then
-  if ! python3 "${SOURCE_DIR}/resume_tailor/desktop.py" \
+  if ! python3 "${SOURCE_DIR}/resume_tailor/ui/desktop.py" \
     is-managed "${DESKTOP_FILE}"; then
     echo "install.sh: refusing to overwrite unrelated file: ${DESKTOP_FILE}" >&2
     exit 1
@@ -103,7 +103,7 @@ fi
 if [[ "${DESKTOP}" -eq 1 \
   && ( -e "${DESKTOP_SHORTCUT}" || -L "${DESKTOP_SHORTCUT}" ) \
   && "${FORCE}" -eq 1 ]]; then
-  if ! python3 "${SOURCE_DIR}/resume_tailor/desktop.py" \
+  if ! python3 "${SOURCE_DIR}/resume_tailor/ui/desktop.py" \
     is-managed "${DESKTOP_SHORTCUT}"; then
     echo "install.sh: refusing to overwrite unrelated file: ${DESKTOP_SHORTCUT}" >&2
     exit 1
@@ -120,7 +120,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "${STAGING}/resume_tailor" "${STAGING}/schemas" "${STAGING}/template"
-cp -a "${SOURCE_DIR}/resume_tailor/"*.py "${STAGING}/resume_tailor/"
+cp -a "${SOURCE_DIR}/resume_tailor/"*.py "${STAGING}/resume_tailor/" 2>/dev/null || true
+cp -a "${SOURCE_DIR}/resume_tailor/backend" "${STAGING}/resume_tailor/backend"
+cp -a "${SOURCE_DIR}/resume_tailor/ui" "${STAGING}/resume_tailor/ui"
 cp -a "${SOURCE_DIR}/resume_tailor/static" "${STAGING}/resume_tailor/static"
 cp -a "${SOURCE_DIR}/resume_tailor/templates" "${STAGING}/resume_tailor/templates"
 cp -a "${SOURCE_DIR}/schemas/"*.json "${STAGING}/schemas/"
@@ -179,12 +181,12 @@ fi
 if [[ "${DESKTOP}" -eq 1 ]]; then
   mkdir -p "${APPLICATIONS_DIR}" "${DESKTOP_DIRECTORY}"
   APP_ICON="${APP_DIR}/resume_tailor/static/favicon.svg"
-  python3 "${SOURCE_DIR}/resume_tailor/desktop.py" write \
+  python3 "${SOURCE_DIR}/resume_tailor/ui/desktop.py" write \
     --template "${SOURCE_DIR}/assets/resume-tailor.desktop.in" \
     --destination "${DESKTOP_FILE}" \
     --launcher "${UI_LAUNCHER}" \
     --icon "${APP_ICON}"
-  python3 "${SOURCE_DIR}/resume_tailor/desktop.py" write \
+  python3 "${SOURCE_DIR}/resume_tailor/ui/desktop.py" write \
     --template "${SOURCE_DIR}/assets/resume-tailor.desktop.in" \
     --destination "${DESKTOP_SHORTCUT}" \
     --launcher "${UI_LAUNCHER}" \

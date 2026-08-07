@@ -7,18 +7,18 @@ from typing import Any
 
 import pytest
 
-from resume_tailor.antigravity_response import (
+from resume_tailor.backend.providers.antigravity_response import (
     locate_json_tailoring_candidate,
     parse_json_output,
     parse_stream_json_output,
 )
-from resume_tailor.antigravity_writer import (
+from resume_tailor.backend.providers.antigravity_writer import (
     resolve_tailoring_response,
     resolve_tailoring_response_text_with_envelope,
 )
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.schemas import load_schema
-from resume_tailor.utilities import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.utils.schemas import load_schema
+from resume_tailor.backend.utils.utilities import (
     AntigravityResponseEnvelopeError,
     AntigravityTailoringContractError,
 )

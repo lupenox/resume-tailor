@@ -6,18 +6,18 @@ from typing import Any
 import jsonschema
 import pytest
 
-from resume_tailor.docx_extract import extract_resume
-from resume_tailor.evidence import (
+from resume_tailor.backend.documents.docx_extract import extract_resume
+from resume_tailor.backend.engine.evidence import (
     diagnose_legacy_analysis_evidence,
     resolve_analysis_evidence,
 )
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.orchestration import ApprovalResponse, PipelineHooks
-from resume_tailor.schemas import (
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.engine.orchestration import ApprovalResponse, PipelineHooks
+from resume_tailor.backend.utils.schemas import (
     build_codex_analysis_transport_schema,
     validate_payload,
 )
-from resume_tailor.utilities import ModelError
+from resume_tailor.backend.utils.utilities import ModelError
 
 
 def _requirements() -> dict[str, Any]:

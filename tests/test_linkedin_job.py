@@ -9,8 +9,8 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-import resume_tailor.apify_job as apify_module
-from resume_tailor.apify_job import (
+import resume_tailor.backend.jobs.apify_job as apify_module
+from resume_tailor.backend.jobs.apify_job import (
     APIFY_DIAGNOSTIC_FILENAME,
     ApifyHTTPClient,
     actor_api_identifier,
@@ -19,12 +19,12 @@ from resume_tailor.apify_job import (
     load_apify_configuration,
     normalize_apify_job_item,
 )
-from resume_tailor.linkedin_job import (
+from resume_tailor.backend.jobs.linkedin_job import (
     posting_confirmation_text,
     validate_linkedin_url,
 )
-from resume_tailor.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
-from resume_tailor.utilities import (
+from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
+from resume_tailor.backend.utils.utilities import (
     ApifyConfigurationError,
     ApifyLinkedInRetrievalError,
     InputError,
