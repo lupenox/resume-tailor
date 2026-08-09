@@ -945,7 +945,7 @@ def test_rejected_job_confirmation_stops_before_resume_analysis(
             await _wait(app, run_id, "CANCELLED")
             assert "fetching_job" in pipeline.calls
             assert "codex_analysis" not in pipeline.calls
-            assert not list((tmp_path / "output").rglob("*.docx"))
+        assert not list((tmp_path / "output").rglob("*.docx"))
 
     asyncio.run(scenario())
 
