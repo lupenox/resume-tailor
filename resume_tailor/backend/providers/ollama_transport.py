@@ -71,7 +71,11 @@ def run_ollama_request(
     parent_timeout = timeout_seconds + max(5, connect_timeout)
     try:
         result = run_command(
-            [sys.executable, "-m", "resume_tailor.ollama_transport"],
+            [
+                sys.executable,
+                "-m",
+                "resume_tailor.backend.providers.ollama_transport",
+            ],
             cwd=cwd,
             timeout_seconds=parent_timeout,
             input_text=encoded.decode("utf-8"),

@@ -49,7 +49,7 @@ PARAMETER temperature 0.2
 ```
 
 The `num_ctx` value must be at least the `context_window` declared for the
-model in `resume_tailor/ollama_capabilities.py`. A profile built with a
+model in `resume_tailor/backend/providers/ollama_capabilities.py`. A profile built with a
 smaller window silently truncates the prompt inside the server, which is one
 way a structurally valid request still produces a wrong-root response.
 
@@ -62,7 +62,8 @@ way a structurally valid request still produces a wrong-root response.
 ## Context and output budgeting
 
 Model capabilities are explicit and configurable rather than hardcoded at the
-call site. `MODEL_CAPABILITIES` in `resume_tailor/ollama_capabilities.py`
+call site. `MODEL_CAPABILITIES` in
+`resume_tailor/backend/providers/ollama_capabilities.py`
 declares `context_window`, `max_output_tokens`, `min_output_tokens`, and
 `supports_json_schema` per model, resolved by exact name and then by tag-free
 prefix; unknown models fall back to conservative defaults. `invoke_ollama` and

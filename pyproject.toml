@@ -21,16 +21,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.2,<2",
   "httpx>=0.27,<1",
   "pytest>=8.2,<10",
+  "setuptools>=69",
 ]
 
 [project.scripts]
 tailor-resume = "resume_tailor.ui.cli:main"
 tailor-resume-ui = "resume_tailor.ui.ui_cli:main"
 
-[tool.setuptools]
-packages = ["resume_tailor"]
+[tool.setuptools.packages.find]
+include = ["resume_tailor*"]
+namespaces = false
 
 [tool.setuptools.package-data]
 resume_tailor = [
@@ -39,6 +42,7 @@ resume_tailor = [
   "static/*.svg",
   "templates/*.html",
 ]
+"resume_tailor.schemas" = ["*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

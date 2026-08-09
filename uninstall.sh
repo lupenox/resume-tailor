@@ -11,7 +11,7 @@ LAUNCHER="${HOME}/.local/bin/tailor-resume"
 UI_LAUNCHER="${HOME}/.local/bin/tailor-resume-ui"
 DESKTOP_FILE="${HOME}/.local/share/applications/resume-tailor.desktop"
 DESKTOP_SHORTCUT=""
-DESKTOP_HELPER="${APP_DIR}/resume_tailor/desktop.py"
+DESKTOP_HELPER="${APP_DIR}/resume_tailor/ui/desktop.py"
 if [[ -f "${DESKTOP_HELPER}" ]]; then
   if DESKTOP_DIRECTORY="$(
     python3 "${DESKTOP_HELPER}" resolve --home "${HOME}"

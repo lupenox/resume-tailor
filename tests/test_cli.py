@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import builtins
 import os
 import subprocess
@@ -8,7 +9,16 @@ from pathlib import Path
 
 import pytest
 
-from resume_tailor.ui.cli import _validate_mode_arguments, build_parser, main
+import resume_tailor.application.pipeline as application_pipeline
+from resume_tailor.application.models import PipelineRequest, PipelineResult
+from resume_tailor.backend.engine.orchestration import PipelineHooks
+from resume_tailor.ui.cli import (
+    _validate_mode_arguments,
+    build_parser,
+    main,
+    pipeline_request_from_namespace,
+    run_pipeline,
+)
 from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
 from resume_tailor.backend.utils.utilities import (
     ApprovalError,
@@ -88,6 +98,107 @@ def test_local_gemma_is_the_default_writer() -> None:
     assert args.writer_provider == "ollama"
     assert args.ollama_model == "resume-tailor-gemma"
     assert args.analytics_db.name == "job-search-analytics.sqlite3"
+
+
+def test_pipeline_request_conversion_preserves_all_cli_and_recovery_values(
+    tmp_path: Path,
+) -> None:
+    retry_context = object()
+    antigravity_retry_context = object()
+    antigravity_reprocess_context = object()
+    namespace = argparse.Namespace(
+        resume=tmp_path / "master.docx",
+        clipboard=True,
+        job_file=tmp_path / "job.txt",
+        job_url="https://www.linkedin.com/jobs/view/4123456789/",
+        company="Example",
+        role="Developer",
+        output_dir=tmp_path / "output",
+        analytics_db=tmp_path / "analytics.sqlite3",
+        yes=True,
+        keep_workdir=True,
+        timeout=(321, "321s"),
+        writer_provider="antigravity",
+        analysis_provider="grok_cli",
+        ollama_model="synthetic-model",
+        antigravity_model="pro",
+        antigravity_strength="high",
+        grok_model="grok-synthetic",
+        grok_strength="medium",
+        codex_model="codex-synthetic",
+        codex_strength="low",
+        initial_qa_provider="grok",
+        job_source_override="pasted",
+        retry_context=retry_context,
+        antigravity_retry_context=antigravity_retry_context,
+        antigravity_reprocess_context=antigravity_reprocess_context,
+    )
+
+    request = pipeline_request_from_namespace(namespace)
+
+    assert request == PipelineRequest(
+        resume=namespace.resume,
+        clipboard=namespace.clipboard,
+        job_file=namespace.job_file,
+        job_url=namespace.job_url,
+        company=namespace.company,
+        role=namespace.role,
+        output_dir=namespace.output_dir,
+        analytics_db=namespace.analytics_db,
+        yes=namespace.yes,
+        keep_workdir=namespace.keep_workdir,
+        timeout=namespace.timeout,
+        writer_provider=namespace.writer_provider,
+        analysis_provider=namespace.analysis_provider,
+        ollama_model=namespace.ollama_model,
+        antigravity_model=namespace.antigravity_model,
+        antigravity_strength=namespace.antigravity_strength,
+        grok_model=namespace.grok_model,
+        grok_strength=namespace.grok_strength,
+        codex_model=namespace.codex_model,
+        codex_strength=namespace.codex_strength,
+        initial_qa_provider=namespace.initial_qa_provider,
+        job_source_override=namespace.job_source_override,
+        retry_context=retry_context,
+        antigravity_retry_context=antigravity_retry_context,
+        antigravity_reprocess_context=antigravity_reprocess_context,
+    )
+
+
+def test_compatibility_run_pipeline_delegates_and_returns_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = build_parser().parse_args(
+        [
+            "--resume",
+            str(tmp_path / "master.docx"),
+            "--job-file",
+            str(tmp_path / "job.txt"),
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+        ]
+    )
+    hooks = PipelineHooks()
+    expected = tmp_path / "completed-run"
+    captured: dict[str, object] = {}
+
+    def fake_service(
+        request: PipelineRequest,
+        *,
+        hooks: PipelineHooks,
+    ) -> PipelineResult:
+        captured["request"] = request
+        captured["hooks"] = hooks
+        return PipelineResult(run_directory=expected)
+
+    monkeypatch.setattr(application_pipeline, "run_pipeline", fake_service)
+
+    assert run_pipeline(args, hooks=hooks) == expected
+    assert isinstance(captured["request"], PipelineRequest)
+    assert captured["hooks"] is hooks
 
 
 def test_removed_linkedin_provider_flag_is_rejected() -> None:
@@ -233,8 +344,9 @@ def test_existing_installation_refuses_overwrite(
     assert (installed / "resume_tailor" / "ui" / "ui.py").is_file()
     assert (installed / "resume_tailor" / "templates" / "dashboard.html").is_file()
     assert (installed / "resume_tailor" / "static" / "app.css").is_file()
-    assert (installed / "schemas" / "linkedin_job.schema.json").is_file()
-    assert not (installed / "schemas" / "linkedin_job.openai.schema.json").exists()
+    installed_schemas = installed / "resume_tailor" / "schemas"
+    assert (installed_schemas / "linkedin_job.schema.json").is_file()
+    assert not (installed_schemas / "linkedin_job.openai.schema.json").exists()
     if (installer_source / ".venv" / "bin" / "python").is_file():
         assert (installed / ".venv").is_symlink()
         assert (installed / ".venv").resolve() == (installer_source / ".venv").resolve()
@@ -310,6 +422,19 @@ def test_desktop_launcher_requires_explicit_installer_option(
     assert shortcut.is_file()
     assert shortcut.stat().st_mode & 0o111
     assert shortcut.read_text(encoding="utf-8") == text
+
+    uninstall = subprocess.run(
+        [str(fake_home / ".local" / "share" / "resume-tailor" / "uninstall.sh")],
+        cwd=tmp_path,
+        env=environment,
+        input="remove\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert uninstall.returncode == 0, uninstall.stderr
+    assert not desktop.exists()
+    assert not shortcut.exists()
 
 
 def test_desktop_installer_refuses_unrelated_shortcut_even_with_force(

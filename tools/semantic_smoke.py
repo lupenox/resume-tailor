@@ -11,8 +11,8 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from resume_tailor.smoke import prepare_smoke_inputs, run_semantic_smoke
-from resume_tailor.utilities import ResumeTailorError
+from resume_tailor.backend.utils.smoke import prepare_smoke_inputs, run_semantic_smoke
+from resume_tailor.backend.utils.utilities import ResumeTailorError
 
 
 def _parser() -> argparse.ArgumentParser:

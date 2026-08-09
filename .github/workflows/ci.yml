@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-build-and-install:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install document tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libreoffice poppler-utils
+
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run offline test suite
+        run: python -m pytest
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Smoke-test installed wheel outside the checkout
+        shell: bash
+        run: |
+          wheel_path="$(find "${GITHUB_WORKSPACE}/dist" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "${wheel_path}"
+
+          smoke_venv="${RUNNER_TEMP}/resume-tailor-wheel-smoke"
+          python -m venv "${smoke_venv}"
+          "${smoke_venv}/bin/python" -m pip install "${wheel_path}"
+
+          cd "${RUNNER_TEMP}"
+          env -u PYTHONPATH "${smoke_venv}/bin/python" -I -c 'import sys; from importlib.resources import files; from pathlib import Path; import resume_tailor; from resume_tailor.application import PipelineRequest, PipelineResult; from resume_tailor.backend.utils.schemas import load_schema; package_file = Path(resume_tailor.__file__).resolve(); assert Path(sys.prefix).resolve() in package_file.parents; assert files("resume_tailor").joinpath("templates", "dashboard.html").is_file(); assert files("resume_tailor").joinpath("static", "app.css").is_file(); assert files("resume_tailor.schemas").joinpath("tailored_resume.schema.json").is_file(); assert load_schema("tailored_resume.schema.json"); assert load_schema("codex_analysis.schema.json"); assert load_schema("codex_analysis.openai.schema.json"); assert PipelineRequest and PipelineResult'
+          env -u PYTHONPATH "${smoke_venv}/bin/tailor-resume" --help
+          env -u PYTHONPATH "${smoke_venv}/bin/tailor-resume-ui" --help
