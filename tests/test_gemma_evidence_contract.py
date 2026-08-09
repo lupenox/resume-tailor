@@ -15,6 +15,7 @@ from resume_tailor.backend.providers.ollama_writer import (
     _validate_gemma_structural_contract,
     build_ollama_tailoring_prompt,
 )
+from resume_tailor.backend.utils.schemas import load_schema
 from resume_tailor.backend.utils.utilities import (
     OllamaCannotApplyError,
     OllamaEvidenceRejectionError,
@@ -162,10 +163,7 @@ def test_4_unsupported_structural_operation_cannot_authorize_bullet_removal(
             approved_analysis=analysis,
         )
 
-    schema = json.loads(
-        (Path(__file__).resolve().parents[1] / "schemas" / "codex_analysis.schema.json")
-        .read_text(encoding="utf-8")
-    )
+    schema = load_schema("codex_analysis.schema.json")
     operations = schema["properties"]["recommended_edits"]["items"]["properties"][
         "operation"
     ]["enum"]

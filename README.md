@@ -2,12 +2,14 @@
 
 `resume-tailor` is a local Linux CLI and polished localhost web application that
 creates a truthful, job-tailored resume from a structured master DOCX. Both
-interfaces share one Python pipeline: Apify retrieves public LinkedIn postings,
-OpenAI Codex CLI performs evidence analysis, and local Gemma 4 12B through
-Ollama produces the complete schema-constrained tailored résumé content,
-deterministic local code validates and renders a Headless-style DOCX,
-LibreOffice and Poppler validate a one-page PDF, and Codex performs a final
-read-only visual/content review.
+interfaces are adapters over the typed application pipeline in
+`resume_tailor/application`: they translate terminal or HTTP input into a
+`PipelineRequest` and consume its `PipelineResult`, while the shared application
+service owns the run. Apify retrieves public LinkedIn postings, OpenAI Codex CLI
+performs evidence analysis, and local Gemma 4 12B through Ollama produces the
+complete schema-constrained tailored résumé content, deterministic local code
+validates and renders a Headless-style DOCX, LibreOffice and Poppler validate a
+one-page PDF, and Codex performs a final read-only visual/content review.
 
 The application never asks either model to edit the document. Models return
 structured content; Python validates it and either renders the deterministic
@@ -65,7 +67,12 @@ The private SQLite job-search source of truth, deterministic statistics, and
 sanitized future-export boundary are documented in
 [docs/local-job-search-analytics.md](docs/local-job-search-analytics.md).
 
-Codex uses separate schemas and adapters for analysis and final QA.
+Codex uses separate schemas and adapters for analysis and final QA. Runtime
+schemas live in `resume_tailor/schemas`, are included in wheels as package data,
+and are loaded through `importlib.resources`; source checkouts and installed
+wheels therefore use the same canonical and compatibility resources. The Jinja
+templates and static UI assets likewise remain packaged under
+`resume_tailor/templates` and `resume_tailor/static`.
 The full Draft 2020-12 schemas `linkedin_job.schema.json`,
 `codex_analysis.schema.json`, and `final_qa.schema.json` remain canonical for
 local validation and retain constraints such as `uniqueItems`, size limits, and
@@ -116,9 +123,10 @@ The UI uses FastAPI, server-rendered Jinja2 templates, local CSS, and a small
 amount of dependency-free JavaScript. There is no Node server, Electron runtime,
 external CDN, remote font, third-party tracking, remote analytics, or telemetry.
 The optional Analytics section reads deterministic statistics from a private
-local SQLite database. A background worker calls the same `run_pipeline`
-function as the CLI through reusable progress, approval, warning, and
-cancellation hooks.
+local SQLite database. A background worker submits the same typed request to the
+application service as the CLI adapter, using reusable progress, approval,
+warning, and cancellation hooks. Neither adapter owns or duplicates pipeline
+logic.
 
 The workflow page polls a small structured status endpoint. It displays concise
 stage messages, never hidden reasoning, raw prompts, environment variables,
@@ -204,7 +212,7 @@ PARAMETER temperature 0.2
 ```
 
 `num_ctx` must be at least the `context_window` declared for the model in
-`resume_tailor/ollama_capabilities.py`. A smaller profile window silently
+`resume_tailor/backend/providers/ollama_capabilities.py`. A smaller profile window silently
 truncates the prompt inside the Ollama server, which can produce a structurally
 wrong response even when the request itself is valid. See
 [docs/ollama-writer.md](docs/ollama-writer.md) for the budgeting and
@@ -885,10 +893,33 @@ Run the required checks:
 
 ```bash
 .venv/bin/python -m pytest -q
+.venv/bin/python -m build
 .venv/bin/python -m compileall resume_tailor
 bash -n tailor-resume tailor-resume-ui install.sh uninstall.sh
 shellcheck tailor-resume tailor-resume-ui install.sh uninstall.sh
 ```
+
+To verify the wheel independently of the source checkout, install it into a
+fresh environment, change to a temporary directory, and run the installed
+imports, resources, and console entry points:
+
+```bash
+WHEEL="$(find "$PWD/dist" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+SMOKE_ROOT="$(mktemp -d)"
+.venv/bin/python -m venv "${SMOKE_ROOT}/venv"
+"${SMOKE_ROOT}/venv/bin/python" -m pip install "${WHEEL}"
+(
+  cd "${SMOKE_ROOT}"
+  env -u PYTHONPATH "${SMOKE_ROOT}/venv/bin/python" -I -c \
+    'import resume_tailor; from resume_tailor.backend.utils.schemas import load_schema; assert load_schema("tailored_resume.schema.json"); assert load_schema("codex_analysis.openai.schema.json")'
+  env -u PYTHONPATH "${SMOKE_ROOT}/venv/bin/tailor-resume" --help
+  env -u PYTHONPATH "${SMOKE_ROOT}/venv/bin/tailor-resume-ui" --help
+)
+```
+
+This is also the sequence enforced by CI on pull requests and pushes to `main`,
+using the minimum supported Python version and the real LibreOffice/Poppler
+integration tests before the clean wheel-install smoke checks.
 
 The suite is synthetic and offline. Tests prepend `tests/stubs` to `PATH` for
 Codex and Antigravity and inject a fake Apify HTTP/run client. They never make

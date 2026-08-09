@@ -22,5 +22,6 @@ else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
+export RESUME_TAILOR_HOME="${APP_DIR}"
 export PYTHONPATH="${APP_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 exec "${PYTHON_BIN}" -m resume_tailor.ui.ui_cli "$@"

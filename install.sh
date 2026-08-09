@@ -119,13 +119,8 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "${STAGING}/resume_tailor" "${STAGING}/schemas" "${STAGING}/template"
-cp -a "${SOURCE_DIR}/resume_tailor/"*.py "${STAGING}/resume_tailor/" 2>/dev/null || true
-cp -a "${SOURCE_DIR}/resume_tailor/backend" "${STAGING}/resume_tailor/backend"
-cp -a "${SOURCE_DIR}/resume_tailor/ui" "${STAGING}/resume_tailor/ui"
-cp -a "${SOURCE_DIR}/resume_tailor/static" "${STAGING}/resume_tailor/static"
-cp -a "${SOURCE_DIR}/resume_tailor/templates" "${STAGING}/resume_tailor/templates"
-cp -a "${SOURCE_DIR}/schemas/"*.json "${STAGING}/schemas/"
+mkdir -p "${STAGING}/template"
+cp -a "${SOURCE_DIR}/resume_tailor" "${STAGING}/resume_tailor"
 cp -a "${SOURCE_DIR}/template/master_resume.docx" "${STAGING}/template/master_resume.docx"
 cp -a \
   "${SOURCE_DIR}/pyproject.toml" \

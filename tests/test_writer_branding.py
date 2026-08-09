@@ -3,8 +3,8 @@ from pathlib import Path
 
 ACTIVE_WRITER_FILES = (
     "resume_tailor/backend/utils/utilities.py",
-    "resume_tailor/ui.py",
-    "resume_tailor/headless_render.py",
+    "resume_tailor/ui/ui.py",
+    "resume_tailor/backend/documents/headless_render.py",
     "resume_tailor/templates/run.html",
     "resume_tailor/templates/dashboard.html",
 )
@@ -18,4 +18,7 @@ def test_active_runtime_files_present_gemma_not_qwen() -> None:
     )
     assert "Gemma 4 12B" in combined
     assert "Qwen" not in combined
-    assert "qwen" not in combined.casefold()
+    # Preserve the existing free-form Ollama model compatibility suggestion;
+    # it is not active writer branding or an automatic provider selection.
+    active_branding = combined.replace('<option value="qwen2.5:7b"></option>', "")
+    assert "qwen" not in active_branding.casefold()

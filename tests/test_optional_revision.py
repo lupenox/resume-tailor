@@ -209,7 +209,10 @@ def test_step10_decision_gate_does_not_invoke_providers_until_revise(
             "technical_failure": None,
         }
 
-    monkeypatch.setattr("resume_tailor.ui.cli.run_initial_qa", track_run_initial_qa)
+    monkeypatch.setattr(
+        "resume_tailor.application.pipeline.run_initial_qa",
+        track_run_initial_qa,
+    )
     hooks = PipelineHooks()
     # Gate alone must not call providers.
     response = hooks.decide_optional_revision(

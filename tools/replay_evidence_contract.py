@@ -9,9 +9,9 @@ from typing import Any
 
 import jsonschema
 
-from resume_tailor.evidence import diagnose_legacy_analysis_evidence
-from resume_tailor.job_requirements import build_job_requirement_catalog
-from resume_tailor.schemas import load_schema
+from resume_tailor.backend.engine.evidence import diagnose_legacy_analysis_evidence
+from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
+from resume_tailor.backend.utils.schemas import load_schema
 
 
 EXPECTED_FILES = (

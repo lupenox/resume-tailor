@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import atexit
 import copy
 import json
+import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import lru_cache
+from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from resume_tailor.backend.utils.utilities import (
@@ -15,7 +22,12 @@ from resume_tailor.backend.utils.utilities import (
 )
 
 
-SCHEMA_DIRECTORY = Path(__file__).resolve().parents[3] / "schemas"
+SCHEMA_PACKAGE = "resume_tailor.schemas"
+
+_SCHEMA_RESOURCE_CONTEXTS = ExitStack()
+_SCHEMA_RESOURCE_LOCK = RLock()
+_SCHEMA_MATERIALIZED_DIRECTORY: Path | None = None
+atexit.register(_SCHEMA_RESOURCE_CONTEXTS.close)
 
 CODEX_TRANSPORT_SCHEMAS = {
     "codex_analysis.schema.json": "codex_analysis.openai.schema.json",
@@ -104,17 +116,52 @@ class CodexAnalysisTransportArtifact:
         }
 
 
+def _schema_resource(name: str) -> Traversable:
+    if not name or Path(name).name != name:
+        raise DependencyError(f"Bundled JSON schema is missing: {name}")
+    try:
+        resource = resources.files(SCHEMA_PACKAGE).joinpath(name)
+    except (ModuleNotFoundError, TypeError) as exc:
+        raise DependencyError(
+            f"Bundled JSON schema package is unavailable: {SCHEMA_PACKAGE}"
+        ) from exc
+    if not resource.is_file():
+        raise DependencyError(f"Bundled JSON schema is missing: {name}")
+    return resource
+
+
+@lru_cache(maxsize=None)
 def schema_path(name: str) -> Path:
-    path = (SCHEMA_DIRECTORY / name).resolve()
-    if not path.is_file():
-        raise DependencyError(f"Bundled JSON schema is missing: {path}")
-    return path
+    """Return a process-lifetime concrete path for a packaged schema resource."""
+
+    global _SCHEMA_MATERIALIZED_DIRECTORY
+
+    resource = _schema_resource(name)
+    try:
+        with _SCHEMA_RESOURCE_LOCK:
+            path = _SCHEMA_RESOURCE_CONTEXTS.enter_context(resources.as_file(resource))
+            if path.name != name:
+                if _SCHEMA_MATERIALIZED_DIRECTORY is None:
+                    temporary = _SCHEMA_RESOURCE_CONTEXTS.enter_context(
+                        tempfile.TemporaryDirectory(prefix="resume-tailor-schemas-")
+                    )
+                    _SCHEMA_MATERIALIZED_DIRECTORY = Path(temporary)
+                path = _SCHEMA_MATERIALIZED_DIRECTORY / name
+                path.write_bytes(resource.read_bytes())
+    except OSError as exc:
+        raise DependencyError(
+            f"Bundled JSON schema is unavailable: {name}: {exc}"
+        ) from exc
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise DependencyError(f"Bundled JSON schema is missing: {name}")
+    return resolved
 
 
 def load_schema(name: str) -> dict[str, Any]:
     try:
-        payload = json.loads(schema_path(name).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = json.loads(_schema_resource(name).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise DependencyError(f"Bundled JSON schema is invalid: {name}: {exc}") from exc
     if not isinstance(payload, dict):
         raise DependencyError(f"Bundled JSON schema must be an object: {name}")

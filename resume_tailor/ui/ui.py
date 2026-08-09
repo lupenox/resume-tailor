@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import argparse
 import hmac
+import importlib.resources
 import json
+import os
 import re
 import secrets
 import shutil
@@ -11,7 +12,7 @@ import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -30,6 +31,8 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.datastructures import FormData, UploadFile
 
 from resume_tailor import __version__
+from resume_tailor.application.models import PipelineRequest, PipelineResult
+from resume_tailor.application.pipeline import run_pipeline, validate_label
 from resume_tailor.backend.utils.analytics import (
     APPLICATION_STATUSES,
     INTERVIEW_TYPES,
@@ -37,7 +40,6 @@ from resume_tailor.backend.utils.analytics import (
     AnalyticsStore,
     default_analytics_database_path,
 )
-from resume_tailor.ui.cli import _validate_label, run_pipeline
 from resume_tailor.backend.documents.docx_extract import validate_template
 from resume_tailor.backend.jobs.linkedin_job import validate_linkedin_url
 from resume_tailor.backend.jobs.job_text import (
@@ -190,7 +192,7 @@ _DOWNLOAD_EXACT = {
 }
 
 
-PipelineRunner = Callable[..., Path]
+PipelineRunner = Callable[..., PipelineResult | Path]
 
 
 class ActiveRunError(InputError):
@@ -215,7 +217,7 @@ class RunRecord:
     source_mode: str
     company: str | None
     role: str | None
-    namespace: argparse.Namespace
+    request: PipelineRequest
     staging_directory: Path
     status: str = "QUEUED"
     stage: str = "validating_input"
@@ -232,12 +234,22 @@ class RunRecord:
     revision: int = 0
 
 
-def _project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
 def default_master_resume() -> Path:
-    return _project_root() / "template" / "master_resume.docx"
+    application_home = os.environ.get("RESUME_TAILOR_HOME")
+    root = Path(application_home).expanduser() if application_home else Path.cwd()
+    return root / "template" / "master_resume.docx"
+
+
+def _package_resource_directory(name: str) -> Path:
+    resource = importlib.resources.files("resume_tailor").joinpath(name)
+    if not resource.is_dir():
+        raise RuntimeError(f"Bundled application resource directory is missing: {name}")
+    try:
+        return Path(resource)
+    except TypeError as exc:
+        raise RuntimeError(
+            f"Bundled application resource directory is not filesystem-backed: {name}"
+        ) from exc
 
 
 def default_output_directory() -> Path:
@@ -379,7 +391,7 @@ class RunManager:
     def start(
         self,
         *,
-        namespace: argparse.Namespace,
+        request: PipelineRequest,
         staging_directory: Path,
         source_mode: str,
         company: str | None,
@@ -399,7 +411,7 @@ class RunManager:
                 source_mode=source_mode,
                 company=company,
                 role=role,
-                namespace=namespace,
+                request=request,
                 staging_directory=staging_directory,
             )
             record.events.append(
@@ -443,7 +455,12 @@ class RunManager:
             cancel_event=record.cancel_event,
         )
         try:
-            run_directory = self.pipeline_runner(record.namespace, hooks=hooks)
+            result = self.pipeline_runner(record.request, hooks=hooks)
+            run_directory = (
+                result.run_directory
+                if isinstance(result, PipelineResult)
+                else result
+            )
         except (CancellationError, ApprovalError) as exc:
             with self._condition:
                 record.status = "CANCELLED"
@@ -1117,7 +1134,7 @@ class RunManager:
             current_resume=self.settings.master_resume,
         )
         staging = self.create_staging_directory()
-        namespace = argparse.Namespace(
+        pipeline_request = PipelineRequest(
             resume=self.settings.master_resume,
             clipboard=False,
             job_file=None,
@@ -1143,14 +1160,17 @@ class RunManager:
                     prior_provider = prior_analysis.get("provider")
                     if isinstance(prior_provider, str):
                         try:
-                            namespace.analysis_provider = (
-                                normalize_analysis_provider(prior_provider)
+                            pipeline_request = replace(
+                                pipeline_request,
+                                analysis_provider=normalize_analysis_provider(
+                                    prior_provider
+                                ),
                             )
                         except InputError:
                             pass
         try:
             return self.start(
-                namespace=namespace,
+                request=pipeline_request,
                 staging_directory=staging,
                 source_mode="retry",
                 company=context.company,
@@ -1174,7 +1194,7 @@ class RunManager:
             current_resume=self.settings.master_resume,
         )
         staging = self.create_staging_directory()
-        namespace = argparse.Namespace(
+        pipeline_request = PipelineRequest(
             resume=self.settings.master_resume,
             clipboard=False,
             job_file=None,
@@ -1192,7 +1212,7 @@ class RunManager:
         )
         try:
             return self.start(
-                namespace=namespace,
+                request=pipeline_request,
                 staging_directory=staging,
                 source_mode="antigravity-retry",
                 company=context.company,
@@ -1216,7 +1236,7 @@ class RunManager:
             current_resume=self.settings.master_resume,
         )
         staging = self.create_staging_directory()
-        namespace = argparse.Namespace(
+        pipeline_request = PipelineRequest(
             resume=self.settings.master_resume,
             clipboard=False,
             job_file=None,
@@ -1234,7 +1254,7 @@ class RunManager:
         )
         try:
             return self.start(
-                namespace=namespace,
+                request=pipeline_request,
                 staging_directory=staging,
                 source_mode="antigravity-response-reprocess",
                 company=context.retry_context.company,
@@ -2035,12 +2055,12 @@ def _form_local_timestamp(form: FormData, name: str) -> datetime | None:
     return parsed
 
 
-async def _prepare_namespace(
+async def _prepare_pipeline_request(
     *,
     request: Request,
     form: FormData,
     manager: RunManager,
-) -> tuple[argparse.Namespace, Path, str, str | None, str | None]:
+) -> tuple[PipelineRequest, Path, str, str | None, str | None]:
     source_mode = _form_text(form, "job_mode")
     if source_mode not in {"url", "pasted", "file"}:
         raise InputError("Choose exactly one job-description input mode.")
@@ -2081,8 +2101,8 @@ async def _prepare_namespace(
                 raise InputError("Enter a LinkedIn job URL.")
             job_url = validate_linkedin_url(job_url).normalized
         else:
-            company = _validate_label(_form_text(form, "company"), "Company")
-            role = _validate_label(_form_text(form, "role"), "Role")
+            company = validate_label(_form_text(form, "company"), "Company")
+            role = validate_label(_form_text(form, "role"), "Role")
             if source_mode == "pasted":
                 description = _form_text(form, "pasted_description")
                 if not description:
@@ -2111,7 +2131,7 @@ async def _prepare_namespace(
             job_file = staging / "job-description.txt"
             atomic_write_text(job_file, description.rstrip() + "\n")
 
-        namespace = argparse.Namespace(
+        pipeline_request = PipelineRequest(
             resume=resume_path,
             clipboard=False,
             job_file=job_file,
@@ -2136,7 +2156,7 @@ async def _prepare_namespace(
                 _form_text(form, "analysis_provider") or DEFAULT_ANALYSIS_PROVIDER
             ),
         )
-        return namespace, staging, source_mode, company, role
+        return pipeline_request, staging, source_mode, company, role
     except Exception:
         _safe_remove_staging(staging, manager._staging_root)
         raise
@@ -2152,9 +2172,8 @@ def create_app(
     port: int = DEFAULT_PORT,
     pipeline_runner: PipelineRunner = run_pipeline,
 ) -> FastAPI:
-    root = _project_root()
-    static_directory = root / "resume_tailor" / "static"
-    template_directory = root / "resume_tailor" / "templates"
+    static_directory = _package_resource_directory("static")
+    template_directory = _package_resource_directory("templates")
     settings = UISettings(
         host=DEFAULT_HOST,
         port=port,
@@ -2388,13 +2407,19 @@ def create_app(
         _require_csrf(request, form)
         staging: Path | None = None
         try:
-            namespace, staging, source_mode, company, role = await _prepare_namespace(
+            (
+                pipeline_request,
+                staging,
+                source_mode,
+                company,
+                role,
+            ) = await _prepare_pipeline_request(
                 request=request,
                 form=form,
                 manager=manager,
             )
             record = manager.start(
-                namespace=namespace,
+                request=pipeline_request,
                 staging_directory=staging,
                 source_mode=source_mode,
                 company=company,

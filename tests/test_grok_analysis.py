@@ -465,7 +465,7 @@ def test_codex_quota_specific_classification(
         )
 
     monkeypatch.setattr(
-        "resume_tailor.codex_analysis.run_command",
+        "resume_tailor.backend.providers.codex_analysis.run_command",
         fake_run_command,
     )
     with pytest.raises(CodexUsageLimitError, match="usage limit"):

@@ -44,7 +44,7 @@ def test_local_ollama_request_uses_stdin_and_fixed_worker(
     assert observed["args"] == [
         sys.executable,
         "-m",
-        "resume_tailor.ollama_transport",
+        "resume_tailor.backend.providers.ollama_transport",
     ]
     assert marker not in "\0".join(observed["args"])  # type: ignore[arg-type]
     request = json.loads(str(observed["input_text"]))

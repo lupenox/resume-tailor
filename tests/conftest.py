@@ -23,7 +23,7 @@ def installer_source(repository_root: Path, tmp_path: Path) -> Path:
     """Minimal installer checkout containing only the synthetic résumé fixture."""
     root = tmp_path / "synthetic-installer-source"
     root.mkdir()
-    for directory in ("resume_tailor", "schemas", "assets"):
+    for directory in ("resume_tailor", "assets"):
         shutil.copytree(repository_root / directory, root / directory)
     for name in (
         "install.sh",

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import uuid
@@ -11,9 +10,11 @@ from typing import Any, AsyncIterator
 import httpx
 import pytest
 
+import resume_tailor.application.pipeline as application_pipeline
 import resume_tailor.ui.cli as cli_module
+from resume_tailor.application.models import PipelineRequest, PipelineResult
+from resume_tailor.application.pipeline import run_pipeline
 from resume_tailor.backend.utils.analytics import observation_from_local_job
-from resume_tailor.ui.cli import run_pipeline
 from resume_tailor.backend.documents.docx_extract import extract_resume
 from resume_tailor.backend.jobs.job_requirements import build_job_requirement_catalog
 from resume_tailor.backend.jobs.job_text import MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
@@ -169,14 +170,19 @@ class StubbedUIPipeline:
         self.injection = injection
         self.block_initial = block_initial
         self.calls: list[str] = []
-        self.namespaces: list[argparse.Namespace] = []
+        self.requests: list[PipelineRequest] = []
         self.job_texts: list[str] = []
 
-    def __call__(self, args: argparse.Namespace, *, hooks: PipelineHooks) -> Path:
-        self.namespaces.append(args)
-        if args.job_file is not None:
-            self.job_texts.append(args.job_file.read_text(encoding="utf-8"))
-        run_directory = args.output_dir / f"stub-ui-{uuid.uuid4().hex}"
+    def __call__(
+        self,
+        request: PipelineRequest,
+        *,
+        hooks: PipelineHooks,
+    ) -> PipelineResult:
+        self.requests.append(request)
+        if request.job_file is not None:
+            self.job_texts.append(request.job_file.read_text(encoding="utf-8"))
+        run_directory = request.output_dir / f"stub-ui-{uuid.uuid4().hex}"
         run_directory.mkdir(mode=0o700)
         self.calls.append("validating_input")
         hooks.progress(
@@ -190,9 +196,9 @@ class StubbedUIPipeline:
                 pass
             raise CancellationError("Stub run cancelled.")
 
-        company = args.company
-        role = args.role
-        if args.job_url is not None:
+        company = request.company
+        role = request.role
+        if request.job_url is not None:
             self.calls.append("fetching_job")
             hooks.progress("fetching_job", "Stub is retrieving the posting.")
             if self.fetch_failure is not None:
@@ -301,7 +307,7 @@ class StubbedUIPipeline:
             company=str(company),
             role=str(role),
         )
-        return run_directory
+        return PipelineResult(run_directory=run_directory)
 
 
 @asynccontextmanager
@@ -447,7 +453,7 @@ def _write_synthetic_antigravity_launch_failure(
         "Build synthetic Python evidence validation workflows.\n",
         encoding="utf-8",
     )
-    args = argparse.Namespace(
+    request = PipelineRequest(
         resume=synthetic_resume,
         clipboard=False,
         job_file=job,
@@ -462,7 +468,7 @@ def _write_synthetic_antigravity_launch_failure(
         writer_provider="antigravity",
         ollama_model="resume-tailor-gemma",
     )
-    original = cli_module.invoke_antigravity
+    original = application_pipeline.invoke_antigravity
 
     def fail_before_provider(**_kwargs: Any) -> dict[str, Any]:
         raise AntigravityLaunchSizeError(
@@ -470,11 +476,15 @@ def _write_synthetic_antigravity_launch_failure(
             "operating system's command-line size."
         )
 
-    monkeypatch.setattr(cli_module, "invoke_antigravity", fail_before_provider)
+    monkeypatch.setattr(
+        application_pipeline,
+        "invoke_antigravity",
+        fail_before_provider,
+    )
     try:
         with pytest.raises(AntigravityLaunchSizeError):
             run_pipeline(
-                args,
+                request,
                 hooks=PipelineHooks(
                     approval_handler=lambda request: (
                         ApprovalResponse("approve")
@@ -486,7 +496,7 @@ def _write_synthetic_antigravity_launch_failure(
                 ),
             )
     finally:
-        monkeypatch.setattr(cli_module, "invoke_antigravity", original)
+        monkeypatch.setattr(application_pipeline, "invoke_antigravity", original)
     run = next(
         child
         for child in output_directory.iterdir()
@@ -623,7 +633,7 @@ def test_ui_startup_health_and_localhost_binding(
     asyncio.run(scenario())
 
 
-def test_ui_defaults_to_the_shared_cli_pipeline(
+def test_ui_defaults_to_the_application_pipeline(
     master_resume: Path,
     tmp_path: Path,
 ) -> None:
@@ -631,7 +641,7 @@ def test_ui_defaults_to_the_shared_cli_pipeline(
         output_directory=tmp_path / "output",
         master_resume=master_resume,
     )
-    assert app.state.manager.pipeline_runner is run_pipeline
+    assert app.state.manager.pipeline_runner is application_pipeline.run_pipeline
 
 
 def test_workflow_sidebar_shows_recorded_analysis_provider(
@@ -768,11 +778,11 @@ def test_file_and_clipboard_text_input_modes(
             )
             run_id = await _start(client, token, mode=mode, files=files)
             await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
-            assert pipeline.namespaces[0].job_url is None
-            assert pipeline.namespaces[0].writer_provider == "ollama"
-            assert pipeline.namespaces[0].ollama_model == "resume-tailor-gemma"
-            assert pipeline.namespaces[0].job_source_override == mode
-            assert pipeline.namespaces[0].analytics_db == (
+            assert pipeline.requests[0].job_url is None
+            assert pipeline.requests[0].writer_provider == "ollama"
+            assert pipeline.requests[0].ollama_model == "resume-tailor-gemma"
+            assert pipeline.requests[0].job_source_override == mode
+            assert pipeline.requests[0].analytics_db == (
                 app.state.settings.analytics_database
             )
             assert pipeline.job_texts
@@ -854,7 +864,7 @@ def test_over_limit_local_text_modes_report_actual_and_permitted(
             assert response.status_code == 422
             assert f"{actual:,}" in response.text
             assert f"{MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS:,}" in response.text
-            assert pipeline.namespaces == []
+            assert pipeline.requests == []
 
     asyncio.run(scenario())
 
@@ -905,7 +915,7 @@ def test_url_mode_has_apify_only_retrieval_surface(
             token = await _session(client)
             run_id = await _start(client, token)
             await _wait(app, run_id, "AWAITING_APPROVAL", "linkedin_posting")
-            assert not hasattr(pipeline.namespaces[0], "linkedin_provider")
+            assert not hasattr(pipeline.requests[0], "linkedin_provider")
             page = await client.get("/")
             assert "Apify sends this exact public URL" in page.text
             assert "Retrieval provider" not in page.text
@@ -956,9 +966,13 @@ def test_real_pipeline_records_view_only_after_ui_posting_gate_is_presented(
         )
         return dict(posting)
 
-    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", retrieve)
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
+        "invoke_apify_linkedin_retrieval",
+        retrieve,
+    )
+    monkeypatch.setattr(
+        application_pipeline,
         "_analysis_dependency_versions",
         lambda *_args, **_kwargs: {
             "resume_tailor": "synthetic",
@@ -994,14 +1008,14 @@ def test_real_pipeline_failed_retrieval_is_not_counted_as_viewed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: (_ for _ in ()).throw(
             ApifyLinkedInRetrievalError("malformed_output")
         ),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "_analysis_dependency_versions",
         lambda *_args, **_kwargs: {
             "resume_tailor": "synthetic",
@@ -1236,11 +1250,11 @@ def test_apify_retrieval_failures_are_classified_and_sanitized(
     tmp_path: Path,
 ) -> None:
     def failing_pipeline(
-        args: argparse.Namespace,
+        request: PipelineRequest,
         *,
         hooks: PipelineHooks,
-    ) -> Path:
-        run_directory = args.output_dir / "apify-retrieval-failure"
+    ) -> PipelineResult:
+        run_directory = request.output_dir / "apify-retrieval-failure"
         run_directory.mkdir(mode=0o700)
         hooks.progress(
             "fetching_job",
@@ -1287,11 +1301,11 @@ def test_codex_schema_failure_is_concise_with_collapsed_sanitized_details(
     secret_prompt = "PRIVATE MASTER RESUME PROMPT"
 
     def incompatible_pipeline(
-        args: argparse.Namespace,
+        request: PipelineRequest,
         *,
         hooks: PipelineHooks,
-    ) -> Path:
-        run_directory = args.output_dir / "schema-failure"
+    ) -> PipelineResult:
+        run_directory = request.output_dir / "schema-failure"
         run_directory.mkdir(mode=0o700)
         hooks.progress(
             "codex_analysis",
@@ -1345,13 +1359,13 @@ def test_source_evidence_failure_guidance_and_safe_retry(
         master_resume,
     )
     monkeypatch.setattr(
-        "resume_tailor.ui.cli._tailoring_dependency_versions",
+        "resume_tailor.application.pipeline._tailoring_dependency_versions",
         lambda *_args, **_kwargs: pytest.fail(
             "Antigravity dependencies checked before approval"
         ),
     )
     monkeypatch.setattr(
-        "resume_tailor.ui.cli._analysis_dependency_versions",
+        "resume_tailor.application.pipeline._analysis_dependency_versions",
         lambda *_args, **_kwargs: {
             "resume_tailor": "synthetic",
             "codex": "synthetic",
@@ -1426,17 +1440,17 @@ def test_antigravity_launch_failure_guidance_and_authenticated_recovery(
         if path.is_file()
     }
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_analysis",
         lambda **_kwargs: pytest.fail("Analysis ran during Antigravity recovery"),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_codex_analysis",
         lambda **_kwargs: pytest.fail("Codex ran during Antigravity recovery"),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail(
             "Apify retrieval ran during Antigravity recovery"
@@ -1537,17 +1551,17 @@ def test_antigravity_waiting_guidance_and_authenticated_step_six_recovery(
         if path.is_file()
     }
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_analysis",
         lambda **_kwargs: pytest.fail("Analysis ran during Antigravity recovery"),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_codex_analysis",
         lambda **_kwargs: pytest.fail("Codex ran during Antigravity recovery"),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail(
             "Apify retrieval ran during Antigravity recovery"
@@ -1642,15 +1656,21 @@ def test_apify_result_format_failure_shows_safe_input_fallback(
         )
         raise ApifyLinkedInRetrievalError("malformed_output")
 
-    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", fail)
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
+        "invoke_apify_linkedin_retrieval",
+        fail,
+    )
+    monkeypatch.setattr(
+        application_pipeline,
         "_analysis_dependency_versions",
         lambda *_args, **_kwargs: {
             "resume_tailor": "0.1.0",
             "codex": "stub",
         },
     )
+    # Deliberately seed UI history through the CLI compatibility adapter; the
+    # patched implementation dependencies still belong to the application layer.
     code = cli_module.main(
         [
             "--resume",
@@ -1708,22 +1728,22 @@ def test_valid_preserved_response_reprocesses_offline_to_content_diff_gate(
         if path.is_file()
     }
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_analysis",
         lambda **_kwargs: pytest.fail("Analysis ran during offline reprocessing"),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_codex_analysis",
         lambda **_kwargs: pytest.fail("Codex ran during offline reprocessing"),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_apify_linkedin_retrieval",
         lambda **_kwargs: pytest.fail("LinkedIn ran during offline reprocessing"),
     )
     monkeypatch.setattr(
-        cli_module,
+        application_pipeline,
         "invoke_antigravity",
         lambda **_kwargs: pytest.fail("Antigravity ran during offline reprocessing"),
     )
@@ -1940,7 +1960,7 @@ def test_cancellation_and_double_submission_prevention(
             )
             assert cancel.status_code == 303
             await _wait(app, run_id, "CANCELLED")
-            assert pipeline.namespaces
+            assert pipeline.requests
             thread = app.state.manager._records[run_id].thread
             assert thread is not None
             thread.join(timeout=1)
@@ -2033,8 +2053,8 @@ def test_valid_uploaded_resume_reaches_shared_pipeline(
             assert response.status_code == 303
             run_id = response.headers["location"].rsplit("/", 1)[-1]
             await _wait(app, run_id, "AWAITING_APPROVAL", "codex_analysis")
-            assert pipeline.namespaces[0].resume.name == "uploaded-resume.docx"
-            assert pipeline.namespaces[0].resume.is_file()
+            assert pipeline.requests[0].resume.name == "uploaded-resume.docx"
+            assert pipeline.requests[0].resume.is_file()
 
     asyncio.run(scenario())
 

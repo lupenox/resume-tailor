@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import resume_tailor.ui.cli as cli_module
+import resume_tailor.application.pipeline as pipeline_module
 from resume_tailor.backend.utils.analytics import ANALYTICS_DATABASE_FILENAME, AnalyticsStore
 from resume_tailor.ui.cli import build_parser, main, run_pipeline
 from resume_tailor.backend.engine.orchestration import ApprovalResponse, PipelineHooks
@@ -106,7 +106,7 @@ def _stub_apify_retrieval(
         )
         return dict(posting)
 
-    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", retrieve)
+    monkeypatch.setattr(pipeline_module, "invoke_apify_linkedin_retrieval", retrieve)
 
 
 def _arguments(
@@ -265,19 +265,19 @@ def test_default_pipeline_routes_approved_writing_to_local_gemma(
         "output_format": "json-schema",
         "validation_result": "PASS",
     }
-    monkeypatch.setattr(cli_module, "invoke_ollama", fake_gemma)
+    monkeypatch.setattr(pipeline_module, "invoke_ollama", fake_gemma)
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "invoke_antigravity",
         lambda **kwargs: pytest.fail("Antigravity was invoked for a default run"),
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "load_ollama_response_metadata",
         lambda *args, **kwargs: fake_metadata,
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "_tailoring_dependency_versions",
         lambda *args, **kwargs: {
             "ollama": "synthetic",
@@ -339,12 +339,12 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
     provider_calls: list[str] = []
 
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "_analysis_dependency_versions",
         lambda *_args, **_kwargs: {"resume_tailor": "synthetic", "codex": "mocked"},
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "_tailoring_dependency_versions",
         lambda *_args, **_kwargs: {
             "ollama": "not-invoked",
@@ -396,8 +396,8 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
         )
         return raw
 
-    monkeypatch.setattr(cli_module, "invoke_analysis", fake_analysis)
-    monkeypatch.setattr(cli_module, "invoke_codex_analysis", fake_analysis)
+    monkeypatch.setattr(pipeline_module, "invoke_analysis", fake_analysis)
+    monkeypatch.setattr(pipeline_module, "invoke_codex_analysis", fake_analysis)
 
     def reject_provider(**_kwargs: object) -> object:
         provider_calls.append("ollama")
@@ -409,7 +409,7 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
         reject_provider,
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "invoke_antigravity",
         lambda **_kwargs: pytest.fail("The deterministic pipeline invoked Antigravity"),
     )
@@ -451,8 +451,8 @@ def test_deterministic_only_pipeline_reaches_evidence_and_rendering_without_prov
 
     monkeypatch.setattr(headless_render_module, "render_headless_docx", fake_render)
     monkeypatch.setattr(docx_render_module, "export_and_validate_pdf", fake_export)
-    monkeypatch.setattr(cli_module, "invoke_final_qa", fake_final_qa)
-    monkeypatch.setattr(cli_module, "run_initial_qa", fake_final_qa)
+    monkeypatch.setattr(pipeline_module, "invoke_final_qa", fake_final_qa)
+    monkeypatch.setattr(pipeline_module, "run_initial_qa", fake_final_qa)
 
     parser = build_parser()
     output_dir = tmp_path / "deterministic-output"
@@ -549,7 +549,7 @@ def test_default_gemma_artifact_preflight_failure_is_provider_specific(
         raise InputError("Synthetic authenticated artifact mismatch.")
 
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "_tailoring_dependency_versions",
         lambda *args, **kwargs: {
             "ollama": "synthetic",
@@ -558,12 +558,12 @@ def test_default_gemma_artifact_preflight_failure_is_provider_specific(
         },
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "verify_tailoring_run_artifacts",
         fail_artifact_preflight,
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "invoke_ollama",
         lambda **kwargs: pytest.fail("Local Ollama ran after a failed local preflight"),
     )
@@ -636,7 +636,7 @@ def test_analytics_failure_warns_but_does_not_corrupt_resume_pipeline(
     del stubs_on_path
     monkeypatch.setenv("STUB_CODEX_MODE", "questions")
     monkeypatch.setattr(
-        cli_module.AnalyticsStore,
+        pipeline_module.AnalyticsStore,
         "record_job_viewed",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("synthetic analytics outage with private detail")
@@ -674,7 +674,7 @@ def test_local_text_modes_never_enable_apify_retrieval(
     monkeypatch.setenv("STUB_CODEX_INVOCATION_LOG", str(invocation_log))
     monkeypatch.setenv("STUB_CODEX_MODE", "questions")
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "invoke_apify_linkedin_retrieval",
         lambda **_: pytest.fail("Local text input enabled Apify retrieval"),
     )
@@ -683,7 +683,7 @@ def test_local_text_modes_never_enable_apify_retrieval(
         arguments = _arguments(master_resume, job_file, output_dir)
     else:
         monkeypatch.setattr(
-            cli_module,
+            pipeline_module,
             "read_clipboard",
             lambda: (
                 "Synthetic complete job description supplied by the local "
@@ -863,29 +863,29 @@ def test_apify_is_the_only_step_2_retrieval_provider(
     calls: list[str] = []
     _stub_apify_retrieval(monkeypatch, calls=calls)
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "invoke_analysis",
         lambda **_: pytest.fail("Analysis ran before posting approval"),
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "invoke_codex_analysis",
         lambda **_: pytest.fail("Codex analysis ran before posting approval"),
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "invoke_antigravity",
         lambda **_: pytest.fail("Antigravity was invoked during Step 2"),
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "_tailoring_dependency_versions",
         lambda *_args, **_kwargs: pytest.fail(
             "Writer dependencies were invoked during Step 2"
         ),
     )
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "_analysis_dependency_versions",
         lambda *_args, **_kwargs: {
             "resume_tailor": "0.1.0",
@@ -939,9 +939,9 @@ def test_malformed_apify_result_is_stage_specific_and_stops_before_analysis(
         )
         raise ApifyLinkedInRetrievalError("malformed_output")
 
-    monkeypatch.setattr(cli_module, "invoke_apify_linkedin_retrieval", fail)
+    monkeypatch.setattr(pipeline_module, "invoke_apify_linkedin_retrieval", fail)
     monkeypatch.setattr(
-        cli_module,
+        pipeline_module,
         "_analysis_dependency_versions",
         lambda *_args, **_kwargs: {
             "resume_tailor": "0.1.0",
@@ -1051,7 +1051,7 @@ def test_initial_generation_metadata_preserves_sanitized_budget_repair(
         ],
     }
 
-    initial, deterministic_only = cli_module._initial_generation_metadata(
+    initial, deterministic_only = pipeline_module._initial_generation_metadata(
         response_metadata={
             "provider": "gemma",
             "runtime": "ollama",
