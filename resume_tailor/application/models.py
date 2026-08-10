@@ -43,6 +43,12 @@ class PipelineRequest:
     retry_context: RetryContext | None = None
     antigravity_retry_context: AntigravityRetryContext | None = None
     antigravity_reprocess_context: AntigravityReprocessContext | None = None
+    github_portfolio: bool = False
+    github_username: str | None = None
+    github_include_private: bool = False
+    github_allow_private_provider: bool = False
+    github_analysis_provider: str | None = None
+    github_project_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

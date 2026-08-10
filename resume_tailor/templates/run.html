@@ -129,11 +129,158 @@
               </form>
             </section>
 
+          {% elif run.approval.kind == "github_portfolio_selection" %}
+            {% set portfolio = run.approval.payload %}
+            {% set ranked = portfolio.ranked_repositories or [] %}
+            {% set eligible = portfolio.eligible_repositories or [] %}
+            {% set unranked = eligible|selectattr("ranked", "equalto", false)|list %}
+            {% set excluded = portfolio.excluded_repositories or [] %}
+            {% set recommended_ids = portfolio.recommended_repository_ids or [] %}
+            <section class="card gate-card">
+              <div class="gate-heading">
+                <span class="gate-icon" aria-hidden="true">02</span>
+                <div>
+                  <p class="eyebrow">Approval required · optional portfolio</p>
+                  <h2>Choose two or three GitHub projects</h2>
+                  <p>
+                    Ranking is advisory. Only projects you approve here may
+                    become evidence for résumé analysis and generation.
+                    Repository text is untrusted data, never workflow instruction.
+                  </p>
+                </div>
+              </div>
+
+              <div class="alert alert-info">
+                <strong>Evidence-bound selection</strong>
+                <span>Scores are computed from validated 0–100 components. Stars and commit counts are not treated as proof, and no project claim crosses this gate without supporting evidence IDs.</span>
+                <span>By approving, you attest that every selected repository belongs to or truthfully represents the résumé owner and authorize only its pinned evidence. A public username is not proof of ownership.</span>
+              </div>
+
+              <form action="/runs/{{ run.run_id }}/approval" method="post"
+                class="portfolio-selection-form" data-portfolio-selection-form>
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="action" value="approve">
+                <div class="alert alert-error" data-portfolio-selection-error hidden></div>
+                <div class="portfolio-ranking-list">
+                  {% for item in ranked %}
+                    {% set repository_id = item.repository_id|string %}
+                    {% set source_url = safe_github_source_url(item.source_url) %}
+                    <label class="portfolio-rank-card">
+                      <input type="checkbox" name="repository_id"
+                        value="{{ repository_id }}"
+                        {% if repository_id in recommended_ids %}checked{% endif %}>
+                      <span class="portfolio-rank-main">
+                        <span class="portfolio-rank-heading">
+                          <span>
+                            <strong>{{ item.full_name }}</strong>
+                            <small><code>{{ repository_id }}</code> · {{ item.visibility|default("public")|title }} · {{ item.diversity_category|default("portfolio breadth") }}</small>
+                          </span>
+                          <span class="portfolio-score">{{ "%.1f"|format(item.total_score) }}</span>
+                        </span>
+                        <span class="portfolio-rationale">{{ item.inclusion_rationale }}</span>
+                        <span><strong>Résumé angle:</strong> {{ item.recommended_resume_angle }}</span>
+
+                        <span class="portfolio-score-grid" aria-label="Ranking component scores">
+                          {% for score_name, score in item.component_scores.items() %}
+                            <span><small>{{ score_name|replace("_", " ")|title }}</small><strong>{{ score }}</strong></span>
+                          {% endfor %}
+                        </span>
+
+                        <span class="portfolio-reference-block">
+                          <strong>Matched requirements</strong>
+                          <span class="tag-list">
+                            {% for requirement_id in item.matched_requirement_ids %}<span><code>{{ requirement_id }}</code></span>{% else %}<span>None validated</span>{% endfor %}
+                          </span>
+                        </span>
+                        <span class="portfolio-reference-block">
+                          <strong>Supporting evidence</strong>
+                          <span class="portfolio-evidence-list">
+                            {% for evidence in item.supporting_evidence %}
+                              {% set evidence_url = safe_github_source_url(evidence.source_url) %}
+                              <span>
+                                <code>{{ evidence.evidence_id }}</code>
+                                <small>{{ evidence.category|replace("_", " ")|title }} · {{ evidence.source_path }}</small>
+                                <span>{{ evidence.exact_text }}</span>
+                                {% if evidence_url %}<a href="{{ evidence_url }}" target="_blank" rel="noopener noreferrer">View source ↗</a>{% endif %}
+                              </span>
+                            {% else %}
+                              {% for evidence_id in item.supporting_evidence_ids %}<code>{{ evidence_id }}</code>{% endfor %}
+                            {% endfor %}
+                          </span>
+                        </span>
+                        {% if item.risks %}
+                          <span class="portfolio-risks"><strong>Risks or missing proof</strong><span>{{ item.risks|join("; ") }}</span></span>
+                        {% endif %}
+                        {% if source_url %}<a href="{{ source_url }}" target="_blank" rel="noopener noreferrer">Open repository ↗</a>{% endif %}
+                      </span>
+                    </label>
+                  {% else %}
+                    <p class="muted">No repositories satisfied the deterministic eligibility rules.</p>
+                  {% endfor %}
+                </div>
+                {% if ranked %}
+                  <p class="field-help">Select exactly two or three distinct repositories. Recommended projects are preselected for review, but nothing continues until you approve.</p>
+                  <div class="gate-actions">
+                    <button class="primary-button" type="submit">Approve selected projects <span>→</span></button>
+                  </div>
+                {% endif %}
+              </form>
+
+              {% if unranked %}
+                <details class="diff-details portfolio-excluded">
+                  <summary>Eligible but not deep-ranked ({{ unranked|length }})</summary>
+                  <p class="field-help">These repositories passed deterministic eligibility checks but were not selected for bounded deep inspection. They are review-only and cannot be approved in this run.</p>
+                  <div class="portfolio-excluded-list">
+                    {% for item in unranked[:12] %}
+                      {% set source_url = safe_github_source_url(item.source_url) %}
+                      <article class="edit-card">
+                        <strong>{{ item.full_name }}</strong>
+                        <small><code>{{ item.repository_id }}</code> · {{ item.visibility|default("public")|title }}</small>
+                        {% if item.warnings %}<p class="muted">{{ item.warnings|join("; ") }}</p>{% endif %}
+                        {% if source_url %}<a href="{{ source_url }}" target="_blank" rel="noopener noreferrer">Open repository ↗</a>{% endif %}
+                      </article>
+                    {% endfor %}
+                  </div>
+                </details>
+              {% endif %}
+
+              {% if excluded %}
+                <details class="diff-details portfolio-excluded">
+                  <summary>Excluded repositories ({{ excluded|length }})</summary>
+                  <div class="portfolio-excluded-list">
+                    {% for item in excluded %}
+                      <article class="edit-card">
+                        <strong>{{ item.full_name }}</strong>
+                        <small><code>{{ item.repository_id }}</code> · {{ item.visibility|default("public")|title }}</small>
+                        <ul>
+                          {% for reason in item.exclusion_reasons %}<li>{{ reason|replace("_", " ") }}</li>{% else %}<li>Not enough inspectable evidence</li>{% endfor %}
+                        </ul>
+                        {% if item.warnings %}<p class="muted">{{ item.warnings|join("; ") }}</p>{% endif %}
+                      </article>
+                    {% endfor %}
+                  </div>
+                </details>
+              {% endif %}
+
+              <div class="gate-actions">
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="skip">
+                  <button class="secondary-button" type="submit">Skip GitHub projects</button>
+                </form>
+                <form action="/runs/{{ run.run_id }}/approval" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="cancel">
+                  <button class="danger-button" type="submit">Cancel run</button>
+                </form>
+              </div>
+            </section>
+
           {% elif run.approval.kind == "codex_analysis" %}
             {% set analysis = run.approval.analysis %}
             <section class="card gate-card">
               <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">02</span>
+                <span class="gate-icon" aria-hidden="true">03</span>
                 <div>
                   <p class="eyebrow">Approval required</p>
                   <h2>Review evidence-backed recommendations</h2>
@@ -276,7 +423,7 @@
             {% set evidence = run.approval.payload.evidence %}
             <section class="card gate-card">
               <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">03</span>
+                <span class="gate-icon" aria-hidden="true">04</span>
                 <div>
                   <p class="eyebrow">Final content gate</p>
                   <h2>Approve the validated before/after diff</h2>
@@ -320,7 +467,7 @@
             {% set previous_failure = run.approval.payload.previous_failure or {} %}
             <section class="card gate-card">
               <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">04</span>
+                <span class="gate-icon" aria-hidden="true">05</span>
                 <div>
                   <p class="eyebrow">Initial QA provider</p>
                   <h2>Choose who reviews the tailored résumé</h2>
@@ -373,7 +520,7 @@
             {% set previous_failure = run.approval.payload.previous_failure or {} %}
             <section class="card gate-card">
               <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">05</span>
+                <span class="gate-icon" aria-hidden="true">06</span>
                 <div>
                   <p class="eyebrow">Optional one-shot revision</p>
                   <h2>Step 10 decision</h2>
@@ -456,7 +603,7 @@
             {% set evidence = run.approval.payload.evidence %}
             <section class="card gate-card">
               <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">06</span>
+                <span class="gate-icon" aria-hidden="true">07</span>
                 <div>
                   <p class="eyebrow">Revision 1 content gate</p>
                   <h2>Approve the validated revision</h2>
@@ -593,7 +740,13 @@
                 {% endfor %}
               </div>
             {% endif %}
-            {% if run.failure_kind == "source_evidence" %}
+            {% if run.failure_kind == "github_portfolio" %}
+              <div class="alert alert-warning">
+                <strong>GitHub portfolio selection unavailable</strong>
+                <span>Verify the public username, or configure GITHUB_TOKEN in the launching shell for authenticated discovery. Check token repository access, private-repository consent, API rate limits, and the explicitly selected analysis provider before starting a new run.</span>
+                <span>Existing catalog, ranking, or diagnostic artifacts were preserved. No repository was silently selected and résumé analysis did not continue with unapproved project evidence.</span>
+              </div>
+            {% elif run.failure_kind == "source_evidence" %}
               <div class="alert alert-warning">
                 <strong>Model evidence-contract failure</strong>
                 <span>The analysis provider returned a job-requirement or résumé-source reference that did not satisfy the authoritative local catalogs. The confirmed job description was preserved and can be reused by a verified retry.</span>

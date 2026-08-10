@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.metadata
+import copy
 import json
+import re
 import shutil
 import sys
 from dataclasses import replace
@@ -177,6 +179,23 @@ def validate_label(value: str, label: str) -> str:
     if any(ord(character) < 32 for character in value):
         raise InputError(f"{label} contains a control character.")
     return value
+
+
+_GITHUB_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)\b(?:github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9]{8,})\b"
+)
+_GITHUB_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?:GITHUB_TOKEN|authorization|credential|password|secret)"
+    r"\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+"
+)
+
+
+def _redact_github_credentials(value: str) -> str:
+    redacted = _GITHUB_CREDENTIAL_ASSIGNMENT_RE.sub(
+        "credential=[credential omitted]",
+        str(value),
+    )
+    return _GITHUB_CREDENTIAL_VALUE_RE.sub("[credential omitted]", redacted)
 
 
 def _validate_resume_path(path: Path) -> Path:
@@ -536,6 +555,133 @@ def _apify_progress_message(
     return "Apify LinkedIn retrieval is continuing."
 
 
+def _portfolio_project_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _bind_portfolio_evidence_targets(
+    extracted_resume: dict[str, Any],
+    source_blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Constrain approved repository evidence to truthful résumé edit targets.
+
+    Repository evidence may support the professional summary and skills. It may
+    support project bullets only when the selected repository name matches the
+    immutable project heading in the master résumé. It never authorizes changes
+    to employment, education, project names/counts, or other structural facts.
+    """
+
+    resume_blocks = extracted_resume.get("source_blocks")
+    if not isinstance(resume_blocks, list):
+        raise IntegrityError("The extracted résumé source catalog is unavailable.")
+    general_targets = {
+        str(block.get("source_id"))
+        for block in resume_blocks
+        if isinstance(block, dict)
+        and block.get("editable") is True
+        and (
+            block.get("source_id") == "professional_summary"
+            or str(block.get("source_id", "")).startswith("skill_groups.")
+        )
+    }
+    projects = extracted_resume.get("content", {}).get("projects", [])
+    project_targets: dict[str, set[str]] = {}
+    if isinstance(projects, list):
+        for index, project in enumerate(projects):
+            if not isinstance(project, dict) or not isinstance(project.get("name"), str):
+                continue
+            key = _portfolio_project_key(project["name"])
+            if not key:
+                continue
+            project_targets[key] = {
+                str(block.get("source_id"))
+                for block in resume_blocks
+                if isinstance(block, dict)
+                and block.get("editable") is True
+                and str(block.get("source_id", "")).startswith(
+                    f"projects.{index}.bullets."
+                )
+            }
+
+    bound: list[dict[str, Any]] = []
+    for supplied in source_blocks:
+        block = copy.deepcopy(supplied)
+        if block.get("source_kind") != "github_repository":
+            raise IntegrityError(
+                "The portfolio service returned a non-GitHub evidence block."
+            )
+        full_name = block.get("repository_full_name")
+        repository_name = (
+            full_name.rsplit("/", 1)[-1]
+            if isinstance(full_name, str) and full_name
+            else ""
+        )
+        targets = set(general_targets)
+        targets.update(project_targets.get(_portfolio_project_key(repository_name), set()))
+        block["allowed_target_source_ids"] = sorted(targets)
+        block["editable"] = False
+        block["evidence_allowed"] = True
+        bound.append(block)
+    return bound
+
+
+_PORTFOLIO_QUARANTINED_ARTIFACTS = (
+    "github-repository-catalog.json",
+    "github-repository-ranking.json",
+    "github-portfolio-evidence-request-1.provider.json",
+    "github-portfolio-evidence-request-2.provider.json",
+    "github-portfolio-ranking.provider.json",
+)
+
+
+def _quarantine_unapproved_portfolio_artifacts(
+    run_directory: Path,
+) -> dict[str, bytes]:
+    """Temporarily remove candidate evidence from downstream provider cwd.
+
+    The approved selection remains in place and is the only portfolio evidence
+    artifact visible while résumé analysis, writing, and QA run. Exact catalog
+    and ranking bytes are restored in the pipeline ``finally`` block, including
+    after cancellation or provider failure.
+    """
+
+    held: dict[str, bytes] = {}
+    parent = run_directory.resolve(strict=True)
+    try:
+        for name in _PORTFOLIO_QUARANTINED_ARTIFACTS:
+            path = run_directory / name
+            if not path.exists():
+                continue
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.resolve(strict=True).parent != parent
+            ):
+                raise IntegrityError(
+                    f"GitHub portfolio artifact {name!r} is not a safe run artifact."
+                )
+            held[name] = path.read_bytes()
+            path.unlink()
+    except Exception:
+        _restore_quarantined_portfolio_artifacts(run_directory, held)
+        raise
+    return held
+
+
+def _restore_quarantined_portfolio_artifacts(
+    run_directory: Path,
+    held: dict[str, bytes],
+) -> None:
+    for name, expected in held.items():
+        path = run_directory / name
+        atomic_write_bytes(path, expected)
+        if path.read_bytes() != expected:
+            raise IntegrityError(
+                f"GitHub portfolio artifact {name!r} could not be restored exactly."
+            )
+    held.clear()
+
+
 def run_pipeline(
     request: PipelineRequest,
     *,
@@ -557,6 +703,18 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
             f"Unsupported résumé writer provider: {writer_provider!r}."
         )
     analysis_provider = normalize_analysis_provider(request.analysis_provider)
+    if request.github_portfolio:
+        if analysis_provider not in {"gemma_local", "grok_cli"}:
+            raise InputError(
+                "GitHub portfolio runs require a tool-free résumé analysis "
+                "provider. Choose Gemma Local or Grok CLI; Codex and "
+                "Antigravity remain available when GitHub selection is disabled."
+            )
+        if writer_provider != "ollama":
+            raise InputError(
+                "GitHub portfolio runs require the local Ollama writer so "
+                "repository evidence cannot reach a tool-capable writing agent."
+            )
     analysis_label = analysis_provider_label(analysis_provider)
     ollama_model = validate_ollama_model_name(request.ollama_model)
     antigravity_model = request.antigravity_model
@@ -828,6 +986,9 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
         run_directory=str(run_directory),
     )
 
+    portfolio_result: Any | None = None
+    quarantined_portfolio_artifacts: dict[str, bytes] = {}
+    private_portfolio_local_only = False
     caught_error: ResumeTailorError | None = None
     try:
         if job_description is not None:
@@ -1104,6 +1265,100 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     job_description=job_description,
                 ),
             )
+        if request.github_portfolio:
+            if retry_inputs is not None or antigravity_retry_inputs is not None:
+                raise InputError(
+                    "GitHub portfolio selection cannot be started inside a recovery "
+                    "run; start a new run with the confirmed job instead."
+                )
+            from resume_tailor.application.portfolio import (
+                PortfolioSelectionSettings,
+                run_portfolio_selection,
+            )
+
+            portfolio_provider = normalize_analysis_provider(
+                request.github_analysis_provider or "gemma_local"
+            )
+            portfolio_model = {
+                "gemma_local": ollama_model,
+                "grok_cli": grok_model,
+            }.get(portfolio_provider)
+            portfolio_strength = {
+                "grok_cli": grok_strength,
+            }.get(portfolio_provider)
+            metadata["stage"] = "github-portfolio-selection"
+            metadata["github_portfolio"] = {
+                "enabled": True,
+                "provider": portfolio_provider,
+                "include_private": request.github_include_private,
+                "private_provider_content_allowed": (
+                    request.github_allow_private_provider
+                ),
+            }
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            portfolio_result = run_portfolio_selection(
+                settings=PortfolioSelectionSettings(
+                    username=request.github_username,
+                    include_private=request.github_include_private,
+                    allow_private_provider=request.github_allow_private_provider,
+                    analysis_provider=portfolio_provider,
+                    timeout_seconds=timeout_seconds,
+                    model=portfolio_model,
+                    model_strength=portfolio_strength,
+                    assume_yes=request.yes,
+                    explicit_repository_ids=request.github_project_ids,
+                ),
+                job_requirements=job_requirements,
+                run_directory=run_directory,
+                hooks=hooks,
+            )
+            portfolio_metadata = metadata["github_portfolio"]
+            portfolio_metadata["skipped"] = portfolio_result.skipped
+            selected_private = (
+                portfolio_result.selection.decision == "approved"
+                and any(
+                    repository.visibility != "public"
+                    for repository in portfolio_result.selection.repositories
+                )
+            )
+            private_portfolio_local_only = bool(
+                selected_private and not request.github_allow_private_provider
+            )
+            if private_portfolio_local_only and (
+                analysis_provider != "gemma_local" or writer_provider != "ollama"
+            ):
+                raise InputError(
+                    "The approved private GitHub selection is local-only. Choose "
+                    "Gemma Local analysis and the Ollama writer, or explicitly "
+                    "allow private evidence to external providers. Artifacts were "
+                    "preserved."
+                )
+            portfolio_metadata["private_evidence_local_only"] = (
+                private_portfolio_local_only
+            )
+            for label, filename in (
+                ("catalog", "github-repository-catalog.json"),
+                ("ranking", "github-repository-ranking.json"),
+                ("selection", "github-repository-selection.json"),
+            ):
+                path = run_directory / filename
+                if path.is_file():
+                    portfolio_metadata[label] = {
+                        "filename": filename,
+                        "sha256": sha256_file(path),
+                    }
+            _update_metadata(metadata, metadata_path, run_directory=run_directory)
+            quarantined_portfolio_artifacts = (
+                _quarantine_unapproved_portfolio_artifacts(run_directory)
+            )
+            portfolio_metadata["downstream_evidence_boundary"] = {
+                "provider_visible_portfolio_artifact": (
+                    "github-repository-selection.json"
+                ),
+                "candidate_catalog_quarantined": bool(
+                    quarantined_portfolio_artifacts
+                ),
+            }
         from resume_tailor.backend.documents.docx_extract import extract_resume, source_blocks_from_paragraphs
 
         metadata["stage"] = "extracting-master"
@@ -1142,6 +1397,34 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                 extracted["source_blocks"] = source_blocks_from_paragraphs(
                     extracted["paragraphs"]
                 )
+        if (
+            portfolio_result is not None
+            and portfolio_result.selection.decision == "approved"
+        ):
+            from resume_tailor.application.portfolio import (
+                approved_portfolio_source_blocks,
+            )
+
+            portfolio_blocks = _bind_portfolio_evidence_targets(
+                extracted,
+                approved_portfolio_source_blocks(portfolio_result.selection),
+            )
+            existing_source_ids = {
+                block.get("source_id")
+                for block in extracted.get("source_blocks", [])
+                if isinstance(block, dict)
+            }
+            if any(
+                block.get("source_id") in existing_source_ids
+                for block in portfolio_blocks
+            ):
+                raise IntegrityError(
+                    "Approved GitHub evidence IDs collide with résumé source IDs."
+                )
+            extracted["source_blocks"].extend(portfolio_blocks)
+            metadata["github_portfolio"]["approved_evidence_block_count"] = len(
+                portfolio_blocks
+            )
         if antigravity_retry_inputs is not None:
             atomic_write_bytes(
                 run_directory / "extracted-master-resume.json",
@@ -1438,6 +1721,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     model=ollama_model if analysis_provider == "gemma_local" else (grok_model if analysis_provider in ("grok", "grok_cli") else (codex_model if analysis_provider == "codex" else antigravity_model)),
                     model_strength=grok_strength if analysis_provider in ("grok", "grok_cli") else (codex_strength if analysis_provider == "codex" else (antigravity_strength if analysis_provider == "antigravity" else None)),
                     progress_handler=_analysis_progress,
+                    restrict_external_tools=request.github_portfolio,
                 )
             analysis, analysis_issues = resolve_analysis_evidence(
                 raw_analysis,
@@ -1656,6 +1940,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     run_directory=run_directory,
                     timeout_seconds=timeout_seconds,
                     model=ollama_model,
+                    restrict_external_tools=request.github_portfolio,
                     heartbeat_handler=lambda elapsed, alive: hooks.progress(
                         "antigravity_tailoring",
                         (
@@ -1681,6 +1966,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     antigravity_duration=antigravity_duration,
                     model=antigravity_model,
                     model_strength=antigravity_strength,
+                    restrict_external_tools=request.github_portfolio,
                 )
         initial_content_path = run_directory / "tailored-content.initial.json"
         atomic_write_json(initial_content_path, tailored_content)
@@ -1871,6 +2157,21 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
             preselected = env_preselected_initial_qa_provider()
         if preselected is not None:
             preselected = normalize_initial_qa_provider(preselected)
+        portfolio_qa_providers = (
+            {"gemma_local"}
+            if private_portfolio_local_only
+            else ({"gemma_local", "grok"} if request.github_portfolio else None)
+        )
+        if portfolio_qa_providers is not None:
+            if preselected is not None and preselected not in portfolio_qa_providers:
+                raise InputError(
+                    "GitHub portfolio evidence requires a tool-free Initial QA "
+                    "provider. Choose Gemma Local or the locked Grok adapter; "
+                    "private evidence without external-provider consent requires "
+                    "Gemma Local. Artifacts were preserved."
+                )
+            if private_portfolio_local_only:
+                preselected = "gemma_local"
 
         previous_failure: dict[str, Any] | None = None
         qa_result: dict[str, Any] | None = None
@@ -1889,6 +2190,12 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
 
             # Honest availability; expensive Ollama probe only when selecting.
             options = probe_initial_qa_providers(include_expensive=True)
+            if portfolio_qa_providers is not None:
+                options = [
+                    item
+                    for item in options
+                    if item.get("provider_id") in portfolio_qa_providers
+                ]
             selection = hooks.select_initial_qa_provider(
                 options=options,
                 default_provider=preselected,
@@ -1960,6 +2267,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     pdf_path=pdf_path,
                     antigravity_duration=antigravity_duration,
                     gemma_model=ollama_model,
+                    restrict_external_tools=request.github_portfolio,
                 )
             except Exception as exc:
                 # Preserve diagnostics; allow retry/reselect without re-render.
@@ -2051,6 +2359,14 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                 initial_qa_provider=selected_provider
             )
             options = probe_initial_qa_providers(include_expensive=True)
+            if portfolio_qa_providers is not None:
+                if default_revision_provider not in portfolio_qa_providers:
+                    default_revision_provider = "gemma_local"
+                options = [
+                    item
+                    for item in options
+                    if item.get("provider_id") in portfolio_qa_providers
+                ]
             hooks.progress(
                 "revision_phase",
                 "Initial QA finished. Choose complete without revision, optional "
@@ -2122,6 +2438,14 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     or revision_provider
                 )
             )
+            if (
+                portfolio_qa_providers is not None
+                and final_qa_provider not in portfolio_qa_providers
+            ):
+                raise InputError(
+                    "GitHub portfolio evidence cannot be sent to the selected "
+                    "tool-capable Final QA provider. Artifacts were preserved."
+                )
             # Do not overwrite initial_qa_provider.
             metadata["revision_provider"] = revision_provider
             metadata["final_qa_provider"] = final_qa_provider
@@ -2233,6 +2557,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                             timeout_seconds=timeout_seconds,
                             attempt_number=1,
                             model=ollama_model,
+                            restrict_external_tools=request.github_portfolio,
                         )
                         revision_response_metadata = load_ollama_response_metadata(
                             run_directory,
@@ -2250,6 +2575,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                             timeout_seconds=timeout_seconds,
                             antigravity_duration=antigravity_duration,
                             attempt_number=1,
+                            restrict_external_tools=request.github_portfolio,
                         )
                         revision_response_metadata = (
                             load_antigravity_response_metadata(
@@ -2595,6 +2921,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     pdf_path=revision_pdf_path,
                     antigravity_duration=antigravity_duration,
                     gemma_model=ollama_model,
+                    restrict_external_tools=request.github_portfolio,
                 )
             except Exception as exc:
                 step10_failure = {
@@ -2904,24 +3231,34 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
             and not isinstance(exc, AntigravityTailoringPreflightError)
         ):
             metadata["failure_class"] = "ollama-tailoring-preflight"
+        error_message = str(exc)
+        if request.github_portfolio:
+            error_message = _redact_github_credentials(error_message)
         metadata["error"] = {
             "type": type(exc).__name__,
-            "message": str(exc),
+            "message": error_message,
             "exit_code": int(exc.exit_code),
         }
         if isinstance(exc, AntigravityResponseEnvelopeError):
             metadata["error"]["response_envelope_type"] = exc.envelope_type
         raise
     except Exception as exc:
-        caught_error = InputError(f"Unexpected internal error: {type(exc).__name__}: {exc}")
+        detail = f"Unexpected internal error: {type(exc).__name__}: {exc}"
+        if request.github_portfolio:
+            detail = _redact_github_credentials(detail)
+        caught_error = InputError(detail)
         metadata["status"] = "FAILED"
         metadata["error"] = {
             "type": type(exc).__name__,
-            "message": str(exc),
+            "message": detail.removeprefix("Unexpected internal error: "),
             "exit_code": 1,
         }
         raise caught_error from exc
     finally:
+        _restore_quarantined_portfolio_artifacts(
+            run_directory,
+            quarantined_portfolio_artifacts,
+        )
         if work_directory.exists() and not request.keep_workdir:
             shutil.rmtree(work_directory)
         response_metadata = load_antigravity_response_metadata(run_directory)

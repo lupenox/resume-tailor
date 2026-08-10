@@ -178,6 +178,147 @@ def test_duplicate_and_inappropriate_edit_targets_are_rejected_separately() -> N
     assert not any(issue.location.startswith("supported_requirement_mappings") for issue in issues)
 
 
+def test_approved_github_evidence_is_restricted_to_local_target_scope() -> None:
+    extracted = _extracted()
+    extracted["source_blocks"].append(
+        {
+            "source_id": "github.101.readme.001",
+            "section_context": "GitHub repository synthetic/example",
+            "block_kind": "repository_evidence",
+            "exact_text": "Python validation with strict JSON Schema checks.",
+            "evidence_allowed": True,
+            "editable": False,
+            "source_kind": "github_repository",
+            "repository_id": "101",
+            "repository_full_name": "synthetic/example",
+            "head_sha": "b" * 40,
+            "source_path": "README.md",
+            "source_url": (
+                "https://github.com/synthetic/example/blob/"
+                + "b" * 40
+                + "/README.md"
+            ),
+            "allowed_target_source_ids": ["skill_groups.0"],
+        }
+    )
+    analysis = _analysis()
+    requirement_id = analysis["supported_requirement_mappings"][0][
+        "requirement_id"
+    ]
+    analysis["supported_requirement_mappings"][0]["evidence_source_ids"] = [
+        "github.101.readme.001"
+    ]
+    analysis["recommended_edits"][0]["evidence_source_ids"] = [
+        "github.101.readme.001"
+    ]
+
+    _, issues = resolve_analysis_evidence(analysis, extracted, _requirements())
+
+    assert "github_evidence_target_mismatch" in {
+        issue.code for issue in issues
+    }
+
+    extracted["source_blocks"][-1]["allowed_target_source_ids"] = [
+        "professional_summary"
+    ]
+    resolved, issues = resolve_analysis_evidence(
+        analysis,
+        extracted,
+        _requirements(),
+    )
+    assert "github_evidence_target_mismatch" not in {
+        issue.code for issue in issues
+    }
+    reference = resolved["recommended_edits"][0]["resolved_evidence"][0]
+    assert reference["source_kind"] == "github_repository"
+    assert reference["repository_full_name"] == "synthetic/example"
+    assert resolved["recommended_edits"][0][
+        "github_evidence_authorizations"
+    ] == [
+        {
+            "target_source_id": "professional_summary",
+            "requirement_id": requirement_id,
+            "evidence_id": "github.101.readme.001",
+            "repository_id": "101",
+            "repository_full_name": "synthetic/example",
+            "head_sha": "b" * 40,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "forged_value"),
+    [
+        ("target_source_id", "skill_groups.0"),
+        ("requirement_id", "skill.999"),
+        ("evidence_id", "github.101.readme.forged"),
+        ("repository_id", "202"),
+        ("repository_full_name", "synthetic/forged"),
+        ("head_sha", "c" * 40),
+    ],
+)
+def test_github_authorization_tuple_is_rederived_from_exact_local_catalogs(
+    field: str,
+    forged_value: str,
+) -> None:
+    extracted = _extracted()
+    github_id = "github.101.readme.001"
+    extracted["source_blocks"].append(
+        {
+            "source_id": github_id,
+            "section_context": "GitHub repository synthetic/example",
+            "block_kind": "repository_evidence",
+            "exact_text": "Python validation with strict JSON Schema checks.",
+            "evidence_allowed": True,
+            "editable": False,
+            "source_kind": "github_repository",
+            "repository_id": "101",
+            "repository_full_name": "synthetic/example",
+            "head_sha": "b" * 40,
+            "source_path": "README.md",
+            "source_url": (
+                "https://github.com/synthetic/example/blob/"
+                + "b" * 40
+                + "/README.md"
+            ),
+            "allowed_target_source_ids": ["professional_summary"],
+        }
+    )
+    analysis = _analysis()
+    requirement_id = analysis["supported_requirement_mappings"][0][
+        "requirement_id"
+    ]
+    analysis["supported_requirement_mappings"][0]["evidence_source_ids"] = [
+        github_id
+    ]
+    analysis["recommended_edits"][0]["evidence_source_ids"] = [github_id]
+    resolved, issues = resolve_analysis_evidence(
+        analysis,
+        extracted,
+        _requirements(),
+    )
+    assert issues == []
+    expected = copy.deepcopy(
+        resolved["recommended_edits"][0]["github_evidence_authorizations"][0]
+    )
+
+    forged = copy.deepcopy(resolved)
+    forged["recommended_edits"][0]["github_evidence_authorizations"][0][
+        field
+    ] = forged_value
+    re_resolved, issues = resolve_analysis_evidence(
+        forged,
+        extracted,
+        _requirements(),
+    )
+
+    assert issues == []
+    assert re_resolved["recommended_edits"][0][
+        "github_evidence_authorizations"
+    ] == [expected]
+    assert re_resolved != forged
+
+
 def test_model_authored_labels_existing_text_and_copied_evidence_are_not_fields() -> None:
     analysis = _analysis()
     analysis["matched_requirements"] = ["Python"]

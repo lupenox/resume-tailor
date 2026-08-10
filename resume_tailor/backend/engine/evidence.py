@@ -48,6 +48,7 @@ _HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("OpenTelemetry", re.compile(r"\bOpenTelemetry\b", re.I)),
     ("Prometheus/Grafana", re.compile(r"\bPrometheus\b|\bGrafana\b", re.I)),
 )
+_GITHUB_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
 _DASH_TRANSLATION = str.maketrans(
     {
@@ -143,11 +144,24 @@ def validate_analysis_evidence(
 
 
 def _source_reference(block: dict[str, Any]) -> dict[str, Any]:
-    return {
+    reference = {
         "source_id": block["source_id"],
         "section_context": block["section_context"],
         "exact_text": block["exact_text"],
     }
+    if block.get("source_kind") == "github_repository":
+        reference["source_kind"] = "github_repository"
+        for key in (
+            "repository_id",
+            "repository_full_name",
+            "head_sha",
+            "source_path",
+            "source_url",
+        ):
+            value = block.get(key)
+            if isinstance(value, str) and value:
+                reference[key] = value
+    return reference
 
 
 def _source_catalog(
@@ -589,6 +603,19 @@ def resolve_analysis_evidence(
         if item["status"] == "unsupported"
     ]
 
+    requirement_ids_by_evidence: dict[str, list[str]] = {}
+    for item in requirement_assessment:
+        if item["status"] == "unsupported":
+            continue
+        requirement_id = item["requirement_id"]
+        for source_id in item["evidence_source_ids"]:
+            requirement_ids = requirement_ids_by_evidence.setdefault(
+                source_id,
+                [],
+            )
+            if requirement_id not in requirement_ids:
+                requirement_ids.append(requirement_id)
+
     for position, question in enumerate(analysis.get("questions_for_user", [])):
         if isinstance(question, str) and _ABSENT_EXPERIENCE_QUESTION_RE.search(
             question
@@ -659,8 +686,70 @@ def resolve_analysis_evidence(
             required=True,
             evidence_only=True,
         )
+        github_authorizations: list[dict[str, str]] = []
+        if isinstance(target_id, str):
+            for block in cited:
+                if block.get("source_kind") != "github_repository":
+                    continue
+                allowed_targets = block.get("allowed_target_source_ids")
+                if (
+                    not isinstance(allowed_targets, list)
+                    or target_id not in allowed_targets
+                ):
+                    issues.append(
+                        SourceEvidenceIssue(
+                            "github_evidence_target_mismatch",
+                            f"recommended_edits[{position}].evidence_source_ids",
+                            "approved GitHub evidence was cited for a résumé target "
+                            "outside its locally authorized project/summary/skills scope",
+                        )
+                    )
+                source_id = block.get("source_id")
+                repository_id = block.get("repository_id")
+                repository_full_name = block.get("repository_full_name")
+                head_sha = block.get("head_sha")
+                if (
+                    not isinstance(source_id, str)
+                    or not isinstance(repository_id, str)
+                    or not repository_id
+                    or not isinstance(repository_full_name, str)
+                    or not repository_full_name
+                    or not isinstance(head_sha, str)
+                    or _GITHUB_HEAD_SHA_RE.fullmatch(head_sha) is None
+                ):
+                    issues.append(
+                        SourceEvidenceIssue(
+                            "github_evidence_provenance_invalid",
+                            f"recommended_edits[{position}].evidence_source_ids",
+                            "approved GitHub evidence is missing its exact repository/head provenance",
+                        )
+                    )
+                    continue
+                requirement_ids = requirement_ids_by_evidence.get(source_id, [])
+                if not requirement_ids:
+                    issues.append(
+                        SourceEvidenceIssue(
+                            "github_evidence_requirement_unbound",
+                            f"recommended_edits[{position}].evidence_source_ids",
+                            "approved GitHub evidence is not bound to a confirmed requirement ID",
+                        )
+                    )
+                    continue
+                for requirement_id in sorted(requirement_ids):
+                    github_authorizations.append(
+                        {
+                            "target_source_id": target_id,
+                            "requirement_id": requirement_id,
+                            "evidence_id": source_id,
+                            "repository_id": repository_id,
+                            "repository_full_name": repository_full_name,
+                            "head_sha": head_sha,
+                        }
+                    )
         local_edit = copy.deepcopy(edit)
         local_edit["resolved_evidence"] = [_source_reference(block) for block in cited]
+        if github_authorizations:
+            local_edit["github_evidence_authorizations"] = github_authorizations
         if target is not None:
             target_text = target["exact_text"]
             proposed_text = local_edit.get("proposed_text")
@@ -988,6 +1077,173 @@ def _assert_exact(
         )
 
 
+def _target_scoped_github_evidence(
+    extracted_resume: dict[str, Any],
+    analysis: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Return GitHub evidence cited and locally authorized for each edit target."""
+
+    source_blocks = extracted_resume.get("source_blocks")
+    if not isinstance(source_blocks, list):
+        return {}
+    github_index = {
+        block["source_id"]: block
+        for block in source_blocks
+        if isinstance(block, dict)
+        and isinstance(block.get("source_id"), str)
+        and block.get("source_kind") == "github_repository"
+        and block.get("evidence_allowed") is True
+        and block.get("editable") is False
+        and isinstance(block.get("exact_text"), str)
+    }
+    requirement_evidence_pairs: set[tuple[str, str]] = set()
+    mappings = analysis.get("supported_requirement_mappings")
+    if isinstance(mappings, list):
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            requirement_id = mapping.get("requirement_id")
+            evidence_ids = mapping.get("evidence_source_ids")
+            resolved_references = mapping.get("resolved_evidence")
+            if (
+                not isinstance(requirement_id, str)
+                or not isinstance(evidence_ids, list)
+                or not isinstance(resolved_references, list)
+            ):
+                continue
+            resolved_ids = {
+                reference.get("source_id")
+                for reference in resolved_references
+                if isinstance(reference, dict)
+                and isinstance(reference.get("source_id"), str)
+                and reference["source_id"] in github_index
+                and reference
+                == _source_reference(github_index[reference["source_id"]])
+            }
+            requirement_evidence_pairs.update(
+                (requirement_id, source_id)
+                for source_id in evidence_ids
+                if isinstance(source_id, str) and source_id in resolved_ids
+            )
+    evidence_by_target: dict[str, list[str]] = {}
+    edits = analysis.get("recommended_edits")
+    if not isinstance(edits, list):
+        return evidence_by_target
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        target_id = edit.get("target_source_id")
+        cited_ids = edit.get("evidence_source_ids")
+        resolved_references = edit.get("resolved_evidence")
+        authorizations = edit.get("github_evidence_authorizations")
+        if (
+            not isinstance(target_id, str)
+            or not isinstance(cited_ids, list)
+            or not isinstance(resolved_references, list)
+            or not isinstance(authorizations, list)
+        ):
+            continue
+        resolved_ids = {
+            reference.get("source_id")
+            for reference in resolved_references
+            if isinstance(reference, dict)
+            and isinstance(reference.get("source_id"), str)
+            and reference["source_id"] in github_index
+            and reference == _source_reference(
+                github_index[reference["source_id"]]
+            )
+        }
+        for source_id in cited_ids:
+            if not isinstance(source_id, str) or source_id not in resolved_ids:
+                continue
+            block = github_index.get(source_id)
+            if block is None:
+                continue
+            allowed_targets = block.get("allowed_target_source_ids")
+            if not isinstance(allowed_targets, list) or target_id not in allowed_targets:
+                continue
+            repository_id = block.get("repository_id")
+            repository_full_name = block.get("repository_full_name")
+            head_sha = block.get("head_sha")
+            exact_authorizations = {
+                (
+                    authorization.get("target_source_id"),
+                    authorization.get("requirement_id"),
+                    authorization.get("evidence_id"),
+                    authorization.get("repository_id"),
+                    authorization.get("repository_full_name"),
+                    authorization.get("head_sha"),
+                )
+                for authorization in authorizations
+                if isinstance(authorization, dict)
+            }
+            if not any(
+                (
+                    target_id,
+                    requirement_id,
+                    source_id,
+                    repository_id,
+                    repository_full_name,
+                    head_sha,
+                )
+                in exact_authorizations
+                for requirement_id, paired_source_id in requirement_evidence_pairs
+                if paired_source_id == source_id
+            ):
+                continue
+            text = block["exact_text"]
+            target_texts = evidence_by_target.setdefault(target_id, [])
+            if text not in target_texts:
+                target_texts.append(text)
+    return evidence_by_target
+
+
+def _is_github_evidence_reference(value: dict[str, Any]) -> bool:
+    source_id = value.get("source_id")
+    return (
+        value.get("source_kind") == "github_repository"
+        or (isinstance(source_id, str) and source_id.startswith("github."))
+        or isinstance(value.get("repository_id"), str)
+        or isinstance(value.get("repository_full_name"), str)
+    )
+
+
+def _global_non_github_evidence(
+    *,
+    source_text: str,
+    extracted_resume: dict[str, Any],
+    analysis: dict[str, Any],
+) -> list[str]:
+    """Preserve historical global evidence semantics except for GitHub blocks."""
+
+    texts = [source_text]
+    source_blocks = extracted_resume.get("source_blocks")
+    if isinstance(source_blocks, list):
+        for block in source_blocks:
+            if (
+                isinstance(block, dict)
+                and not _is_github_evidence_reference(block)
+                and isinstance(block.get("exact_text"), str)
+            ):
+                texts.append(block["exact_text"])
+    edits = analysis.get("recommended_edits")
+    if isinstance(edits, list):
+        for edit in edits:
+            if not isinstance(edit, dict):
+                continue
+            resolved = edit.get("resolved_evidence")
+            if not isinstance(resolved, list):
+                continue
+            for block in resolved:
+                if (
+                    isinstance(block, dict)
+                    and not _is_github_evidence_reference(block)
+                    and isinstance(block.get("exact_text"), str)
+                ):
+                    texts.append(block["exact_text"])
+    return texts
+
+
 def _target_role_core_pattern(target_role: str) -> str | None:
     """Return a regex core for a role with light morphological flexibility.
 
@@ -1251,19 +1507,18 @@ def validate_tailored_content(
     tailored_text = _resume_text(tailored)
     normalized_source = normalized_text(source_text)
 
-    authorized_evidence_texts = [source_text]
-    source_blocks = extracted_resume.get("source_blocks", [])
-    if isinstance(source_blocks, list):
-        for block in source_blocks:
-            if isinstance(block, dict) and isinstance(block.get("exact_text"), str):
-                authorized_evidence_texts.append(block["exact_text"])
-    for edit in analysis.get("recommended_edits", []):
-        if isinstance(edit, dict):
-            for block in edit.get("resolved_evidence", []):
-                if isinstance(block, dict) and isinstance(block.get("exact_text"), str):
-                    authorized_evidence_texts.append(block["exact_text"])
-
-    normalized_authorized_evidence = normalized_text(" ".join(authorized_evidence_texts))
+    globally_authorized_evidence = _global_non_github_evidence(
+        source_text=source_text,
+        extracted_resume=extracted_resume,
+        analysis=analysis,
+    )
+    github_evidence_by_target = _target_scoped_github_evidence(
+        extracted_resume,
+        analysis,
+    )
+    normalized_global_evidence = normalized_text(
+        " ".join(globally_authorized_evidence)
+    )
 
     original_tech_by_location = {
         (location, normalized_text(item))
@@ -1273,23 +1528,60 @@ def validate_tailored_content(
         normalized_item = normalized_text(item)
         if (location, normalized_item) not in original_tech_by_location:
             report.introduced_technologies.append(f"{location}: {item}")
-        if normalized_item not in normalized_authorized_evidence:
+        normalized_target_evidence = normalized_text(
+            " ".join(github_evidence_by_target.get(location, []))
+        )
+        if (
+            normalized_item not in normalized_global_evidence
+            and normalized_item not in normalized_target_evidence
+        ):
             report.issues.append(
                 f"Technology/skill item lacks verbatim source evidence at "
                 f"{location}: {item!r}."
             )
 
-    combined_metric_source = " ".join(authorized_evidence_texts)
-    original_metrics = set(_NUMBER_RE.findall(combined_metric_source))
-    for metric in _NUMBER_RE.findall(tailored_text):
-        if metric not in original_metrics and metric not in report.introduced_metrics:
-            report.introduced_metrics.append(metric)
+    global_evidence_corpus = " ".join(globally_authorized_evidence)
+    global_metrics = set(_NUMBER_RE.findall(global_evidence_corpus))
+    tailored_values = _paragraph_values(tailored)
+    for content_id, value in tailored_values.items():
+        target_evidence = " ".join(
+            github_evidence_by_target.get(content_id, [])
+        )
+        target_metrics = global_metrics | set(_NUMBER_RE.findall(target_evidence))
+        for metric in _NUMBER_RE.findall(value):
+            if metric in target_metrics:
+                continue
+            if metric not in report.introduced_metrics:
+                report.introduced_metrics.append(metric)
             report.issues.append(
                 f"New numeric or metric claim {metric!r} is not present in the master resume."
             )
 
+        for label, pattern in _HIGH_RISK_PATTERNS:
+            if (
+                pattern.search(value)
+                and not pattern.search(global_evidence_corpus)
+                and not pattern.search(target_evidence)
+            ):
+                report.issues.append(
+                    f"Forbidden unsupported capability introduced: {label}."
+                )
+
+    represented_text = "\n".join(tailored_values.values())
+    represented_metrics = set(_NUMBER_RE.findall(represented_text))
+    for metric in _NUMBER_RE.findall(tailored_text):
+        if metric not in global_metrics and metric not in represented_metrics:
+            if metric not in report.introduced_metrics:
+                report.introduced_metrics.append(metric)
+            report.issues.append(
+                f"New numeric or metric claim {metric!r} is not present in the master resume."
+            )
     for label, pattern in _HIGH_RISK_PATTERNS:
-        if pattern.search(tailored_text) and not pattern.search(source_text):
+        if (
+            pattern.search(tailored_text)
+            and not pattern.search(global_evidence_corpus)
+            and not pattern.search(represented_text)
+        ):
             report.issues.append(
                 f"Forbidden unsupported capability introduced: {label}."
             )

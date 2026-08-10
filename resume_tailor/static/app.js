@@ -20,6 +20,14 @@
     if (identity) {
       identity.hidden = jobMode === "url";
     }
+    const githubChoice = bySelector('input[name="github_portfolio"]');
+    const githubEnabled = Boolean(githubChoice?.checked);
+    all("[data-github-panel]").forEach((panel) => {
+      panel.hidden = !githubEnabled;
+      all("input, select, textarea", panel).forEach((input) => {
+        input.disabled = !githubEnabled;
+      });
+    });
   }
 
   function showClientError(message) {
@@ -62,13 +70,41 @@
         return "Choose a UTF-8 .txt job-description file.";
       }
     }
+    const githubEnabled = Boolean(
+      bySelector('input[name="github_portfolio"]', form)?.checked
+    );
+    if (githubEnabled) {
+      const provider = bySelector("#github-analysis-provider", form)?.value;
+      if (!provider) return "Choose a GitHub portfolio analysis provider.";
+      const analysisProvider = bySelector(
+        'input[name="analysis_provider"]:checked', form
+      )?.value;
+      if (!["gemma_local", "grok_cli"].includes(analysisProvider || "")) {
+        return "GitHub portfolio runs require Gemma Local or Grok CLI resume analysis.";
+      }
+      const writerProvider = bySelector(
+        'input[name="writer_provider"]:checked', form
+      )?.value;
+      if (writerProvider !== "ollama") {
+        return "GitHub portfolio runs require the local Ollama writer.";
+      }
+      const includePrivate = Boolean(
+        bySelector('input[name="github_include_private"]', form)?.checked
+      );
+      const allowPrivateProvider = Boolean(
+        bySelector('input[name="github_allow_private_provider"]', form)?.checked
+      );
+      if (allowPrivateProvider && !includePrivate) {
+        return "Enable private repository discovery before allowing private evidence to reach a provider.";
+      }
+    }
     return "";
   }
 
   function setupDashboard() {
     const form = bySelector("#new-run-form");
     if (!form) return;
-    all('input[name="job_mode"], input[name="resume_mode"]', form).forEach((input) => {
+    all('input[name="job_mode"], input[name="resume_mode"], input[name="github_portfolio"]', form).forEach((input) => {
       input.addEventListener("change", updateInputPanels);
     });
     updateInputPanels();
@@ -156,11 +192,34 @@
   function setupSubmissionLocks() {
     all("form").forEach((form) => {
       if (form.id === "new-run-form") return;
-      form.addEventListener("submit", () => {
+      form.addEventListener("submit", (event) => {
+        if (event.defaultPrevented) return;
         all('button[type="submit"]', form).forEach((button) => {
           button.disabled = true;
         });
       });
+    });
+  }
+
+  function setupPortfolioSelection() {
+    const form = bySelector("[data-portfolio-selection-form]");
+    if (!form) return;
+    form.addEventListener("submit", (event) => {
+      const selected = all('input[name="repository_id"]:checked', form);
+      const error = bySelector("[data-portfolio-selection-error]", form);
+      if (selected.length === 2 || selected.length === 3) {
+        if (error) {
+          error.textContent = "";
+          error.hidden = true;
+        }
+        return;
+      }
+      event.preventDefault();
+      if (error) {
+        error.textContent = "Select exactly two or three repositories before approving.";
+        error.hidden = false;
+        error.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
     });
   }
 
@@ -212,6 +271,7 @@
   document.addEventListener("DOMContentLoaded", () => {
     setupDashboard();
     setupFallback();
+    setupPortfolioSelection();
     setupSubmissionLocks();
     setupRunPolling();
     initStarfield();

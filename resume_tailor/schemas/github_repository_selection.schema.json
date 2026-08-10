@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Approved GitHub repository selection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "decision",
+    "approved_at",
+    "job_requirements_sha256",
+    "ranking_sha256",
+    "selected_repository_ids",
+    "repositories",
+    "private_provider_transmission_approved"
+  ],
+  "properties": {
+    "version": {"const": 1},
+    "decision": {"enum": ["approved", "skipped"]},
+    "approved_at": {"type": "string", "format": "date-time"},
+    "job_requirements_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ranking_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "selected_repository_ids": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "repositories": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 3,
+      "items": {"$ref": "#/$defs/repository"}
+    },
+    "private_provider_transmission_approved": {"type": "boolean"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"decision": {"const": "approved"}}},
+      "then": {
+        "properties": {
+          "selected_repository_ids": {"minItems": 2},
+          "repositories": {"minItems": 2}
+        }
+      },
+      "else": {
+        "properties": {
+          "selected_repository_ids": {"maxItems": 0},
+          "repositories": {"maxItems": 0}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "repository_id",
+        "category",
+        "exact_text",
+        "content_sha256",
+        "source_url",
+        "head_sha",
+        "source_path"
+      ],
+      "properties": {
+        "evidence_id": {"type": "string", "minLength": 1},
+        "repository_id": {"type": "string", "minLength": 1},
+        "category": {"type": "string", "minLength": 1},
+        "exact_text": {"type": "string", "minLength": 1},
+        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_url": {"type": "string", "pattern": "^https://github\\.com/"},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "source_path": {"type": ["string", "null"]}
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_id",
+        "full_name",
+        "visibility",
+        "head_sha",
+        "source_url",
+        "approved_resume_angle",
+        "approved_evidence"
+      ],
+      "properties": {
+        "repository_id": {"type": "string", "minLength": 1},
+        "full_name": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
+        "visibility": {"enum": ["public", "private", "internal"]},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "source_url": {"type": "string", "pattern": "^https://github\\.com/"},
+        "approved_resume_angle": {"type": "string", "minLength": 1},
+        "approved_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/evidence"}
+        }
+      }
+    }
+  }
+}

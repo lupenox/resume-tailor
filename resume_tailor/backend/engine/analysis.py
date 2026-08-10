@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from resume_tailor.backend.providers.codex_analysis import build_analysis_prompt, invoke_codex_analysis, readable_analysis
+from resume_tailor.backend.providers.subprocess_isolation import (
+    enforce_tool_free_capability,
+)
 from resume_tailor.backend.utils.utilities import InputError, atomic_write_json, utc_now_iso
 
 # Public provider identifiers (CLI/UI values).
@@ -92,6 +95,7 @@ def workflow_stages_for_provider(
         ("validating_input", "Validating input"),
         ("fetching_job", "Apify job retrieval"),
         ("confirming_posting", "Confirming posting"),
+        ("github_portfolio", "Optional GitHub portfolio selection"),
         ("codex_analysis", analysis_label),
         ("reviewing_changes", "Reviewing proposed changes"),
         ("antigravity_tailoring", "Local résumé tailoring"),
@@ -205,6 +209,7 @@ def invoke_analysis(
     progress_handler: Callable[[float, bool], None] | None = None,
     model: str | None = None,
     model_strength: str | None = None,
+    restrict_external_tools: bool = False,
 ) -> dict[str, Any]:
     """Run the selected analysis provider and return the validated raw payload.
 
@@ -212,6 +217,11 @@ def invoke_analysis(
     structured-field authority remain Python-owned after this call returns.
     """
     selected = normalize_analysis_provider(provider)
+    enforce_tool_free_capability(
+        capability="analysis",
+        provider=selected,
+        restrict_external_tools=restrict_external_tools,
+    )
     if selected == "codex":
         return invoke_codex_analysis(
             extracted_resume=extracted_resume,
@@ -242,6 +252,7 @@ def invoke_analysis(
             model=model,
             model_strength=model_strength,
             progress_handler=progress_handler,
+            restricted=restrict_external_tools,
         )
     if selected == "gemma_local":
         from resume_tailor.backend.providers.gemma_analysis import invoke_gemma_analysis

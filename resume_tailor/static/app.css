@@ -483,6 +483,97 @@ input:focus, textarea:focus {
   padding-left: 36px;
 }
 
+/* GitHub portfolio approval gate */
+.portfolio-ranking-list,
+.portfolio-excluded-list,
+.portfolio-evidence-list {
+  display: grid;
+  gap: 14px;
+}
+.portfolio-rank-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  background: rgba(20, 26, 22, 0.45);
+  cursor: pointer;
+}
+.portfolio-rank-card:has(input:checked) {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 1px var(--focus);
+  background: rgba(196, 165, 116, 0.08);
+}
+.portfolio-rank-card > input {
+  margin-top: 5px;
+  accent-color: var(--focus);
+}
+.portfolio-rank-main {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  width: 100%;
+}
+.portfolio-rank-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+.portfolio-rank-heading > span:first-child {
+  display: grid;
+  gap: 4px;
+}
+.portfolio-score {
+  min-width: 52px;
+  padding: 8px;
+  border-radius: 999px;
+  background: rgba(196, 165, 116, 0.15);
+  color: var(--cyan-bright);
+  font-weight: 700;
+  text-align: center;
+}
+.portfolio-score-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+  gap: 8px;
+}
+.portfolio-score-grid > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.portfolio-reference-block,
+.portfolio-risks {
+  display: grid;
+  gap: 8px;
+}
+.portfolio-evidence-list > span {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border-left: 2px solid var(--focus);
+  background: rgba(12, 16, 13, 0.4);
+}
+.portfolio-rank-main a,
+.portfolio-evidence-list a {
+  color: var(--cyan-bright);
+  width: fit-content;
+}
+.portfolio-excluded {
+  margin-top: 22px;
+}
+
+@media (max-width: 620px) {
+  .portfolio-rank-heading {
+    flex-direction: column;
+  }
+}
+
 /* Segmented Control */
 .segmented-control {
   display: flex;
@@ -691,5 +782,4 @@ input:focus, textarea:focus {
   0% { background-position: 100% 0; }
   100% { background-position: -100% 0; }
 }
-
 
