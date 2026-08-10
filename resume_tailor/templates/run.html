@@ -465,13 +465,12 @@
             {% set options = run.approval.payload.options or [] %}
             {% set default_provider = run.approval.payload.default_provider %}
             {% set previous_failure = run.approval.payload.previous_failure or {} %}
-            <section class="card gate-card">
-              <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">05</span>
+            <section class="card gate-card gate-card-compact">
+              <div class="gate-heading gate-heading-compact">
                 <div>
                   <p class="eyebrow">Initial QA provider</p>
                   <h2>Choose who reviews the tailored résumé</h2>
-                  <p>Steps 1–8 are complete. Rendering is finished. Select one provider for Initial QA. No provider launches until you confirm, and failures never fall back silently.</p>
+                  <p class="gate-lede">Rendering is finished. Select one provider. Nothing launches until you confirm; failures never fall back silently.</p>
                 </div>
               </div>
               {% if previous_failure %}
@@ -480,30 +479,36 @@
                   <span>{{ previous_failure.provider or "provider" }}: {{ previous_failure.message or "diagnostics preserved" }}. DOCX/PDF were not regenerated.</span>
                 </div>
               {% endif %}
-              <div class="provider-grid" style="display:grid;gap:0.75rem;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));margin:1rem 0;">
-                {% for option in options %}
-                  <form action="/runs/{{ run.run_id }}/approval" method="post" class="provider-card card" style="margin:0;padding:1rem;{% if not option.available %}opacity:0.55;{% endif %}">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="hidden" name="action" value="select">
-                    <input type="hidden" name="provider" value="{{ option.provider_id }}">
-                    <strong>{{ option.label }}</strong>
-                    {% if option.provider_id == default_provider %}<span class="status-pill">Default</span>{% endif %}
-                    <p style="margin:0.5rem 0;">{{ option.description }}</p>
-                    <small>
-                      {% if option.available %}Ready{% else %}{{ option.status|replace('_',' ')|title }} — {{ option.detail }}{% endif %}
-                    </small>
-                    {% if option.limitations %}
-                      <p><small>Limitation: {{ option.limitations|join(', ') }}</small></p>
-                    {% endif %}
-                    <div class="gate-actions" style="margin-top:0.75rem;">
-                      <button class="primary-button" type="submit" {% if not option.available %}disabled{% endif %}>
-                        Use {{ option.label }} <span>→</span>
-                      </button>
-                    </div>
-                  </form>
-                {% endfor %}
-              </div>
-              <div class="gate-actions">
+              <form action="/runs/{{ run.run_id }}/approval" method="post" class="provider-select-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="action" value="select">
+                <div class="provider-tile-grid" role="radiogroup" aria-label="Initial QA provider">
+                  {% for option in options %}
+                    <label class="provider-tile{% if not option.available %} is-unavailable{% endif %}{% if option.provider_id == default_provider %} is-default{% endif %}">
+                      <input type="radio" name="provider" value="{{ option.provider_id }}"
+                        {% if option.provider_id == default_provider and option.available %}checked{% endif %}
+                        {% if not option.available %}disabled{% endif %}>
+                      <span class="provider-tile-body">
+                        <span class="provider-tile-title">
+                          <strong>{{ option.label }}</strong>
+                          {% if option.provider_id == default_provider %}<span class="status-pill">Default</span>{% endif %}
+                        </span>
+                        <span class="provider-tile-meta">{{ option.description }}</span>
+                        <span class="provider-tile-status status-pill status-{{ 'available' if option.available else 'unavailable' }}">
+                          {{ option.ui_status_label or (option.status|replace('_',' ')|title) }}
+                        </span>
+                        {% if option.limitations %}
+                          <span class="provider-tile-limit">{{ option.limitations|join(', ')|replace('_',' ') }}</span>
+                        {% endif %}
+                      </span>
+                    </label>
+                  {% endfor %}
+                </div>
+                <div class="gate-actions gate-actions-compact">
+                  <button class="primary-button primary-button-inline" type="submit">Use selected provider <span>→</span></button>
+                </div>
+              </form>
+              <div class="gate-actions gate-actions-compact">
                 <form action="/runs/{{ run.run_id }}/approval" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="action" value="stop">
@@ -518,16 +523,11 @@
             {% set options = run.approval.payload.options or [] %}
             {% set default_provider = run.approval.payload.default_provider %}
             {% set previous_failure = run.approval.payload.previous_failure or {} %}
-            <section class="card gate-card">
-              <div class="gate-heading">
-                <span class="gate-icon" aria-hidden="true">06</span>
+            <section class="card gate-card gate-card-compact">
+              <div class="gate-heading gate-heading-compact">
                 <div>
                   <p class="eyebrow">Optional one-shot revision</p>
-                  <h2>Step 10 decision</h2>
-                  <p>
-                    Initial QA is finished. Skipping revision keeps the current rendered résumé.
-                    Choosing revision authorizes exactly one content revision and an explicit Final QA provider — nothing launches until you confirm.
-                  </p>
+                  <h2>Initial QA finished — choose next step</h2>
                 </div>
               </div>
               {% if previous_failure %}
@@ -537,35 +537,32 @@
                 </div>
               {% endif %}
               {% if qa.status == "material_findings" and qa.issues %}
-                <div class="report-section">
-                  <h3>Validated Initial QA findings</h3>
-                  {% for issue in qa.issues %}
-                    <article class="edit-card">
-                      <strong><code>{{ issue.issue_id }}</code> · {{ issue.category|replace('_', ' ')|title }} · {{ issue.severity|title }}</strong>
-                      <p>{{ issue.description }}</p>
-                      <small>Affected content: {{ issue.affected_content_id or "Not identifiable" }}</small>
-                      <p><strong>Correction objective:</strong> {{ issue.correction_objective }}</p>
-                    </article>
-                  {% endfor %}
-                </div>
+                <details class="findings-details">
+                  <summary>Validated Initial QA findings ({{ qa.issues|length }})</summary>
+                  <div class="report-section">
+                    {% for issue in qa.issues %}
+                      <article class="edit-card edit-card-compact">
+                        <strong><code>{{ issue.issue_id }}</code> · {{ issue.category|replace('_', ' ')|title }} · {{ issue.severity|title }}</strong>
+                        <p>{{ issue.description }}</p>
+                        <small>Affected: {{ issue.affected_content_id or "Not identifiable" }} · {{ issue.correction_objective }}</small>
+                      </article>
+                    {% endfor %}
+                  </div>
+                </details>
               {% elif qa.status == "pass" %}
-                <div class="integrity-banner">
+                <div class="integrity-banner integrity-banner-compact">
                   <span class="status-dot" aria-hidden="true"></span>
                   <div>
-                    <strong>Initial QA approved the current résumé</strong>
+                    <strong>Initial QA approved ✓</strong>
                     <p>Completing without revision is the recommended default.</p>
                   </div>
                 </div>
               {% endif %}
-              <div class="alert alert-warning">
-                <strong>One-attempt content revision limit</strong>
-                <span>No provider starts automatically. A second content revision is never offered. Final QA uses only the provider you select here.</span>
-              </div>
-              <div class="gate-actions" style="margin-bottom:1rem;">
+              <div class="decision-bar">
                 <form action="/runs/{{ run.run_id }}/approval" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="action" value="complete_without_revision">
-                  <button class="primary-button" type="submit">Complete without revision <span>→</span></button>
+                  <button class="primary-button primary-button-inline" type="submit">Complete without revision <span>→</span></button>
                 </form>
                 <form action="/runs/{{ run.run_id }}/approval" method="post">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -573,30 +570,40 @@
                   <button class="secondary-button" type="submit">Stop and preserve artifacts</button>
                 </form>
               </div>
-              <h3>Or run optional revision + Final QA</h3>
-              <p class="muted">Select the Final QA provider (preselected from Initial QA when available). Content revision still uses {{ writer_name }} as the local writer.</p>
-              <div class="provider-grid" style="display:grid;gap:0.75rem;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));margin:1rem 0;">
-                {% for option in options %}
-                  <form action="/runs/{{ run.run_id }}/approval" method="post" class="provider-card card" style="margin:0;padding:1rem;{% if not option.available %}opacity:0.55;{% endif %}">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="hidden" name="action" value="revise_once">
-                    <input type="hidden" name="provider" value="{{ option.provider_id }}">
-                    <strong>{{ option.label }}</strong>
-                    {% if option.provider_id == default_provider %}<span class="status-pill">Default</span>{% endif %}
-                    <p style="margin:0.5rem 0;">{{ option.description }}</p>
-                    <small>
-                      {% if option.available %}Ready{% else %}{{ option.status|replace('_',' ')|title }} — {{ option.detail }}{% endif %}
-                    </small>
-                    <div class="gate-actions" style="margin-top:0.75rem;">
-                      <button class="secondary-button" type="submit" {% if not option.available %}disabled{% endif %}>
-                        Revise + Final QA with {{ option.label }} <span>→</span>
-                      </button>
-                    </div>
-                  </form>
-                {% else %}
-                  <p class="muted">Provider availability will appear when the gate is presented with options.</p>
-                {% endfor %}
-              </div>
+              <details class="revision-provider-details">
+                <summary>Revise once · Final QA provider</summary>
+                <p class="muted revision-provider-help">
+                  One content revision only (writer: {{ writer_name }}). Final QA uses the provider you select. Auth/quota are not verified until launch.
+                </p>
+                <form action="/runs/{{ run.run_id }}/approval" method="post" class="provider-select-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="revise_once">
+                  <div class="provider-tile-grid" role="radiogroup" aria-label="Final QA provider for revision">
+                    {% for option in options %}
+                      <label class="provider-tile{% if not option.available %} is-unavailable{% endif %}">
+                        <input type="radio" name="provider" value="{{ option.provider_id }}"
+                          {% if option.provider_id == default_provider and option.available %}checked{% endif %}
+                          {% if not option.available %}disabled{% endif %}>
+                        <span class="provider-tile-body">
+                          <span class="provider-tile-title">
+                            <strong>{{ option.label }}</strong>
+                            {% if option.provider_id == default_provider %}<span class="status-pill">Default</span>{% endif %}
+                          </span>
+                          <span class="provider-tile-meta">{{ option.description }}</span>
+                          <span class="provider-tile-status status-pill status-{{ 'available' if option.available else 'unavailable' }}">
+                            {{ option.ui_status_label or (option.status|replace('_',' ')|title) }}
+                          </span>
+                        </span>
+                      </label>
+                    {% else %}
+                      <p class="muted">Provider options unavailable for this gate.</p>
+                    {% endfor %}
+                  </div>
+                  <div class="gate-actions gate-actions-compact">
+                    <button class="secondary-button" type="submit">Confirm revision + Final QA <span>→</span></button>
+                  </div>
+                </form>
+              </details>
             </section>
 
           {% elif run.approval.kind == "revised_content" %}
