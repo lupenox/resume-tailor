@@ -33,11 +33,58 @@ _ID_RE = re.compile(
     r"^(?:responsibility|required|preferred|skill|ai_focus|text)\.[0-9]{3}$"
 )
 _BULLET_PREFIX_RE = re.compile(r"^(?:[-*•‣▪◦○]|[0-9]{1,3}[.)])\s+")
-_HEADING_RE = re.compile(
-    r"^(?:responsibilities|what you(?:'|’)ll do|required qualifications?|"
-    r"requirements?|preferred qualifications?|nice to have|skills?|"
-    r"technologies|ai focus(?: areas?)?)\s*:?$",
+_LIST_MARKER_CHARS = "•‣▪◦○"
+# Apify/LinkedIn HTML collapse often glues unicode list markers to the previous
+# token with no leading whitespace: "users• High ownership".
+_GLUED_LIST_MARKER_RE = re.compile(rf"(?<=\S)([{_LIST_MARKER_CHARS}])\s*")
+_HEADING_LINE_RE = re.compile(
+    r"^(?:"
+    r"responsibilities|what you(?:'|’)ll do|what you will do|"
+    r"what you(?:'|’)ll need|required qualifications?|minimum qualifications?|"
+    r"qualifications?|qualification(?:\s*required)?|requirements?|"
+    r"preferred qualifications?|preferred|required|nice to have|skills?|"
+    r"technologies|ai focus(?: areas?)?|education|experience|"
+    r"what we(?:'|’)re looking for|successful candidates will have|"
+    r"why join us|overview|job description"
+    r")\s*:?$",
     re.I,
+)
+# Keep the historical name used by callers/tests that import the private symbol.
+_HEADING_RE = _HEADING_LINE_RE
+# Longer phrases first so "Required Qualifications" wins over bare "Required".
+_FUSED_SECTION_HEADINGS: tuple[str, ...] = tuple(
+    sorted(
+        (
+            "Required Qualifications",
+            "Minimum Qualifications",
+            "Preferred Qualifications",
+            "What You'll Need",
+            r"What You[’']ll Need",
+            "What We're Looking For",
+            r"What We[’']re Looking For",
+            "What You'll Do",
+            r"What You[’']ll Do",
+            "What You Will Do",
+            "Successful Candidates Will Have",
+            "Qualification Required",
+            "QualificationRequired",
+            "Job Description",
+            "Responsibilities",
+            "Qualifications",
+            "Qualification",
+            "Requirements",
+            "Why Join Us",
+            "Technologies",
+            "Education",
+            "Experience",
+            "Overview",
+            "Preferred",
+            "Required",
+            "Skills",
+        ),
+        key=lambda value: len(re.sub(r"\\.", "", value)),
+        reverse=True,
+    )
 )
 _SECONDARY_CUE_RE = re.compile(
     r"(?i)(?<!\S)(?:"
@@ -140,8 +187,61 @@ def _bounded_parts(parts: list[str], original: str) -> list[str]:
     return cleaned
 
 
+def _defuse_glued_list_markers(value: str) -> str:
+    """Insert boundaries before unicode list markers glued to prior text.
+
+    Collapsed HTML list markup often yields ``users• High ownership`` instead of
+    a newline-delimited bullet list. ASCII ``-``/``*`` markers still require
+    surrounding whitespace so hyphenated prose is not split.
+    """
+
+    return _GLUED_LIST_MARKER_RE.sub(r"\n\1 ", value)
+
+
+def _defuse_fused_section_headings(value: str) -> str:
+    """Separate section headings fused into adjacent prose or bullet runs.
+
+    Handles classic camel-case fusion (``searchResponsibilitiesImplement``),
+    heading-then-bullet fusion (``searchResponsibilities• Implement``), and
+    heading stuck on the previous bullet after list markers are split
+    (``...job searchResponsibilities`` on its own line).
+
+    Uppercase look-aheads stay case-sensitive so shorter headings such as
+    ``Qualification`` do not split the plural ``Qualifications``.
+    """
+
+    text = value
+    # (?-i:[A-Z]) keeps the continuation check case-sensitive even when the
+    # heading alternative itself is matched case-insensitively.
+    upper_or_bullet = rf"(?=(?-i:[A-Z])|[{_LIST_MARKER_CHARS}])"
+    for heading in _FUSED_SECTION_HEADINGS:
+        # lowercase/punct + Heading + (bullet or Uppercase continuation)
+        text = re.sub(
+            rf"(?<=[a-z.?!])({heading}){upper_or_bullet}",
+            r"\n\1\n",
+            text,
+            flags=re.IGNORECASE,
+        )
+        # Heading glued at the end of a line after list-marker defusion.
+        text = re.sub(
+            rf"(?m)(?<=[a-z.?!])({heading})\s*$",
+            r"\n\1",
+            text,
+            flags=re.IGNORECASE,
+        )
+        # Heading glued directly to a following list marker on the same line.
+        text = re.sub(
+            rf"(?m)^({heading})(?=[{_LIST_MARKER_CHARS}])",
+            r"\1\n",
+            text,
+            flags=re.IGNORECASE,
+        )
+    return text
+
+
 def _split_existing_boundaries(value: str) -> list[str]:
     normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _defuse_glued_list_markers(normalized)
     normalized = re.sub(
         r"(?<!^)[ \t]+(?=(?:[-*•‣▪◦○]|[0-9]{1,3}[.)])\s+)",
         "\n",
@@ -222,16 +322,19 @@ def _unstructured_requirements(
     text = re.sub(r'<(p|li|hr|div|h[1-6])[^>]*>', r'\n\n', job_description, flags=re.IGNORECASE)
     text = re.sub(r'<[^>]+>', ' ', text)
 
-    headings = [
-        "Requirements", "Qualifications", "Required Qualifications", "Minimum Qualifications",
-        "Preferred Qualifications", "What You'll Need", r"What You[’']ll Need",
-        "What We're Looking For", r"What We[’']re Looking For", "Responsibilities", "What You'll Do",
-        r"What You[’']ll Do", "Skills", "Education", "Experience", "Overview", "Job Description",
-        "Successful Candidates Will Have", "What You Will Do"
-    ]
-    for h in headings:
-        pattern = r"([a-z.?!]|\b)(" + h + r")([A-Z])"
-        text = re.sub(pattern, r"\1\n\2\n\3", text, flags=re.IGNORECASE)
+    # Collapse HTML/list formatting artifacts before heading detection so a
+    # single giant glued run does not swallow every section.
+    text = _defuse_glued_list_markers(text)
+    text = _defuse_fused_section_headings(text)
+    # Classic camel-case fusion still used by some postings after HTML strip.
+    # Keep the uppercase continuation case-sensitive (see defuse helper).
+    for heading in _FUSED_SECTION_HEADINGS:
+        text = re.sub(
+            rf"([a-z.?!]|\b)({heading})(?=(?-i:[A-Z]))",
+            r"\1\n\2\n",
+            text,
+            flags=re.IGNORECASE,
+        )
 
     text = re.sub(r"([a-z]{2,}[.?!])([A-Z])", r"\1\n\2", text)
 
@@ -242,26 +345,25 @@ def _unstructured_requirements(
     items = []
     heading = None
 
-    local_heading_re = re.compile(
-        r"^(?:responsibilities|what you(?:'|’)ll do|what you will do|what you(?:'|’)ll need|required qualifications?|qualifications?|"
-        r"requirements?|preferred qualifications?|nice to have|skills?|"
-        r"technologies|ai focus(?: areas?)?|education|experience|"
-        r"what we(?:'|’)re looking for|successful candidates will have)\s*:?$",
-        re.I,
-    )
     local_bullet_re = re.compile(r"^(?:[-*•‣▪◦○]|[0-9]{1,3}[.)])\s+")
 
     for block in blocks:
-        if local_heading_re.fullmatch(block):
+        if _HEADING_LINE_RE.fullmatch(block):
             heading = block.rstrip(":")
             if heading not in diagnostic["detected_headings"]:
                 diagnostic["detected_headings"].append(heading)
             continue
 
+        block = _defuse_glued_list_markers(block)
         block = re.sub(r"(?<!^)(\s+[-*•‣▪◦○]\s+)", r"\n\1", block)
         sub_blocks = [s.strip() for s in block.split('\n') if s.strip()]
 
         for sub in sub_blocks:
+            if _HEADING_LINE_RE.fullmatch(sub):
+                heading = sub.rstrip(":")
+                if heading not in diagnostic["detected_headings"]:
+                    diagnostic["detected_headings"].append(heading)
+                continue
             category, prefix = _category_for_heading(heading)
             candidate = local_bullet_re.sub("", sub).strip()
             if not candidate:

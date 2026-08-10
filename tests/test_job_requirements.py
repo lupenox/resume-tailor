@@ -255,6 +255,168 @@ Successful Candidates Will HaveBachelor's degree requiredFive years experience.
     diag_file = tmp_path / "requirement-extraction-diagnostic.json"
     assert diag_file.is_file()
 
+
+def test_glued_unicode_bullets_and_fused_headings_are_atomized(
+    tmp_path: Path,
+) -> None:
+    """Collapsed HTML list markup: no newlines, bullets glued, headings fused.
+
+    Structural fixture for the Jobright/Apify pattern that previously produced
+    one disproportionate giant candidate (item_disproportionate_percentage).
+    """
+
+    # Keep synthetic content short and structural — not a copy of a live posting.
+    posting = (
+        "Acme builds synthetic validation agents for engineers. "
+        "As an Entry Level AI Engineer you will ship production features."
+        "Why Join Us• Build production AI agents for real users"
+        "• High ownership on bounded product surfaces"
+        "• Work across agents, retrieval, and evaluation"
+        "Responsibilities• Implement search and recommendation features"
+        "• Build evaluation and experimentation workflows"
+        "• Integrate LLM APIs into reliable backend systems"
+        "QualificationRequired• Bachelor degree in Computer Science or related field"
+        "• Strong Python programming skills"
+        "• Understanding of machine learning fundamentals"
+        "Preferred• Experience with embeddings or model evaluation"
+        "• Familiarity with scikit-learn or cloud AI services"
+    )
+    assert "\n" not in posting
+    assert "•" in posting
+    assert "Responsibilities•" in posting
+    assert "QualificationRequired•" in posting
+    assert "Preferred•" in posting
+
+    catalog = build_job_requirement_catalog(posting, run_directory=tmp_path)
+    requirements = catalog["requirements"]
+    lengths = [len(item["exact_text"]) for item in requirements]
+    source_length = len(posting)
+
+    assert len(requirements) >= 10
+    assert max(lengths) <= 500
+    assert max(lengths) <= source_length * 0.3 or max(lengths) <= 500
+    # The disproportionate guard must not fire for this legitimate pattern.
+    assert not any(
+        length > 500 and length > source_length * 0.3 for length in lengths
+    )
+
+    by_category = {item["category"] for item in requirements}
+    assert "responsibility" in by_category
+    assert "required_qualification" in by_category
+    assert "preferred_qualification" in by_category
+
+    texts = [item["exact_text"] for item in requirements]
+    assert "Implement search and recommendation features" in texts
+    assert "Strong Python programming skills" in texts
+    assert "Experience with embeddings or model evaluation" in texts
+    # Fused heading tails must not remain attached to prior bullets.
+    assert all(
+        not text.endswith(("Responsibilities", "Preferred", "Required"))
+        for text in texts
+    )
+
+    diagnostic = json.loads(
+        (tmp_path / "requirement-extraction-diagnostic.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "failure_classification" not in diagnostic
+    assert diagnostic["final_requirement_count"] == len(requirements)
+    assert diagnostic["largest_item_length"] == max(lengths)
+    assert diagnostic["largest-item/source_ratio"] == round(
+        max(lengths) / source_length, 3
+    )
+
+
+def test_jobright_run_fixture_no_longer_triggers_disproportionate_guard(
+    tmp_path: Path,
+) -> None:
+    """Replay the real failed run text when the artifact is present locally."""
+
+    run_dir = Path(
+        "/home/lupenox/Documents/Resumes/Tailored/"
+        "jobright-ai-ai-engineer-entry-level-20260810-071216"
+    )
+    job_path = run_dir / "job-description.txt"
+    if not job_path.is_file():
+        pytest.skip("local Jobright run artifact not available")
+
+    job_text = job_path.read_text(encoding="utf-8")
+    structured = None
+    source_path = run_dir / "job-source.json"
+    if source_path.is_file():
+        structured = json.loads(source_path.read_text(encoding="utf-8"))
+
+    catalog = build_job_requirement_catalog(
+        job_text,
+        structured_job=structured,
+        run_directory=tmp_path,
+    )
+    requirements = catalog["requirements"]
+    lengths = [len(item["exact_text"]) for item in requirements]
+    source_length = len(job_text)
+
+    assert len(requirements) >= 15
+    assert max(lengths) < source_length * 0.3 or max(lengths) <= 500
+    assert not any(
+        length > 500 and length > source_length * 0.3 for length in lengths
+    )
+    assert any(
+        item["category"] == "responsibility" for item in requirements
+    )
+    assert any(
+        item["category"] == "required_qualification" for item in requirements
+    )
+    assert any(
+        item["category"] == "preferred_qualification" for item in requirements
+    )
+
+
+def test_single_requirement_fallback_and_max_item_guards_remain() -> None:
+    # Short single unstructured item is still accepted (non-pathological).
+    short = build_job_requirement_catalog(
+        "We need one careful Python engineer for a small tool."
+    )
+    assert len(short["requirements"]) == 1
+    assert short["requirements"][0]["category"] == "unstructured_requirement"
+
+    # Giant unsegmentable blob still rejected by the 1500-character guard.
+    with pytest.raises(
+        RequirementExtractionError,
+        match="exceeds maximum character threshold",
+    ):
+        build_job_requirement_catalog("x" * 2000)
+
+    # Disproportionate giant blob without internal boundaries still rejected.
+    with pytest.raises(
+        RequirementExtractionError,
+        match="disproportionate percentage|exceeds maximum character",
+    ):
+        build_job_requirement_catalog("y" * 1600)
+
+
+def test_bounded_catalog_is_ready_for_downstream_analysis() -> None:
+    """Gemma analysis consumes stable IDs and bounded exact_text fields."""
+
+    posting = (
+        "Requirements:"
+        "• Strong Python programming skills"
+        "• Familiarity with APIs and Git"
+        "Responsibilities• Build evaluation workflows"
+        "• Integrate retrieval into product systems"
+    )
+    catalog = build_job_requirement_catalog(posting)
+    requirements = catalog["requirements"]
+    assert len(requirements) >= 4
+    for item in requirements:
+        assert set(item) == {"requirement_id", "category", "exact_text"}
+        assert len(item["exact_text"]) <= 500
+        assert item["requirement_id"].count(".") == 1
+    # Stable IDs are what analysis/providers cite as requirement evidence.
+    ids = [item["requirement_id"] for item in requirements]
+    assert len(ids) == len(set(ids))
+
+
 def test_stable_ordering_and_ids() -> None:
     doc = "Requirements:\
 - A\
