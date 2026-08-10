@@ -713,9 +713,13 @@
 
         {% elif run.status in ["FAILED", "CANCELLED"] %}
           <section class="card terminal-card">
-            <span class="terminal-icon" aria-hidden="true">{% if run.status == "FAILED" %}!{% else %}×{% endif %}</span>
-            <p class="eyebrow">{{ run.status }}</p>
-            <h2>{% if run.status == "FAILED" %}The pipeline stopped safely.{% else %}Run cancelled.{% endif %}</h2>
+            <div class="terminal-header">
+              <span class="terminal-icon" aria-hidden="true">{% if run.status == "FAILED" %}!{% else %}×{% endif %}</span>
+              <div>
+                <p class="eyebrow">{{ run.status }}</p>
+                <h2>{% if run.status == "FAILED" %}The pipeline stopped safely.{% else %}Run cancelled.{% endif %}</h2>
+              </div>
+            </div>
             <p>{{ run.message }}</p>
             {% if run.error %}
               <details class="diff-details technical-details">
@@ -935,7 +939,9 @@
                 <span>If retrieval was blocked, retry with a UTF-8 text file or pasted description.</span>
               </div>
             {% endif %}
-            <a class="primary-button" href="/">Start a new run <span>→</span></a>
+            <div class="result-actions">
+              <a class="primary-button" href="/">Start a new run <span>→</span></a>
+            </div>
           </section>
 
         {% else %}
