@@ -27,12 +27,15 @@ from resume_tailor.backend.providers.gemma_analysis import (
     DEFAULT_EDIT_MAX_OUTPUT_TOKENS,
     EDITS_DIAGNOSTIC_FILENAME,
     MAX_GEMMA_ANALYSIS_EDITS,
+    allowed_evidence_source_ids_for_target,
     assemble_canonical_analysis,
     build_coverage_prompt,
     build_coverage_schema,
     build_edits_prompt,
     build_edits_schema,
+    build_target_requirement_evidence_matrix,
     estimate_prompt_tokens,
+    evidence_compatible_with_target,
     gemma_analysis_chat_request_for_tests,
     invoke_gemma_analysis,
     parse_exact_analysis_json,
@@ -784,7 +787,11 @@ def test_duplicate_phase_b_target_rejected() -> None:
 
 
 def test_unrelated_but_globally_valid_evidence_rejected() -> None:
-    """A catalog-valid source ID that Phase A did not map must not pass Phase B."""
+    """A catalog-valid source ID that Phase A did not map must not pass Phase B.
+
+    The target itself remains allowlisted (self-evidence). A different block that
+    Phase A never cited for the requirement is still rejected.
+    """
     with pytest.raises(SourceEvidenceError, match="unrelated evidence"):
         validate_edits_payload(
             {
@@ -792,16 +799,490 @@ def test_unrelated_but_globally_valid_evidence_rejected() -> None:
                     {
                         "target_source_id": "professional_summary",
                         "requirement_ids": ["skill.001"],
-                        # professional_summary is catalog-eligible but not Phase A evidence
-                        "evidence_source_ids": ["professional_summary"],
+                        # experience bullet is catalog-eligible but not Phase A evidence
+                        # and is not the target.
+                        "evidence_source_ids": ["experience.0.bullets.0"],
                         "proposed_text": "Python-focused summary.",
                     }
                 ]
             },
             editable_ids={"professional_summary"},
-            evidence_ids={"skill_groups.0", "professional_summary", "experience.0.bullets.0"},
+            evidence_ids={
+                "skill_groups.0",
+                "professional_summary",
+                "experience.0.bullets.0",
+            },
             eligible_requirement_ids={"skill.001"},
             requirement_evidence={"skill.001": {"skill_groups.0"}},
+        )
+
+
+def test_sibling_bullet_evidence_rejected_even_when_phase_a_cited_it() -> None:
+    """Replay structure of the Jobright failure: .bullets.1 must not launder into .0."""
+    with pytest.raises(
+        SourceEvidenceError,
+        match=r"unrelated evidence source_id 'projects\.2\.bullets\.1' for target "
+        r"'projects\.2\.bullets\.0'",
+    ):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "projects.2.bullets.0",
+                        "requirement_ids": ["required.002"],
+                        "evidence_source_ids": ["projects.2.bullets.1"],
+                        "proposed_text": (
+                            "Developed a local-first chat app with modular service "
+                            "layer loading FLAN-T5 and TinyLlama via Ollama."
+                        ),
+                    }
+                ]
+            },
+            editable_ids={
+                "projects.2.bullets.0",
+                "projects.2.bullets.1",
+                "projects.2.bullets.2",
+            },
+            evidence_ids={
+                "projects.2.bullets.0",
+                "projects.2.bullets.1",
+                "projects.2.bullets.2",
+                "skill_groups.0",
+            },
+            eligible_requirement_ids={"required.002"},
+            # Even if Phase A mapped the requirement to the sibling, laundering
+            # sibling claims into another bullet is contractually forbidden.
+            requirement_evidence={
+                "required.002": {"projects.2.bullets.1", "skill_groups.0"}
+            },
+        )
+
+
+def test_same_source_and_cross_section_evidence_still_pass() -> None:
+    """Self-evidence and Phase-A skill→summary evidence remain valid."""
+    same_source = validate_edits_payload(
+        {
+            "edits": [
+                {
+                    "target_source_id": "projects.2.bullets.0",
+                    "requirement_ids": ["required.002"],
+                    "evidence_source_ids": ["projects.2.bullets.0"],
+                    "proposed_text": "Local-first desktop chat using Flask and Ollama.",
+                }
+            ]
+        },
+        editable_ids={"projects.2.bullets.0"},
+        evidence_ids={"projects.2.bullets.0", "skill_groups.0"},
+        eligible_requirement_ids={"required.002"},
+        requirement_evidence={"required.002": {"projects.2.bullets.0"}},
+    )
+    assert same_source["edits"][0]["evidence_source_ids"] == [
+        "projects.2.bullets.0"
+    ]
+
+    cross_section = validate_edits_payload(
+        {
+            "edits": [
+                {
+                    "target_source_id": "professional_summary",
+                    "requirement_ids": ["skill.001"],
+                    "evidence_source_ids": ["skill_groups.0"],
+                    "proposed_text": "Python engineer with agentic workflow experience.",
+                }
+            ]
+        },
+        editable_ids={"professional_summary"},
+        evidence_ids={"professional_summary", "skill_groups.0"},
+        eligible_requirement_ids={"skill.001"},
+        requirement_evidence={"skill.001": {"skill_groups.0"}},
+    )
+    assert cross_section["edits"][0]["evidence_source_ids"] == ["skill_groups.0"]
+
+
+def test_legal_plus_illegal_sibling_does_not_become_valid_by_dropping() -> None:
+    """Any illegal evidence ID rejects the edit; proposed_text is not retained.
+
+    Silently stripping projects.2.bullets.1 while keeping proposed_text would
+    launder sibling claims into a metadata-valid edit.
+    """
+    with pytest.raises(
+        SourceEvidenceError,
+        match=r"unrelated evidence source_id 'projects\.2\.bullets\.1'",
+    ):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "projects.2.bullets.0",
+                        "requirement_ids": ["required.002"],
+                        "evidence_source_ids": [
+                            "projects.2.bullets.0",  # legal
+                            "projects.2.bullets.1",  # illegal sibling
+                            "skill_groups.0",  # legal
+                        ],
+                        "proposed_text": (
+                            "Local-first chat app with modular FLAN-T5 loading "
+                            "from the sibling service layer."
+                        ),
+                    }
+                ]
+            },
+            editable_ids={"projects.2.bullets.0", "projects.2.bullets.1"},
+            evidence_ids={
+                "projects.2.bullets.0",
+                "projects.2.bullets.1",
+                "skill_groups.0",
+            },
+            eligible_requirement_ids={"required.002"},
+            requirement_evidence={
+                "required.002": {"projects.2.bullets.0", "skill_groups.0"}
+            },
+        )
+
+
+def test_illegal_evidence_fails_closed_without_model_regeneration(
+    master_resume: Path,
+    tmp_path: Path,
+    mock_ollama: dict[str, Any],
+) -> None:
+    """Evidence-contract failures do not strip IDs or silently retry into validity."""
+    extracted, _ = extract_resume(master_resume)
+    catalog = _job_catalog()
+    coverage = _coverage_body(catalog, support_first=True)
+    supported_id = coverage["requirements"][0]["requirement_id"]
+    bad_edits = {
+        "edits": [
+            {
+                "target_source_id": "projects.0.bullets.0",
+                "requirement_ids": [supported_id],
+                "evidence_source_ids": [
+                    "projects.0.bullets.0",
+                    "projects.0.bullets.1",
+                ],
+                "proposed_text": "Rewritten with sibling claims.",
+            }
+        ]
+    }
+    # No second edits body: a silent repair would consume another Ollama call.
+    mock_ollama["set_bodies"](_ollama_body(coverage), _ollama_body(bad_edits))
+    with pytest.raises(SourceEvidenceError, match="unrelated evidence"):
+        invoke_gemma_analysis(
+            extracted_resume=extracted,
+            job_description="Python role",
+            job_requirements=catalog,
+            company="Example",
+            role="Developer",
+            run_directory=tmp_path,
+            timeout_seconds=60,
+        )
+    # coverage + one edits attempt; no regeneration, no provider fallback
+    assert mock_ollama["calls"] == 2
+    assert len(mock_ollama["requests"]) == 2
+
+
+def test_edits_prompt_exposes_target_requirement_evidence_matrix(
+    master_resume: Path,
+) -> None:
+    """Prompt must not over-union Phase A evidence across all requirements."""
+    extracted, _ = extract_resume(master_resume)
+    coverage = {
+        "requirements": [
+            {
+                "requirement_id": "preferred.001",
+                "status": "supported",
+                "evidence_source_ids": ["skill_groups.2"],
+            },
+            {
+                "requirement_id": "required.002",
+                "status": "supported",
+                "evidence_source_ids": ["skill_groups.0"],
+            },
+        ]
+    }
+    prompt = build_edits_prompt(
+        extracted_resume=extracted,
+        coverage=coverage,
+        company="Example",
+        role="Developer",
+    )
+    assert "target_requirement_evidence" in prompt
+    assert "target_evidence_allowlists" not in prompt
+    assert "Do not invent requirement/evidence links" in prompt
+    assert "skills→summary" in prompt or "skill" in prompt.casefold()
+    assert "Sibling bullets" in prompt or "sibling bullet" in prompt.casefold()
+    assert "ONLY facts contained in the selected legal" in prompt
+
+    # Matrix: skill_groups.2 legal for summary only under preferred.001, not required.002
+    evidence_ids = {
+        "professional_summary",
+        "skill_groups.0",
+        "skill_groups.2",
+        "projects.0.bullets.0",
+        "projects.0.bullets.1",
+    }
+    requirement_evidence = {
+        "preferred.001": {"skill_groups.2"},
+        "required.002": {"skill_groups.0"},
+    }
+    matrix = build_target_requirement_evidence_matrix(
+        editable_targets=["professional_summary", "projects.0.bullets.0"],
+        requirement_evidence=requirement_evidence,
+        evidence_ids=evidence_ids,
+    )
+    by_target = {row["target_source_id"]: row for row in matrix}
+    summary_rows = {
+        r["requirement_id"]: r["allowed_evidence_source_ids"]
+        for r in by_target["professional_summary"]["requirement_evidence"]
+    }
+    assert "skill_groups.2" in summary_rows["preferred.001"]
+    assert "skill_groups.2" not in summary_rows["required.002"]
+    assert "skill_groups.0" in summary_rows["required.002"]
+
+    # Cited-req scoping: without requirement_ids, no Phase-A evidence (no silent union).
+    assert allowed_evidence_source_ids_for_target(
+        "professional_summary",
+        evidence_ids=evidence_ids,
+        requirement_evidence=requirement_evidence,
+    ) == []
+    assert "skill_groups.2" in allowed_evidence_source_ids_for_target(
+        "professional_summary",
+        evidence_ids=evidence_ids,
+        requirement_ids=["preferred.001"],
+        requirement_evidence=requirement_evidence,
+    )
+    assert "skill_groups.2" not in allowed_evidence_source_ids_for_target(
+        "professional_summary",
+        evidence_ids=evidence_ids,
+        requirement_ids=["required.002"],
+        requirement_evidence=requirement_evidence,
+    )
+    # Self-evidence only when Phase A linked the target itself.
+    assert "professional_summary" not in allowed_evidence_source_ids_for_target(
+        "professional_summary",
+        evidence_ids=evidence_ids,
+        requirement_ids=["preferred.001"],
+        requirement_evidence=requirement_evidence,
+    )
+    assert not evidence_compatible_with_target(
+        "projects.0.bullets.1", "projects.0.bullets.0"
+    )
+
+
+def test_multi_requirement_evidence_must_cover_each_cited_requirement() -> None:
+    """Union of legal evidence is necessary but not sufficient for multi-req edits."""
+    with pytest.raises(
+        SourceEvidenceError,
+        match=r"does not cover cited requirement_id 'req\.b'",
+    ):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["req.a", "req.b"],
+                        "evidence_source_ids": ["skill_groups.0"],  # only req.a
+                        "proposed_text": "Summary claiming both A and B.",
+                    }
+                ]
+            },
+            editable_ids={"professional_summary"},
+            evidence_ids={
+                "professional_summary",
+                "skill_groups.0",
+                "skill_groups.1",
+            },
+            eligible_requirement_ids={"req.a", "req.b"},
+            requirement_evidence={
+                "req.a": {"skill_groups.0"},
+                "req.b": {"skill_groups.1"},
+            },
+        )
+
+    covered = validate_edits_payload(
+        {
+            "edits": [
+                {
+                    "target_source_id": "professional_summary",
+                    "requirement_ids": ["req.a", "req.b"],
+                    "evidence_source_ids": ["skill_groups.0", "skill_groups.1"],
+                    "proposed_text": "Summary covering A and B with both skill groups.",
+                }
+            ]
+        },
+        editable_ids={"professional_summary"},
+        evidence_ids={
+            "professional_summary",
+            "skill_groups.0",
+            "skill_groups.1",
+        },
+        eligible_requirement_ids={"req.a", "req.b"},
+        requirement_evidence={
+            "req.a": {"skill_groups.0"},
+            "req.b": {"skill_groups.1"},
+        },
+    )
+    assert covered["edits"][0]["evidence_source_ids"] == [
+        "skill_groups.0",
+        "skill_groups.1",
+    ]
+
+
+def test_target_self_evidence_cannot_bypass_phase_a() -> None:
+    """Self-evidence is not free: Phase A must link the target to the requirement."""
+    with pytest.raises(
+        SourceEvidenceError,
+        match=r"unrelated evidence source_id 'professional_summary'",
+    ):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["req.a"],
+                        "evidence_source_ids": ["professional_summary"],
+                        "proposed_text": "Summary rewrite without Phase A self-link.",
+                    }
+                ]
+            },
+            editable_ids={"professional_summary"},
+            evidence_ids={"professional_summary", "skill_groups.0"},
+            eligible_requirement_ids={"req.a"},
+            requirement_evidence={"req.a": {"skill_groups.0"}},
+        )
+
+    # Self is Phase-A-linked to req.a only: legal in the union but cannot cover req.b.
+    with pytest.raises(
+        SourceEvidenceError,
+        match=r"does not cover cited requirement_id 'req\.b'",
+    ):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["req.a", "req.b"],
+                        "evidence_source_ids": [
+                            "skill_groups.0",
+                            "professional_summary",
+                        ],
+                        "proposed_text": "A via skills/self; B left unsupported.",
+                    }
+                ]
+            },
+            editable_ids={"professional_summary"},
+            evidence_ids={
+                "professional_summary",
+                "skill_groups.0",
+                "skill_groups.1",
+            },
+            eligible_requirement_ids={"req.a", "req.b"},
+            requirement_evidence={
+                "req.a": {"skill_groups.0", "professional_summary"},
+                "req.b": {"skill_groups.1"},
+            },
+        )
+
+    # Legitimate same-source when Phase A linked the target itself.
+    linked = validate_edits_payload(
+        {
+            "edits": [
+                {
+                    "target_source_id": "professional_summary",
+                    "requirement_ids": ["req.a"],
+                    "evidence_source_ids": ["professional_summary"],
+                    "proposed_text": "Summary rephrase backed by Phase A self-link.",
+                }
+            ]
+        },
+        editable_ids={"professional_summary"},
+        evidence_ids={"professional_summary", "skill_groups.0"},
+        eligible_requirement_ids={"req.a"},
+        requirement_evidence={"req.a": {"professional_summary"}},
+    )
+    assert linked["edits"][0]["evidence_source_ids"] == ["professional_summary"]
+
+
+def test_skill_group_cross_section_requires_phase_a_linked_requirement() -> None:
+    """Replay …-075631 shape: skill_groups.2 → summary only if Phase A linked."""
+    # Linked requirement: succeeds
+    ok = validate_edits_payload(
+        {
+            "edits": [
+                {
+                    "target_source_id": "professional_summary",
+                    "requirement_ids": ["preferred.001"],
+                    "evidence_source_ids": ["skill_groups.2"],
+                    "proposed_text": "Engineer with infrastructure and Python delivery.",
+                }
+            ]
+        },
+        editable_ids={"professional_summary"},
+        evidence_ids={"professional_summary", "skill_groups.2", "skill_groups.0"},
+        eligible_requirement_ids={"preferred.001", "required.002"},
+        requirement_evidence={
+            "preferred.001": {"skill_groups.2"},
+            "required.002": {"skill_groups.0"},
+        },
+    )
+    assert ok["edits"][0]["evidence_source_ids"] == ["skill_groups.2"]
+
+    # Unrelated requirement (Jobright failure shape): fails closed
+    with pytest.raises(
+        SourceEvidenceError,
+        match=r"unrelated evidence source_id 'skill_groups\.2' for target "
+        r"'professional_summary'",
+    ):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["required.002"],
+                        "evidence_source_ids": ["skill_groups.2"],
+                        "proposed_text": "Engineer with infrastructure delivery.",
+                    }
+                ]
+            },
+            editable_ids={"professional_summary"},
+            evidence_ids={
+                "professional_summary",
+                "skill_groups.2",
+                "skill_groups.0",
+            },
+            eligible_requirement_ids={"preferred.001", "required.002"},
+            requirement_evidence={
+                "preferred.001": {"skill_groups.2"},
+                "required.002": {"skill_groups.0"},
+            },
+        )
+
+
+def test_phase_b_cannot_invent_requirement_evidence_relationship() -> None:
+    """Evidence legal for one requirement cannot ride along with another alone."""
+    with pytest.raises(SourceEvidenceError, match="unrelated evidence"):
+        validate_edits_payload(
+            {
+                "edits": [
+                    {
+                        "target_source_id": "professional_summary",
+                        "requirement_ids": ["req.a"],
+                        # skill_groups.1 is Phase-A only for req.b
+                        "evidence_source_ids": ["skill_groups.1"],
+                        "proposed_text": "Invented cross-requirement linkage.",
+                    }
+                ]
+            },
+            editable_ids={"professional_summary"},
+            evidence_ids={
+                "professional_summary",
+                "skill_groups.0",
+                "skill_groups.1",
+            },
+            eligible_requirement_ids={"req.a", "req.b"},
+            requirement_evidence={
+                "req.a": {"skill_groups.0"},
+                "req.b": {"skill_groups.1"},
+            },
         )
 
 

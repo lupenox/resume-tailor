@@ -94,11 +94,125 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 30
 _MARKDOWN_FENCE_RE = re.compile(r"^\s*```")
 _LENGTH_DONE_REASONS = frozenset({"length", "max_tokens", "limit"})
 _NORMAL_STOP_REASONS = frozenset({"stop", "end_turn", "completed", "done"})
+# Distinct bullets under the same parent (projects.2.bullets.0 vs .1) must not
+# launder claims into each other during edit planning.
+_BULLET_SOURCE_RE = re.compile(
+    r"^(?P<parent>.+)\.bullets\.(?P<index>\d+)$"
+)
 
 _STATUS_TO_STRENGTH = {
     "supported": "strong",
     "partially_supported": "partial",
 }
+
+
+def _are_distinct_sibling_bullets(left: str, right: str) -> bool:
+    """True when both IDs are different bullets under the same parent block."""
+
+    match_left = _BULLET_SOURCE_RE.fullmatch(left)
+    match_right = _BULLET_SOURCE_RE.fullmatch(right)
+    if match_left is None or match_right is None:
+        return False
+    return (
+        match_left.group("parent") == match_right.group("parent")
+        and match_left.group("index") != match_right.group("index")
+    )
+
+
+def evidence_compatible_with_target(evidence_id: str, target_id: str) -> bool:
+    """Whether ``evidence_id`` may substantiate an edit of ``target_id``.
+
+    The target may always cite itself. Cross-section evidence (skills → summary)
+    remains allowed when Phase A linked it. Distinct sibling bullets under the
+    same parent are never compatible: that path launders claims across bullets.
+    """
+
+    if evidence_id == target_id:
+        return True
+    if _are_distinct_sibling_bullets(evidence_id, target_id):
+        return False
+    return True
+
+
+def allowed_evidence_source_ids_for_target(
+    target_id: str,
+    *,
+    evidence_ids: set[str],
+    requirement_ids: list[str] | tuple[str, ...] | None = None,
+    requirement_evidence: dict[str, set[str]] | None = None,
+) -> list[str]:
+    """Return sorted evidence IDs legal for one edit of ``target_id``.
+
+    When ``requirement_evidence`` is supplied (Phase B after coverage):
+    - Phase A is authoritative: only evidence IDs Phase A linked to the **cited**
+      ``requirement_ids`` are candidates
+    - each candidate must also be target-compatible (no sibling-bullet laundering)
+    - target self-evidence is legal **only** when Phase A linked that target id
+      to the cited requirement (not as a free bypass of Phase A)
+
+    When ``requirement_evidence`` is omitted, any catalog evidence ID that is
+    target-compatible is returned (schema-level bound only).
+    """
+
+    if requirement_evidence is None:
+        return sorted(
+            sid
+            for sid in evidence_ids
+            if evidence_compatible_with_target(sid, target_id)
+        )
+
+    # Empty/missing cited requirements → no Phase-A-backed evidence (never
+    # invent links by unioning every supported requirement).
+    allowed: set[str] = set()
+    for rid in list(requirement_ids or ()):
+        for sid in requirement_evidence.get(rid, ()):
+            if sid in evidence_ids and evidence_compatible_with_target(
+                sid, target_id
+            ):
+                allowed.add(sid)
+    return sorted(allowed)
+
+
+def build_target_requirement_evidence_matrix(
+    *,
+    editable_targets: list[str] | tuple[str, ...],
+    requirement_evidence: dict[str, set[str]],
+    evidence_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Deterministic Design-A matrix: target × Phase-A requirement → legal evidence.
+
+    Each row is one editable target. Nested requirement rows list only Phase-A
+    supported requirement IDs with the evidence IDs that are legal when that
+    requirement is cited for this target.
+
+    For an edit citing requirements R, every evidence_source_id must lie in the
+    union of those rows, **and** each r in R must have at least one selected
+    evidence ID from its own row (per-requirement coverage).
+    """
+
+    matrix: list[dict[str, Any]] = []
+    for target in editable_targets:
+        req_rows: list[dict[str, Any]] = []
+        for rid in sorted(requirement_evidence.keys()):
+            allowed = allowed_evidence_source_ids_for_target(
+                target,
+                evidence_ids=evidence_ids,
+                requirement_ids=[rid],
+                requirement_evidence=requirement_evidence,
+            )
+            req_rows.append(
+                {
+                    "requirement_id": rid,
+                    "allowed_evidence_source_ids": allowed,
+                }
+            )
+        matrix.append(
+            {
+                "target_source_id": target,
+                "requirement_evidence": req_rows,
+            }
+        )
+    return matrix
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +714,7 @@ def build_edits_prompt(
     role: str,
     max_edits: int = MAX_GEMMA_ANALYSIS_EDITS,
     repair_detail: str | None = None,
+    evidence_ids: list[str] | set[str] | None = None,
 ) -> str:
     catalog = _compact_source_catalog(extracted_resume)
     github_rule = (
@@ -630,11 +745,44 @@ def build_edits_prompt(
         if block.get("editable") or block.get("source_id") in cited_ids
     ]
     budgets = catalog["content_budgets"]
+    evidence_id_set = {
+        str(block.get("source_id"))
+        for block in catalog["source_blocks"]
+        if block.get("evidence_allowed") and isinstance(block.get("source_id"), str)
+    }
+    if evidence_ids is not None:
+        evidence_id_set = {str(sid) for sid in evidence_ids}
+    requirement_evidence = {
+        str(item["requirement_id"]): {
+            str(sid)
+            for sid in item.get("evidence_source_ids", [])
+            if isinstance(sid, str)
+        }
+        for item in supported
+        if isinstance(item.get("requirement_id"), str)
+    }
+    editable_targets = sorted(
+        {
+            str(block.get("source_id"))
+            for block in catalog["source_blocks"]
+            if block.get("editable") and isinstance(block.get("source_id"), str)
+        }
+    )
+    # Design A: per (target, requirement) legal evidence — not a per-target union
+    # over every Phase A mapping (that over-authorized skill_groups.N for summary
+    # edits that cited unrelated requirement_ids).
+    target_requirement_evidence = build_target_requirement_evidence_matrix(
+        editable_targets=editable_targets,
+        requirement_evidence=requirement_evidence,
+        evidence_ids=evidence_id_set,
+    )
     repair = ""
     if repair_detail:
         repair = (
             f"\nREPAIR failure_class={repair_detail}\n"
-            "Return one complete schema-valid JSON object only.\n"
+            "Return one complete schema-valid JSON object only. "
+            "Rebuild every edit so requirement_ids and evidence_source_ids obey "
+            "target_requirement_evidence for the cited requirements only.\n"
         )
     payload = {
         "supported_requirements": supported,
@@ -642,12 +790,14 @@ def build_edits_prompt(
         "content_budgets": budgets,
         "character_counting_contract": CHARACTER_COUNTING_CONTRACT,
         "max_edits": max_edits,
+        "target_requirement_evidence": target_requirement_evidence,
     }
     return (
         "Phase B: propose at most "
         f"{max_edits} résumé edits. Emit only structured-output JSON.\n"
         f"TARGET company={company} role={role}\n"
-        "CONTEXT (supported requirements + eligible blocks + budgets):\n"
+        "CONTEXT (supported requirements + blocks + budgets + "
+        "target×requirement evidence matrix):\n"
         f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n"
         "RULES\n"
         f"{github_rule}"
@@ -656,7 +806,21 @@ def build_edits_prompt(
         "labels, employment, metrics, certifications, dates, or leadership.\n"
         "- Python owns skill_groups.N, education.coursework, education.certifications; "
         "only propose via proposed_text.\n"
-        "- Each edit needs ≥1 evidence_source_ids and ≥1 requirement_ids from supported set.\n"
+        "- Each edit needs ≥1 requirement_ids from the supported set.\n"
+        "- Phase A is authoritative for requirement→evidence support. For an edit "
+        "with target T and requirement_ids R: (1) every evidence_source_id MUST "
+        "appear in the union of allowed_evidence_source_ids for those R rows under "
+        "T in target_requirement_evidence; (2) each r in R must have ≥1 selected "
+        "evidence id from its own row (union alone is not enough). Do not invent "
+        "requirement/evidence links.\n"
+        "- Target self-evidence counts only when Phase A linked that source id to "
+        "the cited requirement. Skills→summary evidence is legal ONLY for the "
+        "requirement_ids whose Phase A rows list that skill.\n"
+        "- Sibling bullets (same parent, different .bullets.N index) are forbidden "
+        "evidence for one another. Never invent source or requirement IDs.\n"
+        "- proposed_text may use ONLY facts contained in the selected legal "
+        "evidence_source_ids. Do not combine claims from excluded or uncited "
+        "sources.\n"
         "- Prefer fewer high-value edits. No existing_text, section labels, prose, "
         "Markdown, or long rationales.\n"
         f"{repair}"
@@ -761,7 +925,21 @@ def validate_edits_payload(
     requirement_evidence: dict[str, set[str]] | None = None,
     max_edits: int = MAX_GEMMA_ANALYSIS_EDITS,
 ) -> dict[str, Any]:
-    """Validate Phase B: unique targets, editable only, evidence tied to requirements."""
+    """Validate Phase B: unique targets, editable only, Phase-A-backed evidence.
+
+    When Phase A ``requirement_evidence`` is supplied:
+
+    1. Every selected evidence ID must lie in the union of legal IDs for the
+       cited requirements under this target (matrix rows / Phase A ∩
+       target-compatible). No silent stripping of illegal IDs.
+    2. **Per-requirement coverage:** for every cited requirement r, at least one
+       selected evidence ID must be legal for r alone. Citing REQ_A+REQ_B with
+       evidence only for REQ_A is rejected (union alone is not sufficient).
+    3. Target self-evidence is legal only when Phase A linked that source id to
+       the cited requirement — not as a free bypass of Phase A.
+
+    Sibling bullets of the same parent remain mutually incompatible.
+    """
     edits = payload.get("edits")
     if not isinstance(edits, list):
         raise SourceEvidenceError(
@@ -771,7 +949,6 @@ def validate_edits_payload(
         raise SourceEvidenceError(
             f"Gemma edit planning failed: more than {max_edits} edits returned."
         )
-    evidence_by_requirement = requirement_evidence or {}
     seen_targets: set[str] = set()
     normalized: list[dict[str, Any]] = []
     for position, edit in enumerate(edits):
@@ -812,30 +989,45 @@ def validate_edits_payload(
                 )
             if rid not in cleaned_reqs:
                 cleaned_reqs.append(rid)
-        # Evidence must be catalog-eligible. When Phase A requirement_evidence is
-        # supplied, every evidence ID must also appear in the Phase A mapping for
-        # at least one cited requirement (no globally valid but unrelated IDs).
-        allowed_for_requirements: set[str] = set()
+
+        per_requirement_allowed: dict[str, set[str]] = {}
         if requirement_evidence is not None:
+            allowlist: set[str] = set()
             for rid in cleaned_reqs:
-                allowed_for_requirements |= set(
-                    evidence_by_requirement.get(rid, set())
+                row = set(
+                    allowed_evidence_source_ids_for_target(
+                        target,
+                        evidence_ids=evidence_ids,
+                        requirement_ids=[rid],
+                        requirement_evidence=requirement_evidence,
+                    )
                 )
-            if not allowed_for_requirements:
+                per_requirement_allowed[rid] = row
+                allowlist |= row
+            if not allowlist:
                 raise SourceEvidenceError(
                     f"Gemma edit planning failed: evidence for {target!r} does not "
                     "support the cited requirement_ids."
                 )
+        else:
+            allowlist = set(
+                allowed_evidence_source_ids_for_target(
+                    target,
+                    evidence_ids=evidence_ids,
+                )
+            )
+
         cleaned_evidence: list[str] = []
         for sid in evidence:
             if not isinstance(sid, str) or sid not in evidence_ids:
                 raise SourceEvidenceError(
                     f"Gemma edit planning failed: invalid evidence source_id {sid!r}."
                 )
-            if requirement_evidence is not None and sid not in allowed_for_requirements:
+            if sid not in allowlist:
+                # Fail closed: do not delete illegal IDs and keep proposed_text.
                 raise SourceEvidenceError(
-                    f"Gemma edit planning failed: unrelated evidence source_id {sid!r} "
-                    f"for target {target!r}."
+                    f"Gemma edit planning failed: unrelated evidence source_id "
+                    f"{sid!r} for target {target!r}."
                 )
             if sid not in cleaned_evidence:
                 cleaned_evidence.append(sid)
@@ -843,13 +1035,19 @@ def validate_edits_payload(
             raise SourceEvidenceError(
                 f"Gemma edit planning failed: evidence_source_ids required for {target!r}."
             )
-        if requirement_evidence is not None and not (
-            set(cleaned_evidence) & allowed_for_requirements
-        ):
-            raise SourceEvidenceError(
-                f"Gemma edit planning failed: evidence for {target!r} does not "
-                "support the cited requirement_ids."
-            )
+
+        # Every cited requirement must be backed by at least one selected
+        # evidence ID legal for that requirement alone (not merely for the union).
+        if requirement_evidence is not None:
+            selected = set(cleaned_evidence)
+            for rid in cleaned_reqs:
+                row = per_requirement_allowed.get(rid, set())
+                if not (selected & row):
+                    raise SourceEvidenceError(
+                        f"Gemma edit planning failed: evidence for {target!r} does not "
+                        f"cover cited requirement_id {rid!r}."
+                    )
+
         normalized.append(
             {
                 "target_source_id": target,
