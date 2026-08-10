@@ -453,7 +453,14 @@ class TerminalPipelineHooks(PipelineHooks):
             label = option.get("label") or provider_id
             available = bool(option.get("available"))
             status = option.get("status") or "unknown"
-            mark = "ready" if available else f"unavailable ({status})"
+            mark = str(
+                option.get("ui_status_label")
+                or (
+                    "CLI found · auth/quota not verified"
+                    if available
+                    else f"unavailable ({status})"
+                )
+            )
             default_mark = " (default)" if provider_id == default_provider else ""
             print(f"  {index}. {label}{default_mark} — {mark}")
             index_map[str(index)] = provider_id
@@ -530,7 +537,14 @@ class TerminalPipelineHooks(PipelineHooks):
             label = option.get("label") or provider_id
             status = option.get("status") or "unknown"
             available = bool(option.get("available"))
-            mark = "ready" if available else f"unavailable ({status})"
+            mark = str(
+                option.get("ui_status_label")
+                or (
+                    "CLI found · auth/quota not verified"
+                    if available
+                    else f"unavailable ({status})"
+                )
+            )
             default_mark = " (default)" if provider_id == default_provider else ""
             print(f"  {index}. {label}{default_mark} — {mark}")
             print(f"     {option.get('description') or ''}")

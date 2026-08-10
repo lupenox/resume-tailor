@@ -60,6 +60,10 @@ from resume_tailor.backend.engine.analysis import (
     workflow_stages_for_provider,
 )
 from resume_tailor.backend.providers.ollama_writer import DEFAULT_OLLAMA_MODEL
+from resume_tailor.backend.github.client import (
+    GitHubConfigurationError,
+    validate_github_username,
+)
 from resume_tailor.backend.providers.portfolio_ranker import (
     PORTFOLIO_ANALYSIS_PROVIDERS,
 )
@@ -559,14 +563,13 @@ class RunManager:
                     (ApifyConfigurationError, ApifyLinkedInRetrievalError),
                 ):
                     record.retrieval_classification = exc.classification
-                record.message = (
-                    "GitHub portfolio selection stopped safely. Verify the "
-                    "username, GITHUB_TOKEN access, rate limit, and selected "
-                    "analysis provider, then start a new run. Existing artifacts "
-                    "were preserved."
-                    if record.stage == "github_portfolio"
-                    else _safe_error_message(exc)
-                )
+                if record.stage == "github_portfolio":
+                    class_id = getattr(exc, "classification", None)
+                    if isinstance(class_id, str):
+                        record.retrieval_classification = class_id
+                    record.message = _github_portfolio_user_message(exc)
+                else:
+                    record.message = _safe_error_message(exc)
                 record.approval = None
                 record.events.append(
                     {
@@ -595,10 +598,7 @@ class RunManager:
                     )
                 )
                 record.message = (
-                    "GitHub portfolio selection stopped safely. Verify the "
-                    "username, GITHUB_TOKEN access, rate limit, and selected "
-                    "analysis provider, then start a new run. Existing artifacts "
-                    "were preserved."
+                    _github_portfolio_user_message(exc)
                     if record.stage == "github_portfolio"
                     else "The local pipeline stopped unexpectedly. Existing "
                     "artifacts were preserved for review."
@@ -1112,10 +1112,16 @@ class RunManager:
                 "diagnostics. Repository credentials and authorization headers "
                 "are omitted."
             )
-            message = (
-                "GitHub portfolio selection stopped safely. Verify the username, "
-                "GITHUB_TOKEN access, rate limit, and selected analysis provider, "
-                "then start a new run."
+            portfolio_classification = retrieval_classification
+            if not portfolio_classification and run_directory is not None:
+                diagnostic = _safe_json(
+                    run_directory / "github-portfolio-diagnostic.json"
+                )
+                raw_class = diagnostic.get("classification")
+                if isinstance(raw_class, str):
+                    portfolio_classification = raw_class
+            message = _github_portfolio_user_message(
+                classification=portfolio_classification
             )
         elif failure_kind == "source_evidence":
             technical = (
@@ -1613,6 +1619,76 @@ _OLLAMA_BUDGET_UI_MESSAGE = (
 )
 
 
+_GITHUB_PORTFOLIO_CLASSIFICATION_MESSAGES: dict[str, str] = {
+    "invalid_username": (
+        "GitHub username is invalid. Use a public login (letters, numbers, "
+        "hyphens; max 39; no leading/trailing spaces)."
+    ),
+    "missing_identity": (
+        "Enable portfolio with a public username, or set GITHUB_TOKEN in the "
+        "shell that launched Resume Tailor (never paste the token into the form)."
+    ),
+    "invalid_token": (
+        "GITHUB_TOKEN in the environment is malformed. Fix or unset it; do not "
+        "put the token in the UI."
+    ),
+    "private_requires_token": (
+        "Private repository discovery needs GITHUB_TOKEN and “Consider private "
+        "repositories.”"
+    ),
+    "private_username_mismatch": (
+        "Private discovery only works for the authenticated account. Omit the "
+        "username or use the token owner’s login."
+    ),
+    "authentication_failure": (
+        "GitHub rejected authentication. Check that GITHUB_TOKEN is valid and "
+        "has read access for the intended public repositories."
+    ),
+    "rate_limited": (
+        "GitHub rate-limited this run. Wait for the limit reset, then start a "
+        "new run."
+    ),
+    "forbidden": (
+        "GitHub denied this read-only request (permissions or account access)."
+    ),
+    "not_found": (
+        "GitHub could not find that user or repository resource. Check the "
+        "username."
+    ),
+    "network_error": (
+        "Could not complete the bounded GitHub HTTPS request. Check network "
+        "and retry."
+    ),
+    "timeout": (
+        "Could not complete the bounded GitHub HTTPS request. Check network "
+        "and retry."
+    ),
+}
+
+_GITHUB_PORTFOLIO_GENERIC_MESSAGE = (
+    "GitHub portfolio selection stopped safely. Verify the username, "
+    "GITHUB_TOKEN access, rate limit, and selected analysis provider, then "
+    "start a new run. Existing artifacts were preserved."
+)
+
+
+def _github_portfolio_user_message(
+    error: BaseException | None = None,
+    *,
+    classification: str | None = None,
+) -> str:
+    class_id = classification
+    if class_id is None and error is not None:
+        raw = getattr(error, "classification", None)
+        class_id = raw if isinstance(raw, str) else None
+    if class_id and class_id in _GITHUB_PORTFOLIO_CLASSIFICATION_MESSAGES:
+        return (
+            f"{_GITHUB_PORTFOLIO_CLASSIFICATION_MESSAGES[class_id]} "
+            "Existing artifacts were preserved."
+        )
+    return _GITHUB_PORTFOLIO_GENERIC_MESSAGE
+
+
 def _failure_kind_for_error(
     error: ResumeTailorError,
     stage: str,
@@ -1844,8 +1920,12 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "github-portfolio-ranking": "github_portfolio",
         "github-portfolio-selection": "github_portfolio",
         "extracting-master": "codex_analysis",
-        "extracting_job": "codex_analysis",
-        "extracted_job": "codex_analysis",
+        # Job-requirement extraction is still post-confirmation intake work.
+        # Mapping it to analysis advanced the workflow sidebar past portfolio
+        # and analysis stages that never ran.
+        "extracting-job": "confirming_posting",
+        "extracting_job": "confirming_posting",
+        "extracted_job": "confirming_posting",
         "codex-analysis-schema-preflight": "codex_analysis",
         "codex-analysis": "codex_analysis",
         "tailoring-dependency-check": "antigravity_tailoring",
@@ -2337,6 +2417,19 @@ async def _prepare_pipeline_request(
             raise InputError(
                 "GitHub portfolio runs require the local Ollama writer."
             )
+        if github_portfolio:
+            if github_username is not None:
+                try:
+                    github_username = validate_github_username(github_username)
+                except GitHubConfigurationError as exc:
+                    raise InputError(str(exc)) from exc
+            token_present = bool(os.environ.get("GITHUB_TOKEN", "").strip())
+            if github_username is None and not token_present:
+                raise InputError(str(GitHubConfigurationError("missing_identity")))
+            if github_include_private and not token_present:
+                raise InputError(
+                    str(GitHubConfigurationError("private_requires_token"))
+                )
 
         pipeline_request = PipelineRequest(
             resume=resume_path,

@@ -202,7 +202,10 @@ def test_github_portfolio_cli_defaults_are_disabled() -> None:
     assert request.github_project_ids == ()
 
 
-def test_github_portfolio_cli_flags_and_explicit_projects() -> None:
+def test_github_portfolio_cli_flags_and_explicit_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "github_pat_synthetic_cli_token_value")
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -257,6 +260,8 @@ def test_github_portfolio_cli_defaults_to_safe_local_ranker() -> None:
             "--analysis-provider",
             "grok_cli",
             "--github-portfolio",
+            "--github-username",
+            "synthetic-user",
         ]
     )
     _validate_mode_arguments(parser, args)
@@ -264,6 +269,27 @@ def test_github_portfolio_cli_defaults_to_safe_local_ranker() -> None:
     assert pipeline_request_from_namespace(args).github_analysis_provider == (
         "gemma_local"
     )
+
+
+def test_github_portfolio_cli_rejects_malformed_username() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--resume",
+            "resume.docx",
+            "--job-file",
+            "job.txt",
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+            "--github-portfolio",
+            "--github-username",
+            " bad-user ",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        _validate_mode_arguments(parser, args)
 
 
 def test_github_portfolio_cli_rejects_coding_agent_rankers() -> None:

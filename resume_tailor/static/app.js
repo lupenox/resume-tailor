@@ -88,6 +88,17 @@
       if (writerProvider !== "ollama") {
         return "GitHub portfolio runs require the local Ollama writer.";
       }
+      const usernameField = bySelector("#github-username", form);
+      const username = usernameField?.value || "";
+      if (username !== username.trim()) {
+        return "GitHub username must not have leading or trailing spaces.";
+      }
+      if (username) {
+        const usernamePattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+        if (!usernamePattern.test(username) || username.endsWith("-")) {
+          return "GitHub username is invalid. Use letters, numbers, and hyphens (max 39; no leading/trailing hyphen).";
+        }
+      }
       const includePrivate = Boolean(
         bySelector('input[name="github_include_private"]', form)?.checked
       );

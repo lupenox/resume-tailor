@@ -488,6 +488,11 @@ def _validated_username(value: str) -> str:
     return username
 
 
+def validate_github_username(value: str) -> str:
+    """Public username format check for pre-run UI/CLI validation."""
+    return _validated_username(value)
+
+
 def _validated_full_name(value: str) -> tuple[str, str]:
     if not isinstance(value, str) or value.count("/") != 1:
         raise GitHubAPIError("malformed_response", operation="repository_identity")

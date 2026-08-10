@@ -392,3 +392,83 @@ def test_invoke_final_qa_compat_defaults_to_codex(
     )
     assert result["status"] == "pass"
     assert calls == ["codex"]
+
+
+def test_external_cli_probe_does_not_claim_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "resume_tailor.backend.engine.qa.shutil.which",
+        lambda name: f"/synthetic/bin/{name}" if name in {"codex", "agy"} else None,
+    )
+    monkeypatch.setattr(
+        "resume_tailor.backend.providers.grok_analysis.resolve_grok_executable",
+        lambda _value: "/synthetic/bin/grok",
+    )
+    monkeypatch.setattr(
+        "resume_tailor.backend.engine.qa._probe_gemma_local",
+        lambda: __import__(
+            "resume_tailor.backend.engine.qa", fromlist=["InitialQAProviderOption"]
+        ).InitialQAProviderOption(
+            provider_id="gemma_local",
+            label="Gemma Local",
+            description="local",
+            available=True,
+            status="local_model_present",
+            detail="present",
+            capabilities=("content_qa",),
+            limitations=("content_and_structure_only",),
+            verification="local_only",
+            auth_status="not_applicable",
+        ),
+    )
+    options = probe_initial_qa_providers(include_expensive=True)
+    by_id = {item["provider_id"]: item for item in options}
+    assert by_id["codex"]["available"] is True
+    assert by_id["codex"]["status"] == "cli_found"
+    assert by_id["codex"]["auth_status"] == "not_checked"
+    assert "Ready" not in by_id["codex"]["ui_status_label"]
+    assert "not verified" in by_id["codex"]["ui_status_label"].casefold()
+    assert by_id["grok"]["status"] == "cli_found"
+    assert "not verified" in by_id["grok"]["ui_status_label"].casefold()
+    assert by_id["gemma_local"]["status"] == "local_model_present"
+    assert "Local model present" in by_id["gemma_local"]["ui_status_label"]
+
+
+def test_grok_qa_classifies_e2big_as_prompt_too_large(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    from resume_tailor.backend.engine import qa as qa_module
+    from resume_tailor.backend.utils.utilities import (
+        DependencyError,
+        GrokPromptTooLargeError,
+    )
+
+    monkeypatch.setattr(
+        "resume_tailor.backend.providers.grok_analysis.resolve_grok_executable",
+        lambda _value: "/synthetic/bin/grok",
+    )
+    monkeypatch.setattr(
+        "resume_tailor.backend.providers.grok_analysis.grok_analysis_args",
+        lambda **_kwargs: ["/synthetic/bin/grok", "-p", "x"],
+    )
+
+    def boom(*_args: object, **_kwargs: object) -> object:
+        cause = OSError(errno.E2BIG, "Argument list too long")
+        raise DependencyError("Could not run grok: Argument list too long") from cause
+
+    monkeypatch.setattr(qa_module, "run_command", boom)
+    monkeypatch.setattr(
+        qa_module,
+        "_load_provider_schema",
+        lambda: {"type": "object"},
+    )
+    with pytest.raises(GrokPromptTooLargeError):
+        qa_module._invoke_grok_qa(
+            prompt="synthetic",
+            run_directory=tmp_path,
+            timeout_seconds=5,
+        )

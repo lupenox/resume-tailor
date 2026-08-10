@@ -3139,6 +3139,45 @@ def test_github_private_provider_ui_requires_private_discovery(
     asyncio.run(scenario())
 
 
+def test_github_portfolio_ui_rejects_malformed_username_before_pipeline(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline = _PortfolioGatePipeline()
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=pipeline,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            response = await client.post(
+                "/runs",
+                data={
+                    "csrf_token": token,
+                    "resume_mode": "master",
+                    "job_mode": "pasted",
+                    "company": "Synthetic Company",
+                    "role": "Synthetic Role",
+                    "pasted_description": (
+                        "Build safe Python systems with deterministic tests."
+                    ),
+                    "analysis_provider": "gemma_local",
+                    "github_portfolio": "yes",
+                    "github_username": " bad user ",
+                    "github_analysis_provider": "gemma_local",
+                },
+            )
+            assert response.status_code == 422
+            assert "username is malformed" in response.text.casefold() or (
+                "username is invalid" in response.text.casefold()
+            )
+            assert pipeline.requests == []
+
+    asyncio.run(scenario())
+
 
 def test_github_portfolio_failure_page_never_renders_credentials(
     master_resume: Path,
@@ -3186,5 +3225,56 @@ def test_github_portfolio_failure_page_never_renders_credentials(
             assert page.status_code == 200
             assert "Verify the username" in page.text
             assert secret not in page.text
+
+    asyncio.run(scenario())
+
+
+def test_github_portfolio_failure_maps_safe_classification(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    from resume_tailor.backend.github.client import GitHubConfigurationError
+
+    def fail(request: PipelineRequest, *, hooks: PipelineHooks) -> PipelineResult:
+        run_directory = request.output_dir / "synthetic-github-classified"
+        run_directory.mkdir(mode=0o700)
+        hooks.progress(
+            "github_portfolio",
+            "Cataloging bounded GitHub repository evidence.",
+            run_directory=str(run_directory),
+        )
+        raise GitHubConfigurationError("invalid_username")
+
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=fail,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(
+                client,
+                token,
+                mode="pasted",
+                extra={
+                    "github_portfolio": "yes",
+                    "github_username": "synthetic-user",
+                    "github_analysis_provider": "gemma_local",
+                    "analysis_provider": "gemma_local",
+                },
+            )
+            failed = await _wait(app, run_id, "FAILED")
+            assert failed["failure_kind"] == "github_portfolio"
+            assert "invalid" in failed["message"].casefold()
+            assert "username" in failed["message"].casefold()
+            page = await client.get(f"/runs/{run_id}")
+            assert page.status_code == 200
+            assert "invalid" in page.text.casefold()
+            assert "username" in page.text.casefold()
+            # Credentials must never appear; env-var name in guidance is OK.
+            assert "github_pat_" not in page.text
+            assert "Authorization: Bearer" not in page.text
 
     asyncio.run(scenario())

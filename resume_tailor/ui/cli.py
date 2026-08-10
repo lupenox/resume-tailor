@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -230,6 +231,22 @@ def _validate_mode_arguments(
             "--github-analysis-provider supports only gemma_local or grok_cli"
         )
     if github_enabled:
+        from resume_tailor.backend.github.client import (
+            GitHubConfigurationError,
+            validate_github_username,
+        )
+
+        if github_username is not None:
+            try:
+                args.github_username = validate_github_username(github_username)
+                github_username = args.github_username
+            except GitHubConfigurationError as exc:
+                parser.error(str(exc))
+        token_present = bool(os.environ.get("GITHUB_TOKEN", "").strip())
+        if github_username is None and not token_present:
+            parser.error(str(GitHubConfigurationError("missing_identity")))
+        if github_include_private and not token_present:
+            parser.error(str(GitHubConfigurationError("private_requires_token")))
         analysis_provider = normalize_analysis_provider(
             getattr(args, "analysis_provider", DEFAULT_ANALYSIS_PROVIDER)
         )

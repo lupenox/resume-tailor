@@ -747,8 +747,8 @@
             {% if run.failure_kind == "github_portfolio" %}
               <div class="alert alert-warning">
                 <strong>GitHub portfolio selection unavailable</strong>
-                <span>Verify the public username, or configure GITHUB_TOKEN in the launching shell for authenticated discovery. Check token repository access, private-repository consent, API rate limits, and the explicitly selected analysis provider before starting a new run.</span>
-                <span>Existing catalog, ranking, or diagnostic artifacts were preserved. No repository was silently selected and résumé analysis did not continue with unapproved project evidence.</span>
+                <span>{{ run.message }}</span>
+                <span>No repository was silently selected and résumé analysis did not continue with unapproved project evidence.</span>
               </div>
             {% elif run.failure_kind == "source_evidence" %}
               <div class="alert alert-warning">

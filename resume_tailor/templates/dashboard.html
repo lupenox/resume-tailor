@@ -98,14 +98,17 @@
             <div class="input-panel">
               <label for="github-username">GitHub username</label>
               <input id="github-username" name="github_username" type="text"
-                maxlength="39" autocomplete="off"
+                maxlength="39" autocomplete="off" spellcheck="false"
+                pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+                title="Letters, numbers, and single hyphens; 1–39 characters; no leading/trailing hyphen or spaces"
                 {% if not github_portfolio_enabled %}disabled{% endif %}
                 value="{{ form_values.get('github_username', '') }}"
                 placeholder="Public username, or leave blank for token owner">
               <p class="field-help">
                 Public repositories can be inspected without authentication when
                 a username is supplied. Leaving this blank requires GITHUB_TOKEN
-                in the environment that launched the local UI.
+                in the environment that launched the local UI. Format is validated
+                before the run starts.
               </p>
             </div>
 

@@ -223,10 +223,16 @@ class InitialQAProviderOption:
     label: str
     description: str
     available: bool
-    status: str  # ready | not_configured | cli_unavailable | ollama_unavailable | model_unavailable
+    status: str
+    # ready is legacy alias only for local-model presence; prefer:
+    # cli_found | local_model_present | cli_unavailable | ollama_unavailable |
+    # model_unavailable | not_configured
     detail: str
     capabilities: tuple[str, ...]
     limitations: tuple[str, ...]
+    verification: str = "local_only"
+    # local_only | none — never claim auth/quota verification without a real call
+    auth_status: str = "not_checked"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -238,7 +244,30 @@ class InitialQAProviderOption:
             "detail": self.detail,
             "capabilities": list(self.capabilities),
             "limitations": list(self.limitations),
+            "verification": self.verification,
+            "auth_status": self.auth_status,
+            "ui_status_label": provider_ui_status_label(
+                available=self.available,
+                status=self.status,
+                verification=self.verification,
+            ),
         }
+
+
+def provider_ui_status_label(
+    *,
+    available: bool,
+    status: str,
+    verification: str = "local_only",
+) -> str:
+    """Human-readable status chip; never claims auth/quota success."""
+    if not available:
+        return status.replace("_", " ").title()
+    if status in {"local_model_present", "ready"} and verification != "none":
+        return "Local model present"
+    if status in {"cli_found", "ready"}:
+        return "CLI found · auth/quota not verified"
+    return status.replace("_", " ").title()
 
 
 def _probe_codex() -> InitialQAProviderOption:
@@ -249,10 +278,17 @@ def _probe_codex() -> InitialQAProviderOption:
         label=_PROVIDER_LABELS["codex"],
         description=_PROVIDER_DESCRIPTIONS["codex"],
         available=available,
-        status="ready" if available else "cli_unavailable",
-        detail="Codex CLI ready." if available else "Codex CLI was not found on PATH.",
+        status="cli_found" if available else "cli_unavailable",
+        detail=(
+            "Codex CLI found on PATH. Authentication and quota are not verified "
+            "until you launch Initial QA."
+            if available
+            else "Codex CLI was not found on PATH."
+        ),
         capabilities=("content_qa", "evidence_qa", "visual_layout_qa"),
         limitations=(),
+        verification="none",
+        auth_status="not_checked",
     )
 
 
@@ -266,10 +302,15 @@ def _probe_grok() -> InitialQAProviderOption:
             label=_PROVIDER_LABELS["grok"],
             description=_PROVIDER_DESCRIPTIONS["grok"],
             available=True,
-            status="ready",
-            detail="Grok CLI ready.",
+            status="cli_found",
+            detail=(
+                "Grok CLI found. Authentication, quota, and prompt size are not "
+                "verified until you launch Initial QA."
+            ),
             capabilities=("content_qa", "evidence_qa"),
             limitations=("content_and_structure_only",),
+            verification="none",
+            auth_status="not_checked",
         )
     except Exception as exc:  # honest local probe only
         return InitialQAProviderOption(
@@ -281,6 +322,8 @@ def _probe_grok() -> InitialQAProviderOption:
             detail=str(exc)[:300] or "Grok CLI unavailable.",
             capabilities=("content_qa", "evidence_qa"),
             limitations=("content_and_structure_only",),
+            verification="none",
+            auth_status="not_checked",
         )
 
 
@@ -292,14 +335,17 @@ def _probe_antigravity() -> InitialQAProviderOption:
         label=_PROVIDER_LABELS["antigravity"],
         description=_PROVIDER_DESCRIPTIONS["antigravity"],
         available=available,
-        status="ready" if available else "cli_unavailable",
+        status="cli_found" if available else "cli_unavailable",
         detail=(
-            "Antigravity CLI ready."
+            "Antigravity CLI found on PATH. Authentication and quota are not "
+            "verified until you launch Initial QA."
             if available
             else "Antigravity CLI (agy) was not found on PATH."
         ),
         capabilities=("content_qa", "evidence_qa"),
         limitations=("content_and_structure_only",),
+        verification="none",
+        auth_status="not_checked",
     )
 
 
@@ -380,10 +426,12 @@ def _probe_gemma_local() -> InitialQAProviderOption:
         label=_PROVIDER_LABELS["gemma_local"],
         description=_PROVIDER_DESCRIPTIONS["gemma_local"],
         available=True,
-        status="ready",
-        detail=f"Ollama model {model!r} is available locally.",
+        status="local_model_present",
+        detail=f"Ollama model {model!r} is present locally (generation not smoke-tested).",
         capabilities=capabilities,
         limitations=limitations,
+        verification="local_only",
+        auth_status="not_applicable",
     )
 
 
@@ -396,10 +444,12 @@ def probe_initial_qa_providers(*, include_expensive: bool = True) -> list[dict[s
                 label=_PROVIDER_LABELS["gemma_local"],
                 description=_PROVIDER_DESCRIPTIONS["gemma_local"],
                 available=True,
-                status="ready",
+                status="not_probed",
                 detail="Availability not probed in this context.",
                 capabilities=("content_qa", "evidence_qa"),
                 limitations=("content_and_structure_only",),
+                verification="none",
+                auth_status="not_applicable",
             )
         ),
         _probe_codex,
@@ -861,9 +911,16 @@ def _invoke_grok_qa(
     executable: str | None = None,
     restricted: bool = False,
 ) -> Any:
+    import errno
+
     from resume_tailor.backend.providers.grok_analysis import (
+        _classify_nonzero_exit,
         _restricted_grok_args,
         resolve_grok_executable,
+    )
+    from resume_tailor.backend.utils.utilities import (
+        GrokExecutableError,
+        GrokPromptTooLargeError,
     )
 
     grok = resolve_grok_executable(executable)
@@ -872,37 +929,57 @@ def _invoke_grok_qa(
         f"{prompt}\n\nReturn ONLY JSON matching this schema:\n"
         f"{json.dumps(schema, ensure_ascii=False)}"
     )
-    if restricted:
-        with isolated_provider_workspace(
-            run_directory,
-            prefix="resume-tailor-grok-qa-",
-        ) as workspace:
-            args = _restricted_grok_args(
-                executable=grok,
-                prompt=full_prompt,
-                output_schema=schema,
-                workspace=workspace,
-            )
+    try:
+        if restricted:
+            with isolated_provider_workspace(
+                run_directory,
+                prefix="resume-tailor-grok-qa-",
+            ) as workspace:
+                args = _restricted_grok_args(
+                    executable=grok,
+                    prompt=full_prompt,
+                    output_schema=schema,
+                    workspace=workspace,
+                )
+                result = run_command(
+                    args,
+                    cwd=workspace,
+                    timeout_seconds=timeout_seconds,
+                    env=external_provider_environment(),
+                )
+        else:
+            from resume_tailor.backend.providers.grok_analysis import grok_analysis_args
+
+            args = grok_analysis_args(executable=grok, prompt=full_prompt)
             result = run_command(
                 args,
-                cwd=workspace,
+                cwd=run_directory,
                 timeout_seconds=timeout_seconds,
-                env=external_provider_environment(),
             )
-    else:
-        from resume_tailor.backend.providers.grok_analysis import grok_analysis_args
-
-        args = grok_analysis_args(executable=grok, prompt=full_prompt)
-        result = run_command(
-            args,
-            cwd=run_directory,
-            timeout_seconds=timeout_seconds,
-        )
+    except DependencyError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and cause.errno == errno.E2BIG:
+            raise GrokPromptTooLargeError() from exc
+        if "could not run" in str(exc).casefold():
+            raise GrokExecutableError(
+                f"Could not run Grok executable: {Path(grok).name}"
+            ) from exc
+        raise
     if result.returncode != 0:
-        raise ModelError(
-            f"Final QA with Grok exited with status {result.returncode}. Provider "
-            "output was omitted from the exception."
+        from resume_tailor.backend.utils.utilities import GrokProcessError
+
+        error = _classify_nonzero_exit(
+            stdout=result.stdout,
+            stderr=result.stderr,
+            returncode=result.returncode,
         )
+        # Rephrase analysis-oriented default for QA context when generic.
+        if isinstance(error, GrokProcessError):
+            raise GrokProcessError(
+                f"Final QA with Grok exited with status {result.returncode}. "
+                "Provider output was omitted from the exception."
+            ) from None
+        raise error
     # Prefer structured envelope text field when present.
     try:
         envelope = json.loads(result.stdout)
