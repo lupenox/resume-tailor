@@ -3,12 +3,13 @@
 {% block title %}New run · resume-tailor{% endblock %}
 
 {% block extra_css %}
-<link rel="stylesheet" href="/static/dashboard.css?v=14">
+<link rel="stylesheet" href="/static/dashboard.css?v=15">
 {% endblock %}
 
 {% block content %}
   {% set selected_job_mode = form_values.get("job_mode", "url") %}
   {% set selected_resume_mode = form_values.get("resume_mode", "master") %}
+  {% set github_portfolio_enabled = form_values.get("github_portfolio") == "yes" %}
   <section class="hero">
     <div>
       <p class="eyebrow">AI engineering résumé workspace</p>
@@ -76,6 +77,70 @@
             <p class="field-help">
               The document is structurally validated before any pipeline work.
             </p>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend>GitHub portfolio <span class="muted">· optional</span></legend>
+          <label class="choice-card portfolio-toggle">
+            <input type="checkbox" name="github_portfolio" value="yes"
+              {% if github_portfolio_enabled %}checked{% endif %}>
+            <span class="choice-title">Match repositories to this job</span>
+            <span class="choice-copy">
+              Build evidence-backed dossiers, rank eligible repositories, and
+              pause for your approval of two or three projects.
+            </span>
+            <span class="choice-meta">Off by default · read-only GitHub access</span>
+          </label>
+
+          <div class="conditional-field portfolio-settings" data-github-panel
+            {% if not github_portfolio_enabled %}hidden{% endif %}>
+            <div class="input-panel">
+              <label for="github-username">GitHub username</label>
+              <input id="github-username" name="github_username" type="text"
+                maxlength="39" autocomplete="off"
+                {% if not github_portfolio_enabled %}disabled{% endif %}
+                value="{{ form_values.get('github_username', '') }}"
+                placeholder="Public username, or leave blank for token owner">
+              <p class="field-help">
+                Public repositories can be inspected without authentication when
+                a username is supplied. Leaving this blank requires GITHUB_TOKEN
+                in the environment that launched the local UI.
+              </p>
+            </div>
+
+            <div class="input-panel">
+              <label for="github-analysis-provider">Portfolio analysis provider</label>
+              {% set github_provider = form_values.get("github_analysis_provider", "gemma_local") %}
+              <select id="github-analysis-provider" name="github_analysis_provider"
+                {% if not github_portfolio_enabled %}disabled{% endif %}>
+                <option value="gemma_local" {% if github_provider == "gemma_local" %}selected{% endif %}>Gemma Local</option>
+                <option value="grok_cli" {% if github_provider in ["grok", "grok_cli"] %}selected{% endif %}>Grok CLI</option>
+              </select>
+              <p class="field-help">
+                Gemma Local keeps evidence on-device. Grok runs through a locked,
+                one-turn, deny-all adapter. Coding-agent providers are excluded
+                because bounded repository evidence must have no shell or direct
+                HTTP capability.
+              </p>
+            </div>
+
+            <label class="privacy-option">
+              <input type="checkbox" name="github_include_private" value="yes"
+                {% if not github_portfolio_enabled %}disabled{% endif %}
+                {% if form_values.get("github_include_private") == "yes" %}checked{% endif %}>
+              <span><strong>Consider private repositories</strong><small>Requires an explicitly configured GITHUB_TOKEN. Public-only discovery remains the default.</small></span>
+            </label>
+            <label class="privacy-option private-provider-option">
+              <input type="checkbox" name="github_allow_private_provider" value="yes"
+                {% if not github_portfolio_enabled %}disabled{% endif %}
+                {% if form_values.get("github_allow_private_provider") == "yes" %}checked{% endif %}>
+              <span><strong>Allow private evidence to reach the analysis provider</strong><small>Separate explicit consent. Leave off to prevent private repository content from being transmitted to an external provider.</small></span>
+            </label>
+            <div class="alert alert-warning portfolio-privacy-warning">
+              <strong>Token stays outside the browser</strong>
+              <span>Set GITHUB_TOKEN only in the launching shell. Resume Tailor never places it in HTML, run state, artifacts, prompts, logs, URLs, or error details.</span>
+            </div>
           </div>
         </fieldset>
 
@@ -185,8 +250,8 @@
           </div>
           <p class="field-help">
             Gemma Local is recommended for free offline analysis. Resume Tailor
-            never switches providers automatically after a failure. Initial final
-            QA remains Codex-only even when Gemma Local is selected for analysis.
+            never switches providers automatically after a failure. Enabling the
+            GitHub portfolio stage limits analysis to Gemma Local or locked Grok.
           </p>
         </fieldset>
 
@@ -219,11 +284,11 @@
             normalized posting, the selected analysis provider (Gemma Local by
             default; Codex or Grok CLI when explicitly chosen) analyzes, local
             Gemma 4 12B writes, and deterministic Python validates and formats.
-            Initial final QA remains a separate Codex session and is not yet a
-            local Gemma provider—selecting Gemma Local for analysis does not make
-            the full workflow free of Codex. Validated job metadata and lifecycle
-            events are recorded in private local SQLite analytics; résumé body
-            text and credentials are excluded.
+            Initial QA is a separate explicit provider choice. Portfolio-enabled
+            runs limit it to Gemma Local or locked Grok; ordinary runs retain all
+            existing choices. Validated job metadata and lifecycle events are
+            recorded in private local SQLite analytics; résumé body text and
+            credentials are excluded.
           </p>
         </div>
 

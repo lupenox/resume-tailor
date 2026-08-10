@@ -237,6 +237,150 @@ def test_8_new_numeric_claim_6_rejected(master_resume: Path) -> None:
     assert any("New numeric or metric claim '6'" in issue for issue in report.issues)
 
 
+def test_github_skill_evidence_cannot_authorize_unrelated_experience_claim(
+    master_resume: Path,
+) -> None:
+    extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)
+    master = extracted["content"]
+    github_source_id = "github.101.readme.synthetic"
+    github_text = (
+        "Repository evidence: Kubernetes, Argo CD, and 7319 deployment checks."
+    )
+    github_block = {
+        "source_id": github_source_id,
+        "section_context": "Approved GitHub repository: synthetic/example",
+        "block_kind": "repository_evidence",
+        "exact_text": github_text,
+        "evidence_allowed": True,
+        "editable": False,
+        "source_kind": "github_repository",
+        "repository_id": "101",
+        "repository_full_name": "synthetic/example",
+        "head_sha": "b" * 40,
+        "source_path": "README.md",
+        "source_url": (
+            "https://github.com/synthetic/example/blob/"
+            + "b" * 40
+            + "/README.md"
+        ),
+        "allowed_target_source_ids": ["skill_groups.2"],
+    }
+    extracted["source_blocks"].append(github_block)
+    requirement_id = reqs["requirements"][0]["requirement_id"]
+    github_reference = {
+        key: github_block[key]
+        for key in (
+            "source_id",
+            "section_context",
+            "exact_text",
+            "source_kind",
+            "repository_id",
+            "repository_full_name",
+            "head_sha",
+            "source_path",
+            "source_url",
+        )
+    }
+    analysis["supported_requirement_mappings"].append(
+        {
+            "requirement_id": requirement_id,
+            "evidence_source_ids": [github_source_id],
+            "strength": "strong",
+            "resolved_evidence": [github_reference],
+        }
+    )
+    analysis["recommended_edits"].append(
+        {
+            "target_source_id": "skill_groups.2",
+            "operation": "replace",
+            "proposed_text": master["skill_groups"][2]["text"],
+            "alignment_rationale": "Use only locally scoped repository evidence.",
+            "evidence_source_ids": [github_source_id],
+            "resolved_evidence": [github_reference],
+            "github_evidence_authorizations": [
+                {
+                    "target_source_id": "skill_groups.2",
+                    "requirement_id": requirement_id,
+                    "evidence_id": github_source_id,
+                    "repository_id": "101",
+                    "repository_full_name": "synthetic/example",
+                    "head_sha": "b" * 40,
+                }
+            ],
+        }
+    )
+    tailored = copy.deepcopy(master)
+    tailored["experience"]["bullets"][0] = (
+        "Operated Kubernetes across 7319 deployment checks."
+    )
+    tailored["skill_groups"][0]["text"] += ", Argo CD"
+
+    report = validate_tailored_content(
+        original=master,
+        tailored=tailored,
+        extracted_resume=extracted,
+        analysis=analysis,
+        target_role="AI Engineer",
+    )
+
+    assert any(
+        issue == "Forbidden unsupported capability introduced: Kubernetes."
+        for issue in report.issues
+    )
+    assert any(
+        "New numeric or metric claim '7319'" in issue
+        for issue in report.issues
+    )
+    assert any(
+        "Technology/skill item lacks verbatim source evidence at skill_groups.0: "
+        "'Argo CD'." == issue
+        for issue in report.issues
+    )
+
+    scoped_tailored = copy.deepcopy(master)
+    scoped_tailored["skill_groups"][2]["text"] += (
+        ", Kubernetes, Argo CD, 7319 deployment checks"
+    )
+    scoped_report = validate_tailored_content(
+        original=master,
+        tailored=scoped_tailored,
+        extracted_resume=extracted,
+        analysis=analysis,
+        target_role="AI Engineer",
+    )
+
+    assert not any(
+        issue == "Forbidden unsupported capability introduced: Kubernetes."
+        for issue in scoped_report.issues
+    )
+    assert not any(
+        "New numeric or metric claim '7319'" in issue
+        for issue in scoped_report.issues
+    )
+    assert not any(
+        "Argo CD" in issue and "lacks verbatim source evidence" in issue
+        for issue in scoped_report.issues
+    )
+
+    uncited_analysis = copy.deepcopy(analysis)
+    uncited_analysis["recommended_edits"][-1]["evidence_source_ids"] = []
+    uncited_report = validate_tailored_content(
+        original=master,
+        tailored=scoped_tailored,
+        extracted_resume=extracted,
+        analysis=uncited_analysis,
+        target_role="AI Engineer",
+    )
+    assert any(
+        issue == "Forbidden unsupported capability introduced: Kubernetes."
+        for issue in uncited_report.issues
+    )
+    assert any(
+        "New numeric or metric claim '7319'" in issue
+        for issue in uncited_report.issues
+    )
+
+
 def test_9_existing_authenticated_numeric_claims_remain_valid(master_resume: Path) -> None:
     extracted, reqs, analysis = _setup_synthetic_inputs(master_resume)
     master = extracted["content"]

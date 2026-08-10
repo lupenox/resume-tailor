@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -70,3 +71,54 @@ def test_bounded_timeout_stops_process_group_with_actionable_error(
             cwd=tmp_path,
             timeout_seconds=1,
         )
+
+
+def test_subprocesses_never_inherit_github_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "github_pat_synthetic_secret_value")
+
+    inherited = run_command(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ.get('GITHUB_TOKEN', 'absent'))",
+        ],
+        cwd=tmp_path,
+        timeout_seconds=2,
+    )
+    explicitly_supplied = run_command(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ.get('GITHUB_TOKEN', 'absent'))",
+        ],
+        cwd=tmp_path,
+        timeout_seconds=2,
+        env={**os.environ, "GITHUB_TOKEN": "github_pat_other_secret_value"},
+    )
+    alias_supplied = run_command(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; print(','.join(sorted(k for k in os.environ "
+                "if k.casefold() in {'github_token','gh_token',"
+                "'github_enterprise_token','gh_enterprise_token'})) or 'absent')"
+            ),
+        ],
+        cwd=tmp_path,
+        timeout_seconds=2,
+        env={
+            **os.environ,
+            "github_token": "synthetic-lowercase-secret",
+            "GH_TOKEN": "synthetic-gh-secret",
+            "GITHUB_ENTERPRISE_TOKEN": "synthetic-enterprise-secret",
+            "gh_enterprise_token": "synthetic-lowercase-enterprise-secret",
+        },
+    )
+
+    assert inherited.stdout.strip() == "absent"
+    assert explicitly_supplied.stdout.strip() == "absent"
+    assert alias_supplied.stdout.strip() == "absent"

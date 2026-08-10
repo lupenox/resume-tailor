@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GitHub repository ranking",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "generated_at",
+    "provider",
+    "catalog_sha256",
+    "job_requirements_sha256",
+    "ranked_repositories",
+    "recommended_repository_ids",
+    "evidence_request_rounds"
+  ],
+  "properties": {
+    "version": {"const": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "provider": {"type": "string", "minLength": 1},
+    "catalog_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "job_requirements_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ranked_repositories": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/ranking"}
+    },
+    "recommended_repository_ids": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "evidence_request_rounds": {"type": "integer", "minimum": 0, "maximum": 2}
+  },
+  "$defs": {
+    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+    "scores": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_requirement_relevance",
+        "technical_depth",
+        "completeness_demonstrability",
+        "recency_ownership_confidence",
+        "distinctiveness",
+        "recruiter_clarity"
+      ],
+      "properties": {
+        "job_requirement_relevance": {"$ref": "#/$defs/score"},
+        "technical_depth": {"$ref": "#/$defs/score"},
+        "completeness_demonstrability": {"$ref": "#/$defs/score"},
+        "recency_ownership_confidence": {"$ref": "#/$defs/score"},
+        "distinctiveness": {"$ref": "#/$defs/score"},
+        "recruiter_clarity": {"$ref": "#/$defs/score"}
+      }
+    },
+    "ranking": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_id",
+        "component_scores",
+        "total_score",
+        "matched_requirement_ids",
+        "supporting_evidence_ids",
+        "inclusion_rationale",
+        "recommended_resume_angle",
+        "risks",
+        "diversity_category"
+      ],
+      "properties": {
+        "repository_id": {"type": "string", "minLength": 1},
+        "component_scores": {"$ref": "#/$defs/scores"},
+        "total_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "matched_requirement_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "supporting_evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "inclusion_rationale": {"type": "string", "minLength": 1},
+        "recommended_resume_angle": {"type": "string", "minLength": 1},
+        "risks": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "diversity_category": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

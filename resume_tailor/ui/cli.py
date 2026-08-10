@@ -10,9 +10,13 @@ from resume_tailor.application.models import PipelineRequest
 from resume_tailor.backend.engine.analysis import (
     ANALYSIS_PROVIDERS,
     DEFAULT_ANALYSIS_PROVIDER,
+    normalize_analysis_provider,
 )
 from resume_tailor.backend.engine.orchestration import PipelineHooks
 from resume_tailor.backend.providers.ollama_writer import DEFAULT_OLLAMA_MODEL
+from resume_tailor.backend.providers.portfolio_ranker import (
+    PORTFOLIO_ANALYSIS_PROVIDERS,
+)
 from resume_tailor.backend.utils.analytics import default_analytics_database_path
 from resume_tailor.backend.utils.utilities import (
     ExitCode,
@@ -148,6 +152,57 @@ def build_parser() -> argparse.ArgumentParser:
             "default preselection may also come from INITIAL_QA_PROVIDER)"
         ),
     )
+    parser.add_argument(
+        "--github-portfolio",
+        action="store_true",
+        help=(
+            "optionally rank GitHub repositories against the confirmed job and "
+            "require a separate project-selection approval"
+        ),
+    )
+    parser.add_argument(
+        "--github-username",
+        help=(
+            "GitHub username for public discovery; omit to use the authenticated "
+            "user from GITHUB_TOKEN"
+        ),
+    )
+    parser.add_argument(
+        "--github-include-private",
+        action="store_true",
+        help=(
+            "allow private repositories to be considered (requires GITHUB_TOKEN; "
+            "private content remains local by default)"
+        ),
+    )
+    parser.add_argument(
+        "--github-allow-private-provider",
+        action="store_true",
+        help=(
+            "explicitly allow selected private-repository evidence to be sent to "
+            "the chosen analysis provider"
+        ),
+    )
+    parser.add_argument(
+        "--github-analysis-provider",
+        choices=PORTFOLIO_ANALYSIS_PROVIDERS,
+        default=None,
+        help=(
+            "bounded provider for GitHub portfolio ranking (default: gemma_local; "
+            "grok_cli uses a locked one-turn deny-all adapter; no fallback)"
+        ),
+    )
+    parser.add_argument(
+        "--github-project",
+        dest="github_project_ids",
+        action="append",
+        default=None,
+        metavar="REPOSITORY_ID",
+        help=(
+            "explicit repository ID to approve for non-interactive --yes runs; "
+            "repeat exactly two or three times"
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -156,6 +211,81 @@ def _validate_mode_arguments(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ) -> None:
+    github_enabled = bool(getattr(args, "github_portfolio", False))
+    github_username = getattr(args, "github_username", None)
+    github_include_private = bool(
+        getattr(args, "github_include_private", False)
+    )
+    github_allow_private_provider = bool(
+        getattr(args, "github_allow_private_provider", False)
+    )
+    github_analysis_provider = getattr(args, "github_analysis_provider", None)
+    github_project_ids = tuple(getattr(args, "github_project_ids", ()) or ())
+    if (
+        github_enabled
+        and github_analysis_provider is not None
+        and github_analysis_provider not in PORTFOLIO_ANALYSIS_PROVIDERS
+    ):
+        parser.error(
+            "--github-analysis-provider supports only gemma_local or grok_cli"
+        )
+    if github_enabled:
+        analysis_provider = normalize_analysis_provider(
+            getattr(args, "analysis_provider", DEFAULT_ANALYSIS_PROVIDER)
+        )
+        if analysis_provider not in PORTFOLIO_ANALYSIS_PROVIDERS:
+            parser.error(
+                "--github-portfolio requires --analysis-provider gemma_local "
+                "or grok_cli"
+            )
+        if getattr(args, "writer_provider", "ollama") != "ollama":
+            parser.error(
+                "--github-portfolio requires --writer-provider ollama"
+            )
+        initial_qa_provider = getattr(args, "initial_qa_provider", None)
+        if initial_qa_provider not in {None, "gemma_local", "grok"}:
+            parser.error(
+                "--github-portfolio permits only gemma_local or grok for "
+                "--initial-qa-provider"
+            )
+        private_stays_local = (
+            github_include_private and not github_allow_private_provider
+        )
+        effective_portfolio_provider = github_analysis_provider or "gemma_local"
+        if private_stays_local and (
+            effective_portfolio_provider != "gemma_local"
+            or analysis_provider != "gemma_local"
+            or initial_qa_provider == "grok"
+        ):
+            parser.error(
+                "private GitHub evidence without "
+                "--github-allow-private-provider requires Gemma Local for "
+                "portfolio ranking, résumé analysis, and any preselected QA"
+            )
+    if not github_enabled and any(
+        (
+            github_username,
+            github_include_private,
+            github_allow_private_provider,
+            github_analysis_provider,
+            github_project_ids,
+        )
+    ):
+        parser.error(
+            "GitHub portfolio options require --github-portfolio"
+        )
+    if github_allow_private_provider and not github_include_private:
+        parser.error(
+            "--github-allow-private-provider requires --github-include-private"
+        )
+    if github_project_ids:
+        normalized_ids = [value.strip() for value in github_project_ids]
+        if any(not value for value in normalized_ids):
+            parser.error("--github-project values must not be empty")
+        if len(normalized_ids) not in {2, 3}:
+            parser.error("repeat --github-project exactly two or three times")
+        if len(set(normalized_ids)) != len(normalized_ids):
+            parser.error("--github-project values must be unique")
     if args.job_url is not None:
         if args.company is not None or args.role is not None:
             parser.error(
@@ -198,6 +328,22 @@ def pipeline_request_from_namespace(args: argparse.Namespace) -> PipelineRequest
         codex_model=getattr(args, "codex_model", None),
         codex_strength=getattr(args, "codex_strength", None),
         initial_qa_provider=getattr(args, "initial_qa_provider", None),
+        github_portfolio=bool(getattr(args, "github_portfolio", False)),
+        github_username=getattr(args, "github_username", None),
+        github_include_private=bool(
+            getattr(args, "github_include_private", False)
+        ),
+        github_allow_private_provider=bool(
+            getattr(args, "github_allow_private_provider", False)
+        ),
+        github_analysis_provider=(
+            getattr(args, "github_analysis_provider", None) or "gemma_local"
+            if bool(getattr(args, "github_portfolio", False))
+            else None
+        ),
+        github_project_ids=tuple(
+            getattr(args, "github_project_ids", ()) or ()
+        ),
         job_source_override=getattr(args, "job_source_override", "job-file"),
         retry_context=getattr(args, "retry_context", None),
         antigravity_retry_context=getattr(

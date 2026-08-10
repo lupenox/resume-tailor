@@ -257,6 +257,17 @@ export APIFY_API_TOKEN='apify_api_REPLACE_WITH_THE_COMPLETE_TOKEN'
 export APIFY_ACTOR_ID='username/actor-name'
 ```
 
+GitHub public-username discovery needs no environment variable. The optional
+portfolio stage reads `GITHUB_TOKEN` only for authenticated-user discovery and
+private-repository access:
+
+```bash
+export GITHUB_TOKEN='github_pat_REPLACE_WITH_A_FINE_GRAINED_READ_ONLY_TOKEN'
+```
+
+`GITHUB_TOKEN` is not required when `--github-username` names a public account
+and private discovery is not enabled.
+
 Obtain the exact Actor ID from the tested Actor's Apify Console page. Either its
 Apify ID or normal `username/actor-name` form is accepted. Preserve the entire
 token exactly as issued, including the `apify_api_` prefix; do not paste it into
@@ -417,6 +428,78 @@ tailor-resume \
   --output-dir "$HOME/Documents/Resumes/Tailored"
 ```
 
+### Optional job-aware GitHub portfolio selection
+
+GitHub portfolio selection is off by default. Enable it with a public username
+to use GitHub's unauthenticated, read-only REST API:
+
+```bash
+tailor-resume \
+  --resume "/absolute/path/master_resume.docx" \
+  --job-file "/absolute/path/job-description.txt" \
+  --company "RG Talent" \
+  --role "Agentic AI Developer" \
+  --github-portfolio \
+  --github-username "example-user" \
+  --github-analysis-provider grok_cli
+```
+
+After the confirmed job requirements are recorded, Resume Tailor catalogs the
+account's repositories, records every deterministic eligibility decision,
+performs bounded evidence requests at pinned head SHAs, and asks you to approve
+exactly two or three projects—or explicitly skip the portfolio step. Ranking is
+advisory: a high score never adds a project or claim. Approval also attests that
+the chosen repositories belong to or truthfully represent the résumé owner.
+Only evidence IDs copied into that approval can reach résumé analysis and the
+writer; repository descriptions, READMEs, manifests, and source excerpts remain
+untrusted data and cannot issue instructions.
+
+The portfolio ranker supports `gemma_local` and `grok_cli`, with no fallback.
+Gemma Local keeps repository evidence on-device. Grok uses a locked one-turn,
+deny-all adapter with no web, shell, subagent, memory, or planning capability.
+Coding-agent providers are intentionally excluded from portfolio ranking because
+the bounded evidence protocol cannot grant shell or direct HTTP access. This does
+not change the providers available when the portfolio feature is disabled. When
+portfolio selection is enabled, every downstream capability also fails closed:
+résumé analysis and QA permit only Gemma Local or the locked Grok adapter, and
+writing permits only local Ollama. Codex and Antigravity remain available for
+ordinary, portfolio-disabled runs because their agent tools cannot be hard-disabled
+by the current adapters. There is no Gemini adapter in this release; the
+provider-neutral portfolio interface leaves that as a focused follow-up.
+
+Public discovery needs no credential. For authenticated-user discovery, export a
+token and omit `--github-username`:
+
+```bash
+export GITHUB_TOKEN='github_pat_REPLACE_WITH_A_FINE_GRAINED_READ_ONLY_TOKEN'
+tailor-resume ... --github-portfolio
+```
+
+Use a [fine-grained personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
+with an expiration, access limited to the intended repositories, repository
+**Metadata: read** and **Contents: read**, and no write permissions. Those are the
+read permissions documented for [repository discovery](https://docs.github.com/en/rest/repos/repos#list-repositories-for-the-authenticated-user)
+and [content/tree retrieval](https://docs.github.com/en/rest/repos/contents#get-repository-content).
+The token is read only from `GITHUB_TOKEN`; there is deliberately no CLI option,
+browser field, persisted request value, artifact field, URL credential, or model
+input for it.
+
+Private repositories require both the token and `--github-include-private`.
+Their content is never sent to an external ranker unless you separately add
+`--github-allow-private-provider`. That consent can expose bounded private
+README/manifest/source excerpts to the explicitly selected external provider;
+review the provider's data policy first. Gemma Local remains on the localhost
+Ollama boundary. The web UI exposes the same non-secret controls but never a
+token field.
+
+Immutable dossier data is cached by numeric repository identity plus inspected
+head SHA under `${XDG_CACHE_HOME:-~/.cache}/resume-tailor/github`. Inventory and
+heads are refreshed on each enabled run; unchanged heads reuse their bounded
+dossier. Cache entries use a versioned filename and schema; older pre-redaction
+versions are never reused. Credential-like repository text is redacted before a
+cache write. Cache directories are mode `0700` and entries mode `0600`, so
+private repository users should still treat that local cache as sensitive.
+
 URL retrieval always uses the dedicated Apify adapter. It provides no alternate
 web provider and never silently falls back after a retrieval failure. The Actor
 receives one `searchUrls` value containing the normalized public URL; it receives
@@ -458,6 +541,12 @@ tailor-resume --resume PATH
               [--timeout DURATION]
               [--writer-provider {ollama,antigravity}]
               [--ollama-model MODEL]
+              [--github-portfolio]
+              [--github-username USER]
+              [--github-include-private]
+              [--github-allow-private-provider]
+              [--github-analysis-provider {gemma_local,grok_cli}]
+              [--github-project OWNER/NAME ...]
 ```
 
 Durations accept positive seconds, minutes, or hours such as `90s`, `15m`, and
@@ -473,6 +562,11 @@ screen is still displayed and recorded as approved by `--yes`. The flag does
 **not** bypass URL/status/redirect validation, schema validation, unanswered
 factual questions, immutable-field checks, evidence checks, template validation,
 one-page checks, source integrity, or final QA.
+
+When GitHub selection is enabled, `--yes` never approves the ranker's suggested
+projects. Supply exactly two or three explicit, unique `--github-project
+OWNER/NAME` values; otherwise the run stops at the preserved approval boundary.
+Interactive terminal and web runs can explicitly skip the optional selection.
 
 `--keep-workdir` retains the run's internal `work/` directory, including the
 isolated LibreOffice profile and raw structured final-QA result. Normal output
@@ -503,6 +597,13 @@ keywords, gaps, forbidden claims, and unchanged sections. A final before/after
 content gate still protects deterministic rendering after the local writer and
 local evidence checks.
 
+When enabled, the GitHub gate appears after confirmed job requirements and before
+résumé analysis. It shows eligible and excluded repositories, weighted component
+scores, matched requirement IDs, evidence IDs and pinned source links, rationale,
+résumé angle, risks, and diversity category. Approval binds the requirement hash,
+ranking hash, repository IDs and head SHAs, and the approved angles/evidence IDs.
+A changed requirement catalog or head SHA requires a fresh selection approval.
+
 Any other input, including end-of-input, stops the pipeline and keeps the
 artifacts already produced. If Codex asks an unanswered factual question, the
 pipeline stops even with `--yes`; answer it outside the tool and update the
@@ -520,6 +621,9 @@ rg-talent-agentic-ai-developer-YYYYMMDD-HHMMSS/
 ├── apify-linkedin-retrieval-diagnostic.json  # URL mode, token-free diagnostic
 ├── job-description.txt
 ├── job-requirements.json
+├── github-repository-catalog.json    # only when portfolio selection is enabled
+├── github-repository-ranking.json    # provider scores + local weighted totals
+├── github-repository-selection.json  # explicit approval and pinned evidence
 ├── extracted-master-resume.json
 ├── codex-analysis-transport.schema.json
 ├── codex-analysis.json

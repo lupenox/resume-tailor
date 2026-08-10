@@ -35,6 +35,66 @@
     0 0 0 1px var(--focus),
     inset 0 0 20px rgba(196, 165, 116, 0.05);
 }
+.portfolio-toggle {
+  padding-left: 52px;
+}
+.portfolio-toggle input[type="checkbox"] {
+  position: absolute;
+  left: 20px;
+  top: 22px;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--focus);
+}
+.portfolio-settings {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  background: rgba(12, 16, 13, 0.35);
+}
+.portfolio-settings select {
+  width: 100%;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  background: #0c100d;
+  color: var(--text);
+  font: inherit;
+}
+.portfolio-settings select:focus {
+  outline: none;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 3px rgba(196, 165, 116, 0.15);
+}
+.privacy-option {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin-top: 16px;
+  color: var(--text-soft);
+}
+.privacy-option input {
+  margin-top: 3px;
+  accent-color: var(--focus);
+}
+.privacy-option span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.privacy-option small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+.private-provider-option {
+  padding: 12px;
+  border: 1px solid rgba(212, 160, 160, 0.3);
+  border-radius: var(--radius-small);
+}
+.portfolio-privacy-warning {
+  margin: 18px 0 0;
+}
 .choice-title {
   font-weight: 700;
   font-size: 15px;

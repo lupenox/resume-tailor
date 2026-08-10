@@ -50,6 +50,12 @@ template/master_resume.docx
 job-description.txt
 job-source.json
 job-requirements.json
+github-repository-catalog.json
+github-repository-ranking.json
+github-repository-selection.json
+github-portfolio-diagnostic.json
+github-portfolio-*.provider.json
+github-portfolio-*.schema.json
 run-metadata.json
 codex-analysis.json
 codex-analysis-resolved.json

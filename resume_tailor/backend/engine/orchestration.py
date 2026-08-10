@@ -13,6 +13,84 @@ WarningHandler = Callable[[str, Mapping[str, Any]], None]
 PresentationHandler = Callable[[str, Mapping[str, Any]], None]
 
 
+def portfolio_selectable_repository_ids(
+    payload: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return the stable repository IDs exposed by a validated ranking payload."""
+
+    candidates: Any = payload.get("allowed_repository_ids")
+    if not isinstance(candidates, (list, tuple)):
+        ranking: Any = payload.get("ranking")
+        if isinstance(ranking, Mapping):
+            for key in ("ranked_repositories", "rankings", "repositories"):
+                value = ranking.get(key)
+                if isinstance(value, list):
+                    candidates = value
+                    break
+        elif isinstance(ranking, list):
+            candidates = ranking
+    if not isinstance(candidates, (list, tuple)):
+        for key in ("ranked_repositories", "rankings", "recommendations"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+    if not isinstance(candidates, (list, tuple)):
+        return ()
+
+    identifiers: list[str] = []
+    for candidate in candidates:
+        value: Any = candidate
+        if isinstance(candidate, Mapping):
+            value = candidate.get("repository_id", candidate.get("id"))
+            if value is None and isinstance(candidate.get("repository"), Mapping):
+                repository = candidate["repository"]
+                value = repository.get("repository_id", repository.get("id"))
+        if isinstance(value, (str, int)):
+            identifier = str(value).strip()
+            if identifier and identifier not in identifiers:
+                identifiers.append(identifier)
+    return tuple(identifiers)
+
+
+def validate_portfolio_selection(
+    values: Any,
+    *,
+    allowed_ids: tuple[str, ...],
+    repository_aliases: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple)) or isinstance(values, (str, bytes)):
+        raise ApprovalError(
+            "GitHub portfolio approval requires two or three repository IDs; "
+            "artifacts were preserved."
+        )
+    aliases = {
+        str(alias).strip().casefold(): str(repository_id).strip()
+        for alias, repository_id in (repository_aliases or {}).items()
+        if str(alias).strip() and str(repository_id).strip()
+    }
+    supplied = tuple(str(value).strip() for value in values)
+    selected = tuple(aliases.get(value.casefold(), value) for value in supplied)
+    if len(selected) not in {2, 3} or any(not value for value in selected):
+        raise ApprovalError(
+            "GitHub portfolio approval requires two or three repository IDs; "
+            "artifacts were preserved."
+        )
+    if len(set(selected)) != len(selected):
+        raise ApprovalError(
+            "GitHub portfolio approval contained duplicate repositories; "
+            "artifacts were preserved."
+        )
+    allowed = set(allowed_ids)
+    unknown = [value for value in selected if value not in allowed]
+    if unknown:
+        raise ApprovalError(
+            "GitHub portfolio approval referenced a repository outside the "
+            "validated ranking; artifacts were preserved."
+        )
+    return selected
+
+
 @dataclass(frozen=True)
 class ApprovalRequest:
     kind: str
@@ -73,6 +151,12 @@ class PipelineHooks:
         on_presented: Callable[[], None] | None = None,
     ) -> ApprovalResponse:
         check_cancelled()
+        if kind == "github_portfolio_selection":
+            return self.approve_github_portfolio(
+                payload=payload,
+                assume_yes=assume_yes,
+                on_presented=on_presented,
+            )
         request = ApprovalRequest(
             kind=kind,
             title=title,
@@ -94,6 +178,75 @@ class PipelineHooks:
         if response.action not in {"approve", "use_pasted"}:
             raise ApprovalError(f"{title} was not approved; artifacts were preserved.")
         return response
+
+    def approve_github_portfolio(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        assume_yes: bool = False,
+        explicit_repository_ids: tuple[str, ...] = (),
+        on_presented: Callable[[], None] | None = None,
+    ) -> ApprovalResponse:
+        """Approve two or three ranked repositories, or explicitly skip them.
+
+        ``--yes`` never turns the ranker's recommendation into an approval. It
+        approves only repository IDs supplied explicitly by the caller; an
+        interactive adapter is required to record a skip.
+        """
+
+        check_cancelled()
+        title = "GitHub portfolio selection"
+        allowed_ids = portfolio_selectable_repository_ids(payload)
+        aliases = payload.get("repository_aliases")
+        repository_aliases = aliases if isinstance(aliases, Mapping) else {}
+        if assume_yes:
+            if on_presented is not None:
+                on_presented()
+            if not explicit_repository_ids:
+                raise ApprovalError(
+                    "GitHub portfolio selection under --yes requires two or "
+                    "three explicit --github-project values; artifacts were "
+                    "preserved."
+                )
+            selected = validate_portfolio_selection(
+                explicit_repository_ids,
+                allowed_ids=allowed_ids,
+                repository_aliases=repository_aliases,
+            )
+            return ApprovalResponse(
+                "approve",
+                {"repository_ids": list(selected)},
+            )
+        if self.approval_handler is None:
+            raise ApprovalError(
+                f"{title} requires an interaction adapter; artifacts were preserved."
+            )
+        request = ApprovalRequest(
+            kind="github_portfolio_selection",
+            title=title,
+            payload=payload,
+            on_presented=on_presented,
+        )
+        if not self.approval_handler_presents and on_presented is not None:
+            on_presented()
+        response = self.approval_handler(request)
+        check_cancelled()
+        if response.action == "skip":
+            return ApprovalResponse("skip")
+        if response.action != "approve":
+            raise ApprovalError(
+                "GitHub portfolio selection was not approved; artifacts were "
+                "preserved."
+            )
+        selected = validate_portfolio_selection(
+            response.data.get("repository_ids"),
+            allowed_ids=allowed_ids,
+            repository_aliases=repository_aliases,
+        )
+        return ApprovalResponse(
+            "approve",
+            {"repository_ids": list(selected)},
+        )
 
     def authorize_revision(
         self,

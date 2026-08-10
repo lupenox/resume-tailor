@@ -62,6 +62,7 @@ def stubs_on_path(
         "STUB_GROK_INVOCATION_LOG",
         "APIFY_API_TOKEN",
         "APIFY_ACTOR_ID",
+        "GITHUB_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(

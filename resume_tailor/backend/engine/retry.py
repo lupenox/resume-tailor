@@ -179,7 +179,7 @@ def analysis_input_manifest(
         "job-requirements.json",
         maximum=_MAX_METADATA_BYTES,
     )
-    return {
+    manifest = {
         "version": 2,
         "source_resume_sha256": _hash_value(
             source_resume_sha256,
@@ -189,6 +189,16 @@ def analysis_input_manifest(
         "job_description_sha256": _digest(job),
         "job_requirements_sha256": _digest(job_requirements),
     }
+    portfolio_selection = run_directory / "github-repository-selection.json"
+    if portfolio_selection.is_file():
+        selection = _read_child(
+            run_directory,
+            "github-repository-selection.json",
+            maximum=_MAX_METADATA_BYTES,
+        )
+        manifest["version"] = 3
+        manifest["github_portfolio_selection_sha256"] = _digest(selection)
+    return manifest
 
 
 def _legacy_job_requirement_catalog(
@@ -229,6 +239,17 @@ def _validated_retry_payloads(
     if source_directory.is_symlink() or not source_directory.is_dir():
         raise InputError("The preserved retry directory is not a safe directory.")
     source_directory = source_directory.resolve()
+    portfolio_selection = source_directory / "github-repository-selection.json"
+    if portfolio_selection.exists():
+        _read_child(
+            source_directory,
+            "github-repository-selection.json",
+            maximum=_MAX_METADATA_BYTES,
+        )
+        raise InputError(
+            "Source-evidence retry is unavailable for a GitHub portfolio run; "
+            "the pinned selection artifacts remain preserved, so start a new run."
+        )
 
     metadata = _json_object(
         _read_child(
@@ -525,6 +546,11 @@ def _approval_artifacts_for_run(run_directory: Path) -> dict[str, tuple[str, int
         artifacts["grok_analysis_schema"] = (
             "grok-analysis-schema.json",
             _MAX_SCHEMA_BYTES,
+        )
+    if (run_directory / "github-repository-selection.json").is_file():
+        artifacts["github_portfolio_selection"] = (
+            "github-repository-selection.json",
+            _MAX_METADATA_BYTES,
         )
     return artifacts
 
@@ -859,10 +885,19 @@ def verify_tailoring_run_artifacts(
         "job_description_sha256": _digest(artifacts["job-description.txt"]),
         "job_requirements_sha256": _digest(artifacts["job-requirements.json"]),
     }
-    if not isinstance(manifest, dict) or manifest.get("version") != 2:
+    portfolio_selection_bytes = artifacts.get("github-repository-selection.json")
+    expected_manifest_version = 3 if portfolio_selection_bytes is not None else 2
+    if portfolio_selection_bytes is not None:
+        expected_manifest["github_portfolio_selection_sha256"] = _digest(
+            portfolio_selection_bytes
+        )
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != expected_manifest_version
+    ):
         raise InputError(
-            "Version-2 authenticated analysis inputs are missing; no Antigravity "
-            "provider request was launched."
+            "Authenticated analysis inputs are missing or use the wrong version; "
+            "no Antigravity provider request was launched."
         )
     for key, expected in expected_manifest.items():
         if _hash_value(manifest.get(key), label=key.replace("_", " ")) != expected:
@@ -892,6 +927,18 @@ def _validated_antigravity_retry_payloads(
     if source_directory.is_symlink() or not source_directory.is_dir():
         raise InputError("The preserved recovery directory is not a safe directory.")
     source_directory = source_directory.resolve()
+    portfolio_selection = source_directory / "github-repository-selection.json"
+    if portfolio_selection.exists():
+        _read_child(
+            source_directory,
+            "github-repository-selection.json",
+            maximum=_MAX_METADATA_BYTES,
+        )
+        raise InputError(
+            "Provider recovery is unavailable for a GitHub portfolio run because "
+            "repository heads and selection approval must be reconfirmed; start a "
+            "new run from the preserved artifacts."
+        )
     metadata_bytes = _read_child(
         source_directory,
         "run-metadata.json",

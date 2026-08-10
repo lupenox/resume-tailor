@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from resume_tailor.backend.providers.codex_analysis import build_analysis_prompt
+from resume_tailor.backend.providers.subprocess_isolation import (
+    external_provider_environment,
+    isolated_provider_workspace,
+)
 from resume_tailor.backend.utils.schemas import (
     build_codex_analysis_transport_schema,
     normalize_unique_arrays,
@@ -121,6 +125,53 @@ def grok_analysis_args(
         args.extend(["--model", model])
     if model_strength:
         args.extend(["--model-strength", model_strength])
+    return args
+
+
+def _restricted_grok_args(
+    *,
+    executable: str,
+    prompt: str,
+    output_schema: dict[str, Any],
+    workspace: Path,
+    model: str | None = None,
+    model_strength: str | None = None,
+) -> list[str]:
+    """Return a one-turn, deny-all Grok invocation for untrusted evidence."""
+
+    args = [
+        executable,
+        "--no-auto-update",
+        "--json-schema",
+        json.dumps(
+            output_schema,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        "--disable-web-search",
+        "--no-subagents",
+        "--no-memory",
+        "--no-plan",
+        "--max-turns",
+        "1",
+        "--permission-mode",
+        "dontAsk",
+        "--deny",
+        "*",
+        "--sandbox",
+        "strict",
+        "--cwd",
+        str(workspace),
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+    ]
+    if model:
+        args.extend(["--model", model])
+    if model_strength:
+        args.extend(["--reasoning-effort", model_strength])
     return args
 
 
@@ -446,6 +497,7 @@ def invoke_grok_analysis(
     model: str | None = None,
     model_strength: str | None = None,
     progress_handler: Callable[[float, bool], None] | None = None,
+    restricted: bool = False,
 ) -> dict[str, Any]:
     """Invoke Grok Build for résumé analysis and return validated analysis JSON."""
     try:
@@ -472,20 +524,40 @@ def invoke_grok_analysis(
         output_schema=schema_info["schema"],
     )
     _write_sanitized_prompt(run_directory, prompt)
-    args = grok_analysis_args(
-        executable=grok,
-        prompt=prompt,
-        model=model,
-        model_strength=model_strength,
-    )
-
     try:
-        result = run_command(
-            args,
-            cwd=run_directory,
-            timeout_seconds=timeout_seconds,
-            heartbeat_handler=progress_handler,
-        )
+        if restricted:
+            with isolated_provider_workspace(
+                run_directory,
+                prefix="resume-tailor-grok-analysis-",
+            ) as workspace:
+                args = _restricted_grok_args(
+                    executable=grok,
+                    prompt=prompt,
+                    output_schema=schema_info["schema"],
+                    workspace=workspace,
+                    model=model,
+                    model_strength=model_strength,
+                )
+                result = run_command(
+                    args,
+                    cwd=workspace,
+                    timeout_seconds=timeout_seconds,
+                    env=external_provider_environment(),
+                    heartbeat_handler=progress_handler,
+                )
+        else:
+            args = grok_analysis_args(
+                executable=grok,
+                prompt=prompt,
+                model=model,
+                model_strength=model_strength,
+            )
+            result = run_command(
+                args,
+                cwd=run_directory,
+                timeout_seconds=timeout_seconds,
+                heartbeat_handler=progress_handler,
+            )
     except ModelError as exc:
         message = str(exc).casefold()
         if "timed out" in message:

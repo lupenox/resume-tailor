@@ -128,6 +128,12 @@ def test_pipeline_request_conversion_preserves_all_cli_and_recovery_values(
         codex_model="codex-synthetic",
         codex_strength="low",
         initial_qa_provider="grok",
+        github_portfolio=True,
+        github_username="synthetic-user",
+        github_include_private=True,
+        github_allow_private_provider=True,
+        github_analysis_provider="grok_cli",
+        github_project_ids=["repo-101", "repo-202"],
         job_source_override="pasted",
         retry_context=retry_context,
         antigravity_retry_context=antigravity_retry_context,
@@ -158,11 +164,181 @@ def test_pipeline_request_conversion_preserves_all_cli_and_recovery_values(
         codex_model=namespace.codex_model,
         codex_strength=namespace.codex_strength,
         initial_qa_provider=namespace.initial_qa_provider,
+        github_portfolio=True,
+        github_username="synthetic-user",
+        github_include_private=True,
+        github_allow_private_provider=True,
+        github_analysis_provider="grok_cli",
+        github_project_ids=("repo-101", "repo-202"),
         job_source_override=namespace.job_source_override,
         retry_context=retry_context,
         antigravity_retry_context=antigravity_retry_context,
         antigravity_reprocess_context=antigravity_reprocess_context,
     )
+
+
+def test_github_portfolio_cli_defaults_are_disabled() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--resume",
+            "resume.docx",
+            "--job-file",
+            "job.txt",
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+        ]
+    )
+    _validate_mode_arguments(parser, args)
+    request = pipeline_request_from_namespace(args)
+
+    assert request.github_portfolio is False
+    assert request.github_username is None
+    assert request.github_include_private is False
+    assert request.github_allow_private_provider is False
+    assert request.github_analysis_provider is None
+    assert request.github_project_ids == ()
+
+
+def test_github_portfolio_cli_flags_and_explicit_projects() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--resume",
+            "resume.docx",
+            "--job-file",
+            "job.txt",
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+            "--yes",
+            "--github-portfolio",
+            "--github-username",
+            "synthetic-user",
+            "--github-include-private",
+            "--github-allow-private-provider",
+            "--github-analysis-provider",
+            "grok_cli",
+            "--github-project",
+            "synthetic-user/alpha",
+            "--github-project",
+            "synthetic-user/beta",
+        ]
+    )
+    _validate_mode_arguments(parser, args)
+    request = pipeline_request_from_namespace(args)
+
+    assert request.github_portfolio is True
+    assert request.github_username == "synthetic-user"
+    assert request.github_include_private is True
+    assert request.github_allow_private_provider is True
+    assert request.github_analysis_provider == "grok_cli"
+    assert request.github_project_ids == (
+        "synthetic-user/alpha",
+        "synthetic-user/beta",
+    )
+
+
+def test_github_portfolio_cli_defaults_to_safe_local_ranker() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--resume",
+            "resume.docx",
+            "--job-file",
+            "job.txt",
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+            "--analysis-provider",
+            "grok_cli",
+            "--github-portfolio",
+        ]
+    )
+    _validate_mode_arguments(parser, args)
+
+    assert pipeline_request_from_namespace(args).github_analysis_provider == (
+        "gemma_local"
+    )
+
+
+def test_github_portfolio_cli_rejects_coding_agent_rankers() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--resume",
+                "resume.docx",
+                "--job-file",
+                "job.txt",
+                "--company",
+                "Example",
+                "--role",
+                "Developer",
+                "--github-portfolio",
+                "--github-analysis-provider",
+                "codex",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--github-username", "synthetic-user"],
+        ["--github-portfolio", "--github-allow-private-provider"],
+        ["--github-portfolio", "--github-project", "repo-1"],
+        [
+            "--github-portfolio",
+            "--github-project",
+            "repo-1",
+            "--github-project",
+            "repo-1",
+        ],
+    ],
+)
+def test_invalid_github_portfolio_cli_combinations_are_rejected(
+    extra: list[str],
+) -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--resume",
+            "resume.docx",
+            "--job-file",
+            "job.txt",
+            "--company",
+            "Example",
+            "--role",
+            "Developer",
+            *extra,
+        ]
+    )
+    with pytest.raises(SystemExit):
+        _validate_mode_arguments(parser, args)
+
+
+def test_cli_has_no_github_token_argument() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--resume",
+                "resume.docx",
+                "--job-file",
+                "job.txt",
+                "--company",
+                "Example",
+                "--role",
+                "Developer",
+                "--github-token",
+                "synthetic-secret",
+            ]
+        )
 
 
 def test_compatibility_run_pipeline_delegates_and_returns_path(

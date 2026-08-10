@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from docx import Document
 from fastapi import FastAPI, HTTPException, Request
@@ -50,6 +50,8 @@ from resume_tailor.backend.engine.orchestration import (
     ApprovalRequest,
     ApprovalResponse,
     PipelineHooks,
+    portfolio_selectable_repository_ids,
+    validate_portfolio_selection,
 )
 from resume_tailor.backend.engine.analysis import (
     ANALYSIS_PROVIDERS,
@@ -58,6 +60,9 @@ from resume_tailor.backend.engine.analysis import (
     workflow_stages_for_provider,
 )
 from resume_tailor.backend.providers.ollama_writer import DEFAULT_OLLAMA_MODEL
+from resume_tailor.backend.providers.portfolio_ranker import (
+    PORTFOLIO_ANALYSIS_PROVIDERS,
+)
 from resume_tailor.backend.engine.retry import (
     antigravity_retry_failure_kind,
     build_antigravity_reprocess_context,
@@ -134,6 +139,10 @@ _DOWNLOAD_EXACT = {
     "apify-linkedin-retrieval-diagnostic.json",
     "job-description.txt",
     "job-requirements.json",
+    "github-repository-catalog.json",
+    "github-repository-ranking.json",
+    "github-repository-selection.json",
+    "github-portfolio-diagnostic.json",
     "extracted-master-resume.json",
     "codex-analysis.json",
     "analysis-resolved.json",
@@ -367,6 +376,66 @@ def _analysis_view(analysis: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _safe_github_source_url(value: Any) -> str | None:
+    """Return only credential-free HTTPS links hosted by GitHub."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or "[credential omitted]" in value
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+    ):
+        return None
+    return value
+
+
+def _redacted_public_value(value: Any) -> Any:
+    """Recursively remove recognizable credential values from UI payloads."""
+
+    if isinstance(value, str):
+        redacted = _SENSITIVE_ASSIGNMENT.sub("[credential omitted]", value)
+        return _GITHUB_TOKEN_VALUE.sub("[credential omitted]", redacted)
+    if isinstance(value, Mapping):
+        return {
+            key: (
+                "[credential omitted]"
+                if any(
+                    marker in str(key).casefold()
+                    for marker in (
+                        "token",
+                        "secret",
+                        "password",
+                        "authorization",
+                        "credential",
+                    )
+                )
+                else _redacted_public_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redacted_public_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redacted_public_value(item) for item in value)
+    return value
+
+
 class RunManager:
     def __init__(
         self,
@@ -479,14 +548,25 @@ class RunManager:
         except ResumeTailorError as exc:
             with self._condition:
                 record.status = "FAILED"
-                record.error = _sanitized_technical_details(exc)
+                record.error = (
+                    f"{type(exc).__name__}: sanitized GitHub portfolio failure."
+                    if record.stage == "github_portfolio"
+                    else _sanitized_technical_details(exc)
+                )
                 record.failure_kind = _failure_kind_for_error(exc, record.stage)
                 if isinstance(
                     exc,
                     (ApifyConfigurationError, ApifyLinkedInRetrievalError),
                 ):
                     record.retrieval_classification = exc.classification
-                record.message = _safe_error_message(exc)
+                record.message = (
+                    "GitHub portfolio selection stopped safely. Verify the "
+                    "username, GITHUB_TOKEN access, rate limit, and selected "
+                    "analysis provider, then start a new run. Existing artifacts "
+                    "were preserved."
+                    if record.stage == "github_portfolio"
+                    else _safe_error_message(exc)
+                )
                 record.approval = None
                 record.events.append(
                     {
@@ -500,17 +580,28 @@ class RunManager:
         except Exception as exc:  # defensive boundary for a localhost UI thread
             with self._condition:
                 record.status = "FAILED"
-                record.failure_kind = "internal"
+                record.failure_kind = (
+                    "github_portfolio"
+                    if record.stage == "github_portfolio"
+                    else "internal"
+                )
                 record.error = (
-                    _sanitized_technical_details(
+                    f"{type(exc).__name__}: sanitized GitHub portfolio failure."
+                    if record.stage == "github_portfolio"
+                    else _sanitized_technical_details(
                         RuntimeError(
                             f"Unexpected internal error: {type(exc).__name__}: {exc}"
                         )
                     )
                 )
                 record.message = (
-                    "The local pipeline stopped unexpectedly. Existing artifacts "
-                    "were preserved for review."
+                    "GitHub portfolio selection stopped safely. Verify the "
+                    "username, GITHUB_TOKEN access, rate limit, and selected "
+                    "analysis provider, then start a new run. Existing artifacts "
+                    "were preserved."
+                    if record.stage == "github_portfolio"
+                    else "The local pipeline stopped unexpectedly. Existing "
+                    "artifacts were preserved for review."
                 )
                 record.approval = None
                 record.events.append(
@@ -582,7 +673,7 @@ class RunManager:
     ) -> None:
         with self._condition:
             record = self._records[run_id]
-            safe_message = message[:500]
+            safe_message = _sanitized_technical_details(RuntimeError(message))[:500]
             record.message = safe_message
             record.events.append(
                 {
@@ -636,6 +727,7 @@ class RunManager:
             record.approval_response = None
             if response.action in {
                 "approve",
+                "skip",
                 "use_pasted",
                 "revise_once",
                 "stop",
@@ -647,7 +739,13 @@ class RunManager:
                 record.message = (
                     f"{request.title} recorded."
                     if response.action
-                    in {"select", "complete_without_revision", "revise_once", "stop"}
+                    in {
+                        "select",
+                        "skip",
+                        "complete_without_revision",
+                        "revise_once",
+                        "stop",
+                    }
                     else f"{request.title} approved."
                 )
                 record.events.append(
@@ -668,6 +766,7 @@ class RunManager:
         action: str,
         job_description: str = "",
         provider: str = "",
+        repository_ids: tuple[str, ...] = (),
     ) -> None:
         with self._condition:
             record = self._require_record(run_id)
@@ -689,6 +788,8 @@ class RunManager:
                 allowed = {"approve", "reject", "cancel"}
             elif kind == "initial_qa_provider":
                 allowed = {"select", "stop", "cancel"}
+            elif kind == "github_portfolio_selection":
+                allowed = {"approve", "skip", "cancel"}
             else:
                 allowed = {"approve", "cancel"}
             if action not in allowed:
@@ -712,6 +813,25 @@ class RunManager:
                 data["provider"] = selected
                 data["revision_provider"] = selected
                 data["final_qa_provider"] = selected
+            if kind == "github_portfolio_selection":
+                if action == "approve":
+                    allowed_ids = portfolio_selectable_repository_ids(
+                        record.approval.payload
+                    )
+                    aliases = record.approval.payload.get("repository_aliases")
+                    selected = validate_portfolio_selection(
+                        repository_ids,
+                        allowed_ids=allowed_ids,
+                        repository_aliases=(
+                            aliases if isinstance(aliases, Mapping) else {}
+                        ),
+                    )
+                    data["repository_ids"] = list(selected)
+                elif repository_ids:
+                    raise InputError(
+                        "Repository IDs are accepted only when approving the "
+                        "GitHub portfolio selection."
+                    )
             if action == "cancel":
                 record.cancel_event.set()
             record.approval_response = ApprovalResponse(action, data)
@@ -748,6 +868,8 @@ class RunManager:
         approval: dict[str, Any] | None = None
         if record.approval is not None:
             payload = dict(record.approval.payload)
+            if record.approval.kind == "github_portfolio_selection":
+                payload = _redacted_public_value(payload)
             approval = {
                 "kind": record.approval.kind,
                 "title": record.approval.title,
@@ -984,7 +1106,18 @@ class RunManager:
             and isinstance(error_payload.get("message"), str)
             else ""
         )
-        if failure_kind == "source_evidence":
+        if failure_kind == "github_portfolio":
+            technical = (
+                "GitHub portfolio cataloging or ranking stopped with sanitized "
+                "diagnostics. Repository credentials and authorization headers "
+                "are omitted."
+            )
+            message = (
+                "GitHub portfolio selection stopped safely. Verify the username, "
+                "GITHUB_TOKEN access, rate limit, and selected analysis provider, "
+                "then start a new run."
+            )
+        elif failure_kind == "source_evidence":
             technical = (
                 "Local evidence-contract validation rejected model requirement or "
                 "source references. "
@@ -1484,6 +1617,8 @@ def _failure_kind_for_error(
     error: ResumeTailorError,
     stage: str,
 ) -> str:
+    if stage == "github_portfolio":
+        return "github_portfolio"
     if isinstance(error, SourceEvidenceError):
         return "source_evidence"
     if isinstance(error, (ApifyConfigurationError, ApifyLinkedInRetrievalError)):
@@ -1567,6 +1702,15 @@ def _failure_kind_for_error(
 
 
 def _failure_kind_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    stage = str(metadata.get("stage", ""))
+    failure_class = str(metadata.get("failure_class", ""))
+    if stage in {
+        "github_portfolio",
+        "github-portfolio-catalog",
+        "github-portfolio-ranking",
+        "github-portfolio-selection",
+    } or failure_class.startswith("github-portfolio"):
+        return "github_portfolio"
     if metadata.get("failure_class") == "source-evidence-analysis":
         return "source_evidence"
     failure_class = str(metadata.get("failure_class", ""))
@@ -1695,6 +1839,10 @@ def _ui_stage_from_metadata(stage: str) -> str:
         "dependency-check": "validating_input",
         "apify-linkedin-retrieval": "fetching_job",
         "linkedin-posting-confirmation": "confirming_posting",
+        "github_portfolio": "github_portfolio",
+        "github-portfolio-catalog": "github_portfolio",
+        "github-portfolio-ranking": "github_portfolio",
+        "github-portfolio-selection": "github_portfolio",
         "extracting-master": "codex_analysis",
         "extracting_job": "codex_analysis",
         "extracted_job": "codex_analysis",
@@ -1911,9 +2059,12 @@ _TECHNICAL_BLOCK = re.compile(
     flags=re.DOTALL,
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY|APIFY|GROK|XAI)_[A-Z0-9_]*"
+    r"(?i)\b(?:OPENAI|CODEX|ANTIGRAVITY|AGY|APIFY|GROK|XAI|GITHUB)_[A-Z0-9_]*"
     r"(?:KEY|TOKEN|COOKIE|SECRET|PASSWORD)"
     r"\s*=\s*[^\s]+"
+)
+_GITHUB_TOKEN_VALUE = re.compile(
+    r"(?i)\b(?:github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9]{8,})\b"
 )
 
 
@@ -1923,6 +2074,7 @@ def _sanitized_technical_details(error: BaseException) -> str:
         str(error).strip(),
     )
     detail = _SENSITIVE_ASSIGNMENT.sub("[credential omitted]", detail)
+    detail = _GITHUB_TOKEN_VALUE.sub("[credential omitted]", detail)
     lines: list[str] = []
     for line in detail.splitlines()[:40]:
         lines.append(line if len(line) <= 500 else line[:497] + "...")
@@ -1955,6 +2107,7 @@ def _render(
         max_job_description_characters=(
             MAX_CONFIRMED_JOB_DESCRIPTION_CHARACTERS
         ),
+        safe_github_source_url=_safe_github_source_url,
         **context,
     )
     response = HTMLResponse(html, status_code=status_code)
@@ -2001,7 +2154,7 @@ async def _limited_form(request: Request, *, max_files: int) -> FormData:
             )
     return await request.form(
         max_files=max_files,
-        max_fields=20,
+        max_fields=32,
         max_part_size=MAX_JOB_BYTES,
     )
 
@@ -2131,6 +2284,60 @@ async def _prepare_pipeline_request(
             job_file = staging / "job-description.txt"
             atomic_write_text(job_file, description.rstrip() + "\n")
 
+        github_portfolio = _form_text(form, "github_portfolio") == "yes"
+        github_username = _form_text(form, "github_username") or None
+        github_include_private = (
+            _form_text(form, "github_include_private") == "yes"
+        )
+        github_allow_private_provider = (
+            _form_text(form, "github_allow_private_provider") == "yes"
+        )
+        github_analysis_provider_value = _form_text(
+            form,
+            "github_analysis_provider",
+        )
+        if not github_portfolio and any(
+            (
+                github_username,
+                github_include_private,
+                github_allow_private_provider,
+                github_analysis_provider_value,
+            )
+        ):
+            raise InputError(
+                "GitHub portfolio settings require the optional GitHub portfolio "
+                "stage to be enabled."
+            )
+        if github_allow_private_provider and not github_include_private:
+            raise InputError(
+                "Allowing private repository evidence to reach a provider "
+                "requires private repository discovery to be enabled."
+            )
+        github_analysis_provider: str | None = None
+        if github_portfolio:
+            github_analysis_provider = normalize_analysis_provider(
+                github_analysis_provider_value or "gemma_local"
+            )
+            if github_analysis_provider not in PORTFOLIO_ANALYSIS_PROVIDERS:
+                raise InputError(
+                    "GitHub portfolio ranking supports only Gemma Local or the "
+                    "locked Grok CLI adapter."
+                )
+
+        writer_provider = _form_text(form, "writer_provider") or "ollama"
+        analysis_provider = normalize_analysis_provider(
+            _form_text(form, "analysis_provider") or DEFAULT_ANALYSIS_PROVIDER
+        )
+        if github_portfolio and analysis_provider not in PORTFOLIO_ANALYSIS_PROVIDERS:
+            raise InputError(
+                "GitHub portfolio runs require Gemma Local or the locked Grok "
+                "adapter for résumé analysis."
+            )
+        if github_portfolio and writer_provider != "ollama":
+            raise InputError(
+                "GitHub portfolio runs require the local Ollama writer."
+            )
+
         pipeline_request = PipelineRequest(
             resume=resume_path,
             clipboard=False,
@@ -2144,7 +2351,7 @@ async def _prepare_pipeline_request(
             yes=False,
             keep_workdir=False,
             timeout=manager.settings.timeout,
-            writer_provider=_form_text(form, "writer_provider") or "ollama",
+            writer_provider=writer_provider,
             ollama_model=_form_text(form, "ollama_model") or DEFAULT_OLLAMA_MODEL,
             antigravity_model=_form_text(form, "antigravity_model") or None,
             antigravity_strength=_form_text(form, "antigravity_strength") or None,
@@ -2152,8 +2359,19 @@ async def _prepare_pipeline_request(
             grok_strength=_form_text(form, "grok_strength") or None,
             codex_model=_form_text(form, "codex_model") or None,
             codex_strength=_form_text(form, "codex_strength") or None,
-            analysis_provider=normalize_analysis_provider(
-                _form_text(form, "analysis_provider") or DEFAULT_ANALYSIS_PROVIDER
+            analysis_provider=analysis_provider,
+            github_portfolio=github_portfolio,
+            github_username=github_username if github_portfolio else None,
+            github_include_private=(
+                github_include_private if github_portfolio else False
+            ),
+            github_allow_private_provider=(
+                github_allow_private_provider if github_portfolio else False
+            ),
+            github_analysis_provider=(
+                github_analysis_provider
+                if github_portfolio
+                else None
             ),
         )
         return pipeline_request, staging, source_mode, company, role
@@ -2496,8 +2714,13 @@ def create_app(
                 action=_form_text(form, "action"),
                 job_description=_form_text(form, "fallback_description"),
                 provider=_form_text(form, "provider"),
+                repository_ids=tuple(
+                    str(value).strip()
+                    for value in form.getlist("repository_id")
+                    if isinstance(value, str) and value.strip()
+                ),
             )
-        except InputError as exc:
+        except (InputError, ApprovalError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
@@ -2607,6 +2830,11 @@ def _safe_form_values(form: FormData) -> dict[str, str]:
         "role",
         "pasted_description",
         "analysis_provider",
+        "github_portfolio",
+        "github_username",
+        "github_include_private",
+        "github_allow_private_provider",
+        "github_analysis_provider",
     }
     return {
         name: value

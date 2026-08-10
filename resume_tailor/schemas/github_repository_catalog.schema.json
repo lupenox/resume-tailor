@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GitHub repository catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "generated_at",
+    "github_username",
+    "authenticated",
+    "include_private",
+    "repositories",
+    "warnings"
+  ],
+  "properties": {
+    "version": {"const": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "github_username": {"type": ["string", "null"]},
+    "authenticated": {"type": "boolean"},
+    "include_private": {"type": "boolean"},
+    "repositories": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/repository"}
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "nullable_string": {"type": ["string", "null"]},
+    "string_array": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "repository_id",
+        "category",
+        "exact_text",
+        "content_sha256",
+        "source_url",
+        "head_sha",
+        "source_path"
+      ],
+      "properties": {
+        "evidence_id": {"type": "string", "minLength": 1},
+        "repository_id": {"type": "string", "minLength": 1},
+        "category": {"type": "string", "minLength": 1},
+        "exact_text": {"type": "string", "minLength": 1},
+        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_url": {"type": "string", "pattern": "^https://github\\.com/"},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "source_path": {"type": ["string", "null"]}
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_id",
+        "full_name",
+        "owner",
+        "name",
+        "visibility",
+        "private",
+        "source_url",
+        "description",
+        "topics",
+        "languages",
+        "fork",
+        "archived",
+        "disabled",
+        "empty",
+        "created_at",
+        "updated_at",
+        "pushed_at",
+        "default_branch",
+        "head_sha",
+        "readme_excerpt",
+        "root_manifest",
+        "detected_manifests",
+        "detected_frameworks",
+        "test_indicators",
+        "ci_indicators",
+        "deployment_indicators",
+        "license",
+        "homepage_url",
+        "evidence",
+        "warnings",
+        "eligible",
+        "exclusion_reasons"
+      ],
+      "properties": {
+        "repository_id": {"type": "string", "minLength": 1},
+        "full_name": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
+        "owner": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "visibility": {"enum": ["public", "private", "internal"]},
+        "private": {"type": "boolean"},
+        "source_url": {"type": "string", "pattern": "^https://github\\.com/"},
+        "description": {"$ref": "#/$defs/nullable_string"},
+        "topics": {"$ref": "#/$defs/string_array"},
+        "languages": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "fork": {"type": "boolean"},
+        "archived": {"type": "boolean"},
+        "disabled": {"type": "boolean"},
+        "empty": {"type": "boolean"},
+        "created_at": {"$ref": "#/$defs/nullable_string"},
+        "updated_at": {"$ref": "#/$defs/nullable_string"},
+        "pushed_at": {"$ref": "#/$defs/nullable_string"},
+        "default_branch": {"$ref": "#/$defs/nullable_string"},
+        "head_sha": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+            {"type": "null"}
+          ]
+        },
+        "readme_excerpt": {"$ref": "#/$defs/nullable_string"},
+        "root_manifest": {"$ref": "#/$defs/string_array"},
+        "detected_manifests": {"$ref": "#/$defs/string_array"},
+        "detected_frameworks": {"$ref": "#/$defs/string_array"},
+        "test_indicators": {"$ref": "#/$defs/string_array"},
+        "ci_indicators": {"$ref": "#/$defs/string_array"},
+        "deployment_indicators": {"$ref": "#/$defs/string_array"},
+        "license": {"$ref": "#/$defs/nullable_string"},
+        "homepage_url": {"$ref": "#/$defs/nullable_string"},
+        "evidence": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "warnings": {"$ref": "#/$defs/string_array"},
+        "eligible": {"type": "boolean"},
+        "exclusion_reasons": {"$ref": "#/$defs/string_array"}
+      }
+    }
+  }
+}

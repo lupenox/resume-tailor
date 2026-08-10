@@ -826,6 +826,21 @@ def run_command(
     check_cancelled()
     if heartbeat_interval_seconds <= 0:
         raise InputError("Subprocess heartbeat interval must be positive.")
+    # GitHub access is owned exclusively by the read-only REST adapter. Provider
+    # CLIs, document tools, and every other child process must never inherit the
+    # credential, even if untrusted repository text attempts to inspect its
+    # environment. Explicit environments remain supported, but this one secret
+    # is always removed at the process boundary.
+    process_environment = dict(os.environ if env is None else env)
+    github_credential_names = {
+        "github_token",
+        "gh_token",
+        "github_enterprise_token",
+        "gh_enterprise_token",
+    }
+    for key in tuple(process_environment):
+        if key.casefold() in github_credential_names:
+            process_environment.pop(key, None)
     try:
         process = subprocess.Popen(
             [str(arg) for arg in args],
@@ -836,7 +851,7 @@ def run_command(
             text=True,
             encoding="utf-8",
             errors="strict",
-            env=dict(env) if env is not None else None,
+            env=process_environment,
             shell=False,
             start_new_session=True,
         )
