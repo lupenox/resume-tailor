@@ -16,6 +16,7 @@ import json
 CATALOG_VERSION = 1
 MAX_JOB_REQUIREMENTS = 999
 MAX_REQUIREMENT_CHARACTERS = 5_000
+MAX_SECONDARY_SEGMENTS_PER_BLOCK = MAX_JOB_REQUIREMENTS
 
 _STRUCTURED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("responsibilities", "responsibility", "responsibility"),
@@ -31,12 +32,24 @@ _ALLOWED_CATEGORIES = frozenset(
 _ID_RE = re.compile(
     r"^(?:responsibility|required|preferred|skill|ai_focus|text)\.[0-9]{3}$"
 )
-_BULLET_PREFIX_RE = re.compile(r"^(?:[-*•‣▪◦]|[0-9]{1,3}[.)])\s+")
+_BULLET_PREFIX_RE = re.compile(r"^(?:[-*•‣▪◦○]|[0-9]{1,3}[.)])\s+")
 _HEADING_RE = re.compile(
     r"^(?:responsibilities|what you(?:'|’)ll do|required qualifications?|"
     r"requirements?|preferred qualifications?|nice to have|skills?|"
     r"technologies|ai focus(?: areas?)?)\s*:?$",
     re.I,
+)
+_SECONDARY_CUE_RE = re.compile(
+    r"(?i)(?<!\S)(?:"
+    r"must\s+(?:have|be|demonstrate)|"
+    r"you(?:\s+(?:will|must|should)|(?:'|’)ll)|"
+    r"the\s+(?:successful\s+)?candidate\s+(?:will|must|should)|"
+    r"successful\s+candidates\s+(?:will|must|should)|"
+    r"responsibilities\s+include|qualifications\s+include|"
+    r"minimum\s+qualifications|required\s+qualifications|"
+    r"preferred\s+qualifications|experience\s+with|"
+    r"proficiency\s+in|knowledge\s+of|ability\s+to"
+    r")\b"
 )
 
 
@@ -112,6 +125,96 @@ def _category_for_heading(heading: str | None) -> tuple[str, str]:
     return "unstructured_requirement", "text"
 
 
+def _requires_secondary_segmentation(value: str, source_length: int) -> bool:
+    normalized = " ".join(value.split())
+    return len(normalized) > 1500 or (
+        len(normalized) > 500
+        and len(normalized) > (source_length * 0.3)
+    )
+
+
+def _bounded_parts(parts: list[str], original: str) -> list[str]:
+    cleaned = [part.strip() for part in parts if part.strip()]
+    if len(cleaned) <= 1:
+        return [original]
+    return cleaned
+
+
+def _split_existing_boundaries(value: str) -> list[str]:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(
+        r"(?<!^)[ \t]+(?=(?:[-*•‣▪◦○]|[0-9]{1,3}[.)])\s+)",
+        "\n",
+        normalized,
+    )
+    return _bounded_parts(
+        [
+            _BULLET_PREFIX_RE.sub("", part.strip()).strip()
+            for part in normalized.split("\n")
+        ],
+        value,
+    )
+
+
+def _split_sentence_boundaries(value: str) -> list[str]:
+    # The first-pass parser historically required an uppercase character after
+    # punctuation. Real postings often continue with lower-case list prose, so
+    # the bounded fallback accepts any whitespace-delimited sentence boundary.
+    return _bounded_parts(re.split(r"(?<=[.!?])\s+", value), value)
+
+
+def _split_semicolon_clauses(value: str) -> list[str]:
+    return _bounded_parts(re.split(r"\s*;\s*", value), value)
+
+
+def _split_requirement_cues(value: str) -> list[str]:
+    starts = [match.start() for match in _SECONDARY_CUE_RE.finditer(value)]
+    starts = [start for start in starts if start > 0]
+    if not starts:
+        return [value]
+    parts: list[str] = []
+    cursor = 0
+    for start in starts:
+        parts.append(value[cursor:start])
+        cursor = start
+    parts.append(value[cursor:])
+    return _bounded_parts(parts, value)
+
+
+def _secondary_segment_oversized_item(
+    value: str,
+    *,
+    source_length: int,
+) -> tuple[list[str], tuple[str, ...]]:
+    """Atomize one oversized candidate through bounded deterministic stages."""
+
+    segments = [value]
+    used: list[str] = []
+    strategies = (
+        ("existing_boundary", _split_existing_boundaries),
+        ("sentence_boundary", _split_sentence_boundaries),
+        ("semicolon_clause", _split_semicolon_clauses),
+        ("requirement_cue", _split_requirement_cues),
+    )
+    for name, splitter in strategies:
+        expanded: list[str] = []
+        split_used = False
+        for segment in segments:
+            if not _requires_secondary_segmentation(segment, source_length):
+                expanded.append(segment)
+                continue
+            parts = splitter(segment)
+            if len(parts) > 1:
+                split_used = True
+            expanded.extend(parts)
+            if len(expanded) > MAX_SECONDARY_SEGMENTS_PER_BLOCK:
+                return [value], ()
+        segments = expanded
+        if split_used:
+            used.append(name)
+    return segments, tuple(used)
+
+
 def _unstructured_requirements(
     job_description: str,
     diagnostic: dict[str, Any],
@@ -164,19 +267,21 @@ def _unstructured_requirements(
             if not candidate:
                 continue
 
-            if category != "unstructured_requirement" and ";" in candidate and len(candidate.split(";")) > 2:
+            if (
+                not _requires_secondary_segmentation(
+                    candidate,
+                    len(job_description),
+                )
+                and category != "unstructured_requirement"
+                and ";" in candidate
+                and len(candidate.split(";")) > 2
+            ):
                 parts = [p.strip() for p in candidate.split(";") if p.strip()]
                 for p in parts:
                     items.append((p, category, prefix))
                 continue
 
-            if len(candidate) > 500:
-                sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', candidate)
-                for s in sentences:
-                    if s.strip():
-                        items.append((s.strip(), category, prefix))
-            else:
-                items.append((candidate, category, prefix))
+            items.append((candidate, category, prefix))
 
     final_requirements = []
     counters = {}
@@ -187,8 +292,27 @@ def _unstructured_requirements(
     diagnostic["largest-item/source_ratio"] = 0.0
     diagnostic["fallback_use"] = False
     diagnostic["deduplication_count"] = 0
+    diagnostic["secondary_segmentation_count"] = 0
+    diagnostic["secondary_segmentation_strategies"] = []
+    diagnostic["largest_pre_segmentation_item_length"] = max(
+        (len(" ".join(item_text.split())) for item_text, _, _ in items),
+        default=0,
+    )
 
+    atomic_items: list[tuple[str, str, str]] = []
     for item_text, cat, pref in items:
+        segments, strategies = _secondary_segment_oversized_item(
+            item_text,
+            source_length=total_len,
+        )
+        if len(segments) > 1:
+            diagnostic["secondary_segmentation_count"] += len(segments) - 1
+        for strategy in strategies:
+            if strategy not in diagnostic["secondary_segmentation_strategies"]:
+                diagnostic["secondary_segmentation_strategies"].append(strategy)
+        atomic_items.extend((segment, cat, pref) for segment in segments)
+
+    for item_text, cat, pref in atomic_items:
         try:
             norm = _safe_requirement_text(
                 item_text,

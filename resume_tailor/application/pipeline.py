@@ -1210,9 +1210,11 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                     ),
                     run_directory=run_directory,
                 )
-            except RequirementExtractionError as exc:
-                hooks.error(str(exc))
-                return 1
+            except RequirementExtractionError:
+                # The extractor has already preserved its bounded diagnostic.
+                # Propagate through the normal typed pipeline error path; hooks
+                # deliberately expose no terminal-specific ``error`` method.
+                raise
 
             req_count = len(job_requirements.get("requirements", []))
             hooks.progress(

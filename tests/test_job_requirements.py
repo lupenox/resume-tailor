@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pathlib import Path
 from resume_tailor.backend.utils.utilities import InputError, RequirementExtractionError
@@ -131,6 +133,101 @@ def test_long_unstructured_paragraphs_split_safely() -> None:
     cat = build_job_requirement_catalog(doc)
     reqs = cat["requirements"]
     assert len(reqs) > 1 # It should have split the sentences
+
+
+def test_short_two_block_posting_secondary_segments_oversized_sentences(
+    tmp_path: Path,
+) -> None:
+    def sentence(prefix: str, length: int) -> str:
+        assert len(prefix) + 1 < length
+        return prefix + ("x" * (length - len(prefix) - 1)) + "."
+
+    intro_prefix = "A concise synthetic overview of the engineering role "
+    intro = intro_prefix + ("z" * (390 - len(intro_prefix)))
+    oversized = " ".join(
+        (
+            sentence("you will design validated Python services ", 326),
+            sentence("you will implement deterministic safety checks ", 326),
+            sentence("you will collaborate on evidence-backed delivery ", 326),
+            sentence("you will maintain reliable automated tests ", 325),
+        )
+    )
+    posting = intro + "\n" + oversized
+    assert len(posting) == 1_697
+    assert len(oversized) == 1_306
+
+    catalog = build_job_requirement_catalog(posting, run_directory=tmp_path)
+
+    requirements = catalog["requirements"]
+    assert len(requirements) == 5
+    assert requirements[0]["exact_text"] == intro
+    assert all(len(item["exact_text"]) <= 500 for item in requirements)
+    diagnostic = json.loads(
+        (tmp_path / "requirement-extraction-diagnostic.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert diagnostic["initial_block_count"] == 2
+    assert diagnostic["detected_headings"] == []
+    assert diagnostic["largest_pre_segmentation_item_length"] == 1_306
+    assert diagnostic["secondary_segmentation_count"] == 3
+    assert diagnostic["secondary_segmentation_strategies"] == [
+        "sentence_boundary"
+    ]
+
+
+def test_oversized_block_uses_semicolon_clause_segmentation(
+    tmp_path: Path,
+) -> None:
+    def clause(prefix: str) -> str:
+        return prefix + ("x" * (430 - len(prefix)))
+
+    posting = "Synthetic role overview.\n" + "; ".join(
+        (
+            clause("Experience with deterministic Python services "),
+            clause("Proficiency in structured validation systems "),
+            clause("Knowledge of reliable automated test design "),
+        )
+    )
+
+    catalog = build_job_requirement_catalog(posting, run_directory=tmp_path)
+
+    assert len(catalog["requirements"]) == 4
+    diagnostic = json.loads(
+        (tmp_path / "requirement-extraction-diagnostic.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert diagnostic["secondary_segmentation_strategies"] == [
+        "semicolon_clause"
+    ]
+
+
+def test_oversized_block_uses_requirement_cue_segmentation(
+    tmp_path: Path,
+) -> None:
+    def clause(prefix: str) -> str:
+        return prefix + ("x" * (430 - len(prefix)))
+
+    posting = "Synthetic role overview.\n" + " ".join(
+        (
+            clause("Must have deterministic Python experience "),
+            clause("You will maintain evidence-backed services "),
+            clause("Ability to create reliable automated tests "),
+        )
+    )
+
+    catalog = build_job_requirement_catalog(posting, run_directory=tmp_path)
+
+    assert len(catalog["requirements"]) == 4
+    diagnostic = json.loads(
+        (tmp_path / "requirement-extraction-diagnostic.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert diagnostic["secondary_segmentation_strategies"] == [
+        "requirement_cue"
+    ]
 
 def test_pathological_item_source_ratio_rejected() -> None:
     # 2000 chars of no punctuation. Should reject.

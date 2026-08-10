@@ -13,6 +13,7 @@ from resume_tailor.backend.utils.utilities import (
     ApifyLinkedInRetrievalError,
     ApprovalError,
     InputError,
+    RequirementExtractionError,
     TailoringPreflightError,
 )
 from resume_tailor.backend.utils.utilities import ExitCode, sha256_file
@@ -159,6 +160,41 @@ def _url_arguments(
         "--analysis-provider",
         "codex",
     ]
+
+
+def test_requirement_extraction_failure_uses_typed_pipeline_error_path(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    job_file = tmp_path / "unsplittable-job.txt"
+    job_file.write_text("x" * 2_000, encoding="utf-8")
+    output_dir = tmp_path / "Tailored Resumes"
+    args = build_parser().parse_args(
+        _arguments(master_resume, job_file, output_dir)
+    )
+
+    with pytest.raises(
+        RequirementExtractionError,
+        match="exceeds maximum character threshold",
+    ):
+        run_pipeline(args, hooks=PipelineHooks())
+
+    run_directories = list(output_dir.iterdir())
+    assert len(run_directories) == 1
+    run_directory = run_directories[0]
+    diagnostic = json.loads(
+        (run_directory / "requirement-extraction-diagnostic.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert diagnostic["failure_classification"] == (
+        "item_exceeds_character_threshold"
+    )
+    metadata = json.loads(
+        (run_directory / "run-metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["status"] == "FAILED"
+    assert metadata["error"]["type"] == "RequirementExtractionError"
 
 
 def test_simulated_pipeline_artifact_tree_and_source_immutability(
