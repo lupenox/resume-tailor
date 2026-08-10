@@ -172,12 +172,26 @@ def test_requirement_extraction_failure_uses_typed_pipeline_error_path(
     args = build_parser().parse_args(
         _arguments(master_resume, job_file, output_dir)
     )
+    progress_stages: list[str] = []
+    hooks = PipelineHooks(
+        progress_handler=lambda stage, _message, _payload: progress_stages.append(
+            stage
+        )
+    )
+
+    # Bare PipelineHooks has no error() method. The old path called hooks.error()
+    # and then returned, which raised AttributeError and rewrote the terminal
+    # failure as an unexpected internal error.
+    assert not hasattr(hooks, "error")
 
     with pytest.raises(
         RequirementExtractionError,
         match="exceeds maximum character threshold",
-    ):
-        run_pipeline(args, hooks=PipelineHooks())
+    ) as raised:
+        run_pipeline(args, hooks=hooks)
+
+    assert "AttributeError" not in type(raised.value).__name__
+    assert "AttributeError" not in str(raised.value)
 
     run_directories = list(output_dir.iterdir())
     assert len(run_directories) == 1
@@ -194,7 +208,62 @@ def test_requirement_extraction_failure_uses_typed_pipeline_error_path(
         (run_directory / "run-metadata.json").read_text(encoding="utf-8")
     )
     assert metadata["status"] == "FAILED"
+    assert metadata["stage"] == "extracting-job"
     assert metadata["error"]["type"] == "RequirementExtractionError"
+    assert "AttributeError" not in metadata["error"]["message"]
+    assert metadata["failure_class"] == "requirement-extraction"
+    assert metadata["requirement_extraction_classification"] == (
+        "item_exceeds_character_threshold"
+    )
+    # Workflow progress and terminal status are independent: extraction may
+    # report an in-progress stage without ever marking the run complete.
+    assert "complete" not in progress_stages
+    assert progress_stages[-1] == "extracting_job"
+    assert metadata["status"] != "COMPLETE"
+
+
+def test_requirement_extraction_hook_reporting_cannot_obscure_original_failure(
+    master_resume: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A secondary reporting failure must not replace RequirementExtractionError."""
+
+    job_file = tmp_path / "unsplittable-job.txt"
+    job_file.write_text("x" * 2_000, encoding="utf-8")
+    output_dir = tmp_path / "Tailored Resumes"
+    args = build_parser().parse_args(
+        _arguments(master_resume, job_file, output_dir)
+    )
+
+    original_progress = PipelineHooks.progress
+
+    def progress_that_would_mask(
+        self: PipelineHooks,
+        stage: str,
+        message: str,
+        **payload: object,
+    ) -> None:
+        if stage == "extracting_job":
+            # Simulate a stale adapter that tries to "report" failures via a
+            # non-existent hooks.error method (the production regression).
+            reporter = getattr(self, "error", None)
+            assert reporter is None
+        return original_progress(self, stage, message, **payload)
+
+    monkeypatch.setattr(PipelineHooks, "progress", progress_that_would_mask)
+
+    with pytest.raises(RequirementExtractionError):
+        run_pipeline(args, hooks=PipelineHooks())
+
+    metadata = json.loads(
+        next(output_dir.iterdir()).joinpath("run-metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["status"] == "FAILED"
+    assert metadata["error"]["type"] == "RequirementExtractionError"
+    assert metadata["error"]["type"] != "AttributeError"
 
 
 def test_simulated_pipeline_artifact_tree_and_source_immutability(

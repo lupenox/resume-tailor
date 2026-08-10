@@ -111,7 +111,14 @@ class ApprovalResponse:
 
 @dataclass
 class PipelineHooks:
-    """Interaction boundary shared by the terminal and localhost UI."""
+    """Interaction boundary shared by the terminal and localhost UI.
+
+    Progress, warnings, presentations, and approvals are optional adapters.
+    Terminal failure reporting is intentionally not part of this contract:
+    pipeline stages must raise typed ``ResumeTailorError`` subclasses so the
+    orchestrator records ``FAILED`` / ``CANCELLED`` from the original exception.
+    There is no ``error`` method; callers must not invent one.
+    """
 
     progress_handler: ProgressHandler | None = None
     approval_handler: ApprovalHandler | None = None

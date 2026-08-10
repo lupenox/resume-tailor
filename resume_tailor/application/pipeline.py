@@ -1196,6 +1196,11 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
         elif retry_inputs is not None:
             job_requirements = retry_inputs.job_requirements
         else:
+            # Keep metadata stage honest for fail-safe diagnostics. Do not call a
+            # hooks.error() reporter: PipelineHooks has no such method, and any
+            # secondary AttributeError would overwrite the original extraction
+            # failure in run-metadata.
+            metadata["stage"] = "extracting-job"
             hooks.progress(
                 "extracting_job",
                 "Extracting constraints and requirements from the job posting.",
@@ -1212,8 +1217,7 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                 )
             except RequirementExtractionError:
                 # The extractor has already preserved its bounded diagnostic.
-                # Propagate through the normal typed pipeline error path; hooks
-                # deliberately expose no terminal-specific ``error`` method.
+                # Propagate through the normal typed pipeline error path.
                 raise
 
             req_count = len(job_requirements.get("requirements", []))
@@ -3068,6 +3072,14 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
         caught_error = exc
         metadata["status"] = "FAILED"
         revision_stage = "revision" in str(metadata.get("stage", ""))
+        if isinstance(exc, RequirementExtractionError):
+            # Preserve the extraction failure distinctly from generic InputError
+            # and from any secondary reporting-hook accident.
+            metadata["failure_class"] = "requirement-extraction"
+            if exc.diagnostic.get("failure_classification"):
+                metadata["requirement_extraction_classification"] = (
+                    exc.diagnostic["failure_classification"]
+                )
         if isinstance(exc, SourceEvidenceError):
             metadata["failure_class"] = "source-evidence-analysis"
         if isinstance(exc, CodexUsageLimitError):

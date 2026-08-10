@@ -35,9 +35,11 @@ from resume_tailor.backend.utils.utilities import (
     InputError,
     OllamaBudgetError,
     OllamaConnectionError,
+    RequirementExtractionError,
     atomic_write_json,
     sha256_file,
 )
+from resume_tailor.backend.engine.analysis import workflow_stages_for_provider
 
 
 JOB_URL = "https://www.linkedin.com/jobs/view/platform-engineer-4123456789/"
@@ -649,8 +651,6 @@ def test_workflow_sidebar_shows_recorded_analysis_provider(
     tmp_path: Path,
 ) -> None:
     """Regression: analysis stage label must follow metadata.analysis.provider."""
-    from resume_tailor.backend.engine.analysis import workflow_stages_for_provider
-
     output_directory = tmp_path / "output"
     output_directory.mkdir()
     for provider, expected_label in (
@@ -1223,6 +1223,125 @@ def test_failed_retrieval_messages_are_safe(
             assert "text file or pasted description" in page.text
 
     asyncio.run(scenario())
+
+
+def test_requirement_extraction_failure_keeps_failed_status_without_workflow_complete(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    """Workflow step progress and terminal status stay independent on fail-safe stop.
+
+    Regression: a stale hooks.error() call raised AttributeError after the real
+    RequirementExtractionError, and the UI could look "fully advanced" while the
+    terminal status was FAILED.
+    """
+
+    stages = [name for name, _label in workflow_stages_for_provider(None)]
+    complete_index = stages.index("complete")
+
+    def fail_during_extraction(
+        request: PipelineRequest,
+        *,
+        hooks: PipelineHooks,
+    ) -> PipelineResult:
+        run_directory = request.output_dir / "extraction-failure"
+        run_directory.mkdir(mode=0o700)
+        # Advance only through confirmed posting intake — not later stages.
+        hooks.progress(
+            "validating_input",
+            "Validated local input.",
+            run_directory=str(run_directory),
+        )
+        hooks.progress(
+            "confirming_posting",
+            "Posting confirmed.",
+            run_directory=str(run_directory),
+        )
+        # Live UI ignores non-workflow progress keys; extraction stays at intake.
+        hooks.progress(
+            "extracting_job",
+            "Extracting constraints and requirements from the job posting.",
+            run_directory=str(run_directory),
+        )
+        raise RequirementExtractionError(
+            "Requirement contains disproportionate percentage of source text.",
+            {
+                "failure_classification": "item_disproportionate_percentage",
+            },
+        )
+
+    app = create_app(
+        output_directory=tmp_path / "output",
+        master_resume=master_resume,
+        pipeline_runner=fail_during_extraction,
+    )
+
+    async def scenario() -> None:
+        async with _client(app) as client:
+            token = await _session(client)
+            run_id = await _start(client, token, mode="pasted")
+            failed = await _wait(app, run_id, "FAILED")
+            assert failed["status"] == "FAILED"
+            assert failed["status"] != "COMPLETE"
+            assert failed["stage"] != "complete"
+            assert failed["stage_index"] < complete_index
+            # Confirming posting is index 2; later steps must not be marked done.
+            assert failed["stage"] == "confirming_posting"
+            assert failed["stage_index"] == stages.index("confirming_posting")
+            assert "AttributeError" not in (failed.get("error") or "")
+            assert "disproportionate" in failed["message"].casefold()
+            page = await client.get(f"/runs/{run_id}")
+            assert page.status_code == 200
+            assert "pipeline stopped safely" in page.text
+            # The terminal Complete step must not be classed as done on FAILED.
+            complete_item = page.text.split('data-stage="complete"', 1)[1][:200]
+            assert 'class="done"' not in complete_item
+
+    asyncio.run(scenario())
+
+
+def test_historical_extraction_failure_does_not_advance_workflow_to_complete(
+    master_resume: Path,
+    tmp_path: Path,
+) -> None:
+    """Metadata stage extracting-job must not map to complete or analysis."""
+
+    output_directory = tmp_path / "output"
+    output_directory.mkdir()
+    run = output_directory / "jobright-extraction-failure"
+    run.mkdir()
+    atomic_write_json(
+        run / "run-metadata.json",
+        {
+            "application": "resume-tailor",
+            "status": "FAILED",
+            "stage": "extracting-job",
+            "company": "Jobright.ai",
+            "role": "AI Engineer, Entry Level",
+            "failure_class": "requirement-extraction",
+            "error": {
+                "type": "RequirementExtractionError",
+                "message": (
+                    "Requirement contains disproportionate percentage of source text."
+                ),
+                "exit_code": 4,
+            },
+        },
+    )
+    app = create_app(
+        output_directory=output_directory,
+        master_resume=master_resume,
+        pipeline_runner=StubbedUIPipeline(),
+    )
+    snapshot = app.state.manager.snapshot(f"history-{run.name}")
+    stages = [name for name, _label in snapshot["workflow_stages"]]
+    complete_index = stages.index("complete")
+    assert snapshot["status"] == "FAILED"
+    assert snapshot["stage"] == "confirming_posting"
+    assert snapshot["stage_index"] < complete_index
+    assert snapshot["stage_index"] == stages.index("confirming_posting")
+    assert snapshot["stage"] != "complete"
+    assert "AttributeError" not in (snapshot.get("error") or "")
 
 
 @pytest.mark.parametrize(
@@ -3018,6 +3137,7 @@ def test_github_private_provider_ui_requires_private_discovery(
             assert pipeline.requests == []
 
     asyncio.run(scenario())
+
 
 
 def test_github_portfolio_failure_page_never_renders_credentials(

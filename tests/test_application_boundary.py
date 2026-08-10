@@ -130,6 +130,17 @@ def test_neutral_hooks_perform_no_terminal_io(
     assert captured.err == ""
 
 
+def test_pipeline_hooks_contract_has_no_error_reporter() -> None:
+    """Failures must propagate as typed exceptions, not hooks.error(...)."""
+
+    hooks = PipelineHooks()
+    assert not hasattr(hooks, "error")
+    assert callable(hooks.progress)
+    assert callable(hooks.warning)
+    assert callable(hooks.present)
+    assert callable(hooks.approve)
+
+
 def test_pipeline_hooks_preserve_positional_cancel_event_contract() -> None:
     cancel_event = threading.Event()
 
