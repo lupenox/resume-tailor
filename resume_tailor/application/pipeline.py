@@ -2480,6 +2480,8 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
 
             # Author revision content at most once (one-shot limit). Reuse existing
             # revision artifacts when retrying Final QA after a provider failure.
+            # Consumption is irreversible only after a full successful revision
+            # render (content + preview + docx), not at authorize or failed init.
             if (
                 not revision_already_authored
                 and revised_content_path.is_file()
@@ -2487,13 +2489,14 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                 and revision_docx_path.is_file()
             ):
                 revision_already_authored = True
+                if metadata["revision_cycle"]["attempt_count"] == 0:
+                    metadata["revision_cycle"]["attempt_count"] = 1
 
             if not revision_already_authored:
                 if metadata["revision_cycle"]["attempt_count"] != 0:
                     raise RevisionValidationError(
                         "The one-revision limit was already consumed."
                     )
-                metadata["revision_cycle"]["attempt_count"] = 1
                 metadata["revision_cycle"]["state"] = "revision_1_authorized"
                 allowed_targets = approved_revision_targets(
                     qa_result=qa_result,
@@ -2859,6 +2862,8 @@ def _run_pipeline(request: PipelineRequest, hooks: PipelineHooks) -> Path:
                 metadata["revision_cycle"]["revision_1"]["layout_validation"] = (
                     revision_layout
                 )
+                # Irreversible one-shot boundary: full revision artifacts exist.
+                metadata["revision_cycle"]["attempt_count"] = 1
                 revision_already_authored = True
             else:
                 # Reuse already-authored/rendered revision; only re-run Final QA.
